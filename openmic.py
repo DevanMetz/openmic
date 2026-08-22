@@ -241,6 +241,11 @@ class App:
         style.map("Footer.TCheckbutton", background=[("active", "#0b1020")])
         style.configure("TCombobox", fieldbackground="#0f172a", background="#1e293b",
                         foreground="#f8fafc", arrowcolor="#94a3b8", bordercolor="#334155")
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", "#0f172a"), ("disabled", "#111827")],
+                  foreground=[("readonly", "#f8fafc"), ("disabled", "#64748b")],
+                  selectbackground=[("readonly", "#0f172a")],
+                  selectforeground=[("readonly", "#f8fafc")])
         style.configure("TScale", background="#111827", troughcolor="#1e293b")
         style.configure("Vertical.TScrollbar", background="#1e293b",
                         troughcolor="#0f172a", arrowcolor="#94a3b8",
@@ -325,9 +330,11 @@ class App:
                                         values=self.outputs, state="readonly", width=51)
         for row, box in enumerate((self.dev_box, self.out_box, self.mon_out_box)):
             box.grid(row=row, column=1, padx=6, pady=3)
-            box.bind("<<ComboboxSelected>>", lambda _event: self.schedule_save())
+            box.bind("<<ComboboxSelected>>", self.routing_changed)
         self.refresh_btn = ttk.Button(routing, text="Refresh", command=self.refresh_devices)
         self.refresh_btn.grid(row=0, column=2, rowspan=3, padx=(6, 0), sticky="ns")
+        ttk.Label(routing, text="Changes apply live", foreground="#22c55e").grid(
+            row=3, column=1, padx=6, pady=(3, 0), sticky="e")
 
         processing = ttk.LabelFrame(mic_tab, text="PROCESSING", style="Card.TLabelframe",
                                     padding=10)
@@ -486,6 +493,7 @@ class App:
             self.status.config(text=str(e)[:52], foreground="#f87171")
 
     def refresh_devices(self):
+        before = (self.dev_var.get(), self.out_var.get(), self.mon_out_var.get())
         self.inputs = list_devices()
         self.outputs = list_devices(output=True)
         self.dev_box.configure(values=self.inputs)
@@ -498,12 +506,10 @@ class App:
         if self.mon_out_var.get() not in self.outputs and self.outputs:
             self.mon_out_var.set(self.outputs[0])
         self.schedule_save()
+        after = (self.dev_var.get(), self.out_var.get(), self.mon_out_var.get())
+        if self.engine and after != before:
+            self.restart_engine()
 
-    def set_routing_enabled(self, enabled):
-        state = "readonly" if enabled else "disabled"
-        for box in (self.dev_box, self.out_box, self.mon_out_box):
-            box.configure(state=state)
-        self.refresh_btn.configure(state="normal" if enabled else "disabled")
 
     def reset_processing(self):
         self.strength_var.set(100)
@@ -580,34 +586,66 @@ class App:
         self.playing_name = None
         self.sound_status.config(text="Ready", foreground="#e5e7eb")
 
-    def toggle(self):
-        if self.engine:
-            self.save()
-            self.engine.stop_evt.set()
-            self.engine.join(timeout=2)
-            self.engine = None
-            self.btn.config(text="Start OpenMic")
-            self.status.config(text="Stopped", foreground="#94a3b8")
-            self.sound_status.config(text="Ready", foreground="#e5e7eb")
-            self.set_routing_enabled(True)
-            return
-
+    def start_engine(self):
         idx = device_index(self.dev_var.get())
         out = device_index(self.out_var.get(), output=True)
         monitor = device_index(self.mon_out_var.get(), output=True)
         if idx is None or out is None or monitor is None:
             self.status.config(text="Device not found", foreground="#f87171")
-            return
+            return False
         if self.mon_var.get() and monitor == out:
             self.status.config(text="Monitor output must differ", foreground="#f87171")
-            return
+            return False
 
         self.engine = Engine(idx, out, monitor)
         self.apply_controls()
         self.engine.start()
         self.btn.config(text="Stop OpenMic")
         self.status.config(text="Starting…", foreground="#fbbf24")
-        self.set_routing_enabled(False)
+        return True
+
+    def stop_engine(self, announce=True):
+        engine = self.engine
+        if not engine:
+            return True
+        engine.stop_evt.set()
+        engine.join(timeout=2)
+        if engine.is_alive():
+            self.status.config(text="Audio stream did not stop", foreground="#f87171")
+            return False
+        self.engine = None
+        self.btn.config(text="Start OpenMic")
+        if announce:
+            self.status.config(text="Stopped", foreground="#94a3b8")
+            self.playing_name = None
+            self.sound_status.config(text="Ready", foreground="#e5e7eb")
+        return True
+
+    def restart_engine(self):
+        old = self.engine
+        if not old:
+            return self.start_engine()
+        with old.sound_lock:
+            remaining = None if old.sound is None else old.sound[old.sound_pos:].copy()
+        self.status.config(text="Switching route…", foreground="#fbbf24")
+        if not self.stop_engine(announce=False):
+            return False
+        started = self.start_engine()
+        if started and remaining is not None:
+            self.engine.play_sound(remaining)
+        return started
+
+    def routing_changed(self, _event=None):
+        self.schedule_save()
+        if self.engine:
+            self.restart_engine()
+
+    def toggle(self):
+        self.save()
+        if self.engine:
+            self.stop_engine()
+        else:
+            self.start_engine()
 
     @staticmethod
     def meter_percent(peak):
@@ -621,7 +659,6 @@ class App:
                 self.engine = None
                 self.btn.config(text="Start OpenMic")
                 self.status.config(text=eng.error[:52], foreground="#f87171")
-                self.set_routing_enabled(True)
             else:
                 self.in_meter["value"] = self.meter_percent(eng.in_peak)
                 self.out_meter["value"] = self.meter_percent(eng.out_peak)

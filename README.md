@@ -8,6 +8,7 @@ Audio stays on your computer. Nothing is recorded or uploaded.
 
 - Native RNNoise processing at 48 kHz
 - Selectable microphone, processed output, and headphone monitor
+- Live routing changes with automatic audio-stream handoff
 - Noise-reduction wet/dry control
 - Input/output gain and adjustable noise gate
 - Live bypass and microphone mute
