@@ -1,2 +1,2 @@
 @echo off
-start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0denoiser.py"
+start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0openmic.py"

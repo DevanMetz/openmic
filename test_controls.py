@@ -1,7 +1,7 @@
 """Hardware-free check for the live frame controls."""
 import numpy as np
 
-from denoiser import Engine, FRAME
+from openmic import Engine, FRAME
 
 engine = Engine(0, 0, 0)
 release = 0.9
