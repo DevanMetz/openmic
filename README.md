@@ -56,10 +56,11 @@ Open the **Soundboard** tab, add local audio clips, select one, and press **Play
 ```bat
 .venv\Scripts\python.exe test_controls.py
 .venv\Scripts\python.exe test_soundboard.py
+.venv\Scripts\python.exe test_routing.py
 .venv\Scripts\python.exe test_denoise.py
 ```
 
-The controls and soundboard checks are hardware-free. The RNNoise check uses deterministic noise and signal inputs.
+The controls, routing, and soundboard checks are hardware-free. The RNNoise check uses deterministic noise and signal inputs.
 
 ## License
 
