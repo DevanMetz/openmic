@@ -1,0 +1,587 @@
+//! egui front end: routing, processing controls, meters, soundboard.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use eframe::egui::{
+    self, CentralPanel, Color32, ComboBox, ProgressBar, RichText, ScrollArea, Slider,
+};
+
+use crate::config::{self, Settings};
+use crate::decode;
+use crate::dsp::{self, Params};
+use crate::engine::{list_devices, Engine};
+
+const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
+const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
+const AMBER: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+const MUTED: Color32 = Color32::from_rgb(0x94, 0xa3, 0xb8);
+
+#[derive(PartialEq)]
+enum Tab {
+    Mic,
+    Soundboard,
+}
+
+type Status = (String, Color32);
+
+pub struct App {
+    settings: Settings,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    tab: Tab,
+    engine: Option<Engine>,
+    status: Status,
+    sound_status: Status,
+    selected: usize,
+    playing_name: Option<String>,
+    warn_until: Option<(String, Instant)>,
+    dirty_since: Option<Instant>,
+}
+
+impl App {
+    pub fn new(settings: Settings) -> Self {
+        let mut app = Self {
+            settings,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            tab: Tab::Mic,
+            engine: None,
+            status: ("Stopped".into(), MUTED),
+            sound_status: ("Ready".into(), Color32::WHITE),
+            selected: 0,
+            playing_name: None,
+            warn_until: None,
+            dirty_since: None,
+        };
+        // Reflect the actual registry state, like the Python app did.
+        app.settings.start_with_windows = config::startup_enabled();
+
+        if app.settings.microphone.is_empty() {
+            app.settings.microphone = app.inputs.first().cloned().unwrap_or_default();
+        }
+        if app.settings.output.is_empty() {
+            app.settings.output = app
+                .outputs
+                .iter()
+                .find(|n| n.contains("CABLE Input"))
+                .or_else(|| app.outputs.first())
+                .cloned()
+                .unwrap_or_default();
+        }
+        if app.settings.monitor_output.is_empty() {
+            app.settings.monitor_output = app
+                .outputs
+                .iter()
+                .find(|n| !n.contains("CABLE Input"))
+                .or_else(|| app.outputs.first())
+                .cloned()
+                .unwrap_or_default();
+        }
+
+        if app.settings.auto_start {
+            app.start_engine();
+        }
+        app
+    }
+
+    fn params(&self) -> Params {
+        let s = &self.settings;
+        Params {
+            strength: s.strength.clamp(0.0, 1.0),
+            input_gain: dsp::db_to_gain(s.input_gain_db),
+            output_gain: dsp::db_to_gain(s.output_gain_db),
+            monitor_gain: s.monitor_volume.clamp(0.0, 1.0),
+            sound_gain: s.sound_volume.clamp(0.0, 1.0),
+            gate_enabled: s.gate,
+            gate_threshold_db: s.gate_threshold_db,
+            bypass: s.bypass,
+            mute: s.mute,
+            monitor_on: s.monitor,
+        }
+    }
+
+    fn apply_live(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.set_params(self.params());
+        }
+        self.dirty_since.get_or_insert(Instant::now());
+    }
+
+    fn touch(&mut self) {
+        self.dirty_since.get_or_insert(Instant::now());
+    }
+
+    fn start_engine(&mut self) {
+        match Engine::start(
+            &self.settings.microphone,
+            &self.settings.output,
+            &self.settings.monitor_output,
+            self.params(),
+        ) {
+            Ok(engine) => {
+                self.engine = Some(engine);
+                self.status = ("Starting…".into(), AMBER);
+            }
+            Err(e) => self.status = (short(&format!("{:#}", e)), RED),
+        }
+    }
+
+    fn stop_engine(&mut self, announce: bool) {
+        if let Some(engine) = self.engine.take() {
+            engine.stop();
+        }
+        self.playing_name = None;
+        if announce {
+            self.status = ("Stopped".into(), MUTED);
+            self.sound_status = ("Ready".into(), Color32::WHITE);
+        }
+    }
+
+    /// Live route change: stop old engine, start new, hand the clip playhead over.
+    fn restart_engine(&mut self) {
+        let remaining = self.engine.as_ref().and_then(Engine::take_remaining_clip);
+        self.stop_engine(false);
+        self.status = ("Switching route…".into(), AMBER);
+        self.start_engine();
+        if let (Some(engine), Some(samples)) = (&self.engine, remaining) {
+            engine.play_sound(Arc::new(samples));
+        }
+    }
+
+    fn refresh_devices(&mut self, live: bool) {
+        let host = cpal_host();
+        let before = (
+            self.settings.microphone.clone(),
+            self.settings.output.clone(),
+            self.settings.monitor_output.clone(),
+        );
+        self.inputs = list_devices(&host, false);
+        self.outputs = list_devices(&host, true);
+        if !self.inputs.iter().any(|n| *n == self.settings.microphone) {
+            self.settings.microphone = self.inputs.first().cloned().unwrap_or_default();
+        }
+        for (current, pool) in [
+            (&mut self.settings.output, &self.outputs),
+            (&mut self.settings.monitor_output, &self.outputs),
+        ] {
+            if !pool.iter().any(|n| *n == *current) {
+                *current = pool.first().cloned().unwrap_or_default();
+            }
+        }
+        self.touch();
+        let after = (
+            self.settings.microphone.clone(),
+            self.settings.output.clone(),
+            self.settings.monitor_output.clone(),
+        );
+        if live && self.engine.is_some() && before != after {
+            self.restart_engine();
+        }
+    }
+
+    fn play_selected(&mut self) {
+        let Some(path) = self.settings.sounds.get(self.selected).cloned() else {
+            self.sound_status = ("Select a clip first".into(), AMBER);
+            return;
+        };
+        let Some(engine) = &self.engine else {
+            self.sound_status = ("Start OpenMic before playing a clip".into(), AMBER);
+            return;
+        };
+        match decode::load_clip(&path) {
+            Ok(samples) => {
+                engine.play_sound(Arc::new(samples));
+                let name = file_name(&path);
+                self.sound_status = (format!("Playing · {name}"), GREEN);
+                self.playing_name = Some(name);
+            }
+            Err(e) => self.sound_status = (short(&format!("{:#}", e)), RED),
+        }
+    }
+
+    fn add_sounds(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .add_filter(
+                "Audio files",
+                &["wav", "flac", "ogg", "mp3", "aiff", "aif"],
+            )
+            .add_filter("All files", &["*"])
+            .pick_files()
+        else {
+            return;
+        };
+        let mut invalid = Vec::new();
+        for path in paths {
+            if self.settings.sounds.contains(&path) {
+                continue;
+            }
+            match decode::load_clip(&path) {
+                Ok(_) => self.settings.sounds.push(path),
+                Err(_) => invalid.push(file_name(&path)),
+            }
+        }
+        if !invalid.is_empty() {
+            self.sound_status = (format!("Could not read: {}", invalid.join(", ")), RED);
+        }
+        self.touch();
+    }
+
+    fn remove_selected(&mut self) {
+        if self.selected < self.settings.sounds.len() {
+            self.settings.sounds.remove(self.selected);
+            self.selected = self.selected.min(self.settings.sounds.len().saturating_sub(1));
+            self.touch();
+        }
+    }
+
+    fn toggle_startup(&mut self, enabled: bool) {
+        if let Err(e) = config::set_startup(enabled) {
+            self.settings.start_with_windows = !enabled;
+            self.status = (short(&format!("{:#}", e)), RED);
+        } else {
+            self.status = (
+                format!(
+                    "Windows startup {}",
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+                GREEN,
+            );
+        }
+    }
+
+    fn poll_engine(&mut self) {
+        let err = self.engine.as_ref().and_then(Engine::take_error);
+        if let Some(e) = err {
+            self.stop_engine(false);
+            self.status = (short(&e), RED);
+            return;
+        }
+        // Stream glitches are transient: surface them briefly, keep running.
+        if let Some(w) = self.engine.as_ref().and_then(Engine::take_warning) {
+            self.warn_until = Some((short(&w), Instant::now()));
+        }
+        if let Some((msg, at)) = &self.warn_until {
+            if at.elapsed() < Duration::from_secs(2) {
+                self.status = (msg.clone(), AMBER);
+            } else {
+                self.warn_until = None;
+            }
+        }
+        let playing = self.engine.as_ref().map(Engine::sound_playing);
+        if self.playing_name.is_some() && playing == Some(false) {
+            self.playing_name = None;
+            self.sound_status = ("Ready".into(), Color32::WHITE);
+        }
+    }
+    fn draw_mic_tab(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.strong(RichText::new("ROUTING").color(CYAN));
+            macro_rules! route_row {
+                ($label:expr, $id:expr, $field:ident, $pool:expr) => {{
+                    let changed = ui
+                        .horizontal(|ui| {
+                            ui.label($label);
+                            let field = &mut self.settings.$field;
+                            combo(ui, $id, field, &$pool).changed()
+                        })
+                        .inner;
+                    if changed {
+                        self.touch();
+                        if self.engine.is_some() {
+                            self.restart_engine();
+                        }
+                    }
+                }};
+            }
+            route_row!("Microphone", 0, microphone, self.inputs);
+            route_row!("Processed output", 1, output, self.outputs);
+            route_row!("Monitor output", 2, monitor_output, self.outputs);
+            ui.horizontal(|ui| {
+                if ui.button("Refresh").clicked() {
+                    self.refresh_devices(true);
+                }
+                ui.weak(RichText::new("Changes apply live").color(GREEN));
+            });
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong(RichText::new("PROCESSING").color(CYAN));
+            let mut changed = false;
+            for (label, value, range) in [
+                (
+                    "Noise reduction",
+                    &mut self.settings.strength,
+                    0.0..=1.0,
+                ),
+                ("Input gain", &mut self.settings.input_gain_db, -12.0..=24.0),
+                (
+                    "Output gain",
+                    &mut self.settings.output_gain_db,
+                    -24.0..=12.0,
+                ),
+                (
+                    "Gate threshold",
+                    &mut self.settings.gate_threshold_db,
+                    -80.0..=-20.0,
+                ),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let slider = if label == "Noise reduction" {
+                        Slider::new(value, range)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    } else {
+                        Slider::new(value, range).suffix(" dB")
+                    };
+                    changed |= ui.add(slider).changed();
+                });
+            }
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut self.settings.gate, "Noise gate").changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.bypass, "Bypass reduction")
+                    .changed();
+                changed |= ui.checkbox(&mut self.settings.mute, "Mute microphone").changed();
+                if ui.button("Reset").clicked() {
+                    self.settings.strength = 1.0;
+                    self.settings.input_gain_db = 0.0;
+                    self.settings.output_gain_db = 0.0;
+                    self.settings.gate = false;
+                    self.settings.gate_threshold_db = -50.0;
+                    self.settings.bypass = false;
+                    self.settings.mute = false;
+                    self.settings.monitor_volume = 1.0;
+                    changed = true;
+                }
+            });
+            if changed {
+                self.apply_live();
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong(RichText::new("MONITOR & LEVELS").color(CYAN));
+            ui.horizontal(|ui| {
+                let mut changed =
+                    ui.checkbox(&mut self.settings.monitor, "Headphone monitor").changed();
+                changed |= ui
+                    .add(
+                        Slider::new(&mut self.settings.monitor_volume, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .changed();
+                if changed {
+                    self.apply_live();
+                }
+            });
+            let snapshot = self.engine.as_ref().map(Engine::stats);
+            meter(
+                ui,
+                "Input",
+                snapshot.map(|s| s.in_peak),
+                CYAN,
+            );
+            meter(
+                ui,
+                "Output",
+                snapshot.map(|s| s.out_peak),
+                GREEN,
+            );
+            if let Some(stats) = snapshot {
+                let warning_fresh = self
+                    .warn_until
+                    .as_ref()
+                    .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
+                if !warning_fresh {
+                    self.status = (
+                        format!("Running · voice {:.0}%", stats.prob * 100.0),
+                        GREEN,
+                    );
+                }
+            }
+        });
+    }
+
+    fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label("Play clips directly into your processed microphone output.");
+        let sounds = self.settings.sounds.clone();
+        ScrollArea::vertical()
+            .id_salt("sounds")
+            .max_height(ui.available_height() - 140.0)
+            .show(ui, |ui| {
+                for (i, path) in sounds.iter().enumerate() {
+                    let name = file_name(path);
+                    let resp =
+                        ui.selectable_label(i == self.selected, RichText::new(name.clone()));
+                    if resp.clicked() {
+                        self.selected = i;
+                    }
+                    if resp.double_clicked() {
+                        self.selected = i;
+                        self.play_selected();
+                    }
+                }
+            });
+        ui.horizontal(|ui| {
+            if ui.button("Add clips").clicked() {
+                self.add_sounds();
+            }
+            if ui.button(RichText::new("Play").color(Color32::BLACK)).clicked() {
+                self.play_selected();
+            }
+            if ui.button("Stop").clicked() {
+                if let Some(engine) = &self.engine {
+                    engine.stop_sound();
+                }
+                self.playing_name = None;
+                self.sound_status = ("Ready".into(), Color32::WHITE);
+            }
+            if ui.button(RichText::new("Remove").color(Color32::from_rgb(0xfe, 0xca, 0xca))).clicked() {
+                self.remove_selected();
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Sound volume");
+            if ui
+                .add(
+                    Slider::new(&mut self.settings.sound_volume, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                )
+                .changed()
+            {
+                self.apply_live();
+            }
+        });
+        ui.add_space(4.0);
+        ui.weak(RichText::new(format!(
+            "{}   (WAV, FLAC, OGG, MP3, AIFF supported)",
+            self.sound_status.0
+        )).color(self.sound_status.1));
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        ctx.request_repaint_after(Duration::from_millis(100));
+        self.poll_engine();
+
+        if let Some(t) = self.dirty_since {
+            if t.elapsed() >= Duration::from_millis(300) {
+                let _ = self.settings.save();
+                self.dirty_since = None;
+            }
+        }
+
+        CentralPanel::default().show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("OpenMic");
+                ui.weak(dsp_version());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak("Clean voice. Instant sounds. Fully local.");
+                });
+            });
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Mic, "Microphone");
+                ui.selectable_value(&mut self.tab, Tab::Soundboard, "Soundboard");
+            });
+            ui.separator();
+            match self.tab {
+                Tab::Mic => self.draw_mic_tab(ui),
+                Tab::Soundboard => self.draw_sound_tab(ui),
+            }
+
+            // Footer follows the content; the fixed window is sized to fit.
+            ui.add_space(10.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let running = self.engine.is_some();
+                let btn = egui::Button::new(if running {
+                    RichText::new("Stop OpenMic").color(Color32::BLACK)
+                } else {
+                    RichText::new("Start OpenMic").color(Color32::BLACK)
+                })
+                .fill(if running { RED } else { GREEN });
+                if ui.add(btn).clicked() {
+                    let _ = self.settings.save();
+                    if running {
+                        self.stop_engine(true);
+                    } else {
+                        self.start_engine();
+                    }
+                }
+                ui.label(RichText::new(&self.status.0).color(self.status.1));
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut self.settings.start_with_windows, "Start with Windows")
+                    .changed()
+                {
+                    self.toggle_startup(self.settings.start_with_windows);
+                }
+                if ui
+                    .checkbox(
+                        &mut self.settings.auto_start,
+                        "Start processing automatically",
+                    )
+                    .changed()
+                {
+                    self.touch();
+                }
+            });
+        });
+    }
+}
+
+// ---- small helpers ---------------------------------------------------------
+
+fn cpal_host() -> cpal::Host {
+    cpal::default_host()
+}
+
+fn dsp_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn short(msg: &str) -> String {
+    msg.chars().take(64).collect()
+}
+
+fn file_name(path: &PathBuf) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn combo(ui: &mut egui::Ui, id: usize, value: &mut String, pool: &[String]) -> egui::Response {
+    ComboBox::from_id_salt(id)
+        .width(360.0)
+        .selected_text(value.as_str())
+        .show_ui(ui, |ui| {
+            for name in pool {
+                ui.selectable_value(value, name.clone(), name);
+            }
+        })
+        .response
+}
+
+fn meter(ui: &mut egui::Ui, label: &str, peak: Option<f32>, color: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let pct = dsp::meter_percent(peak.unwrap_or(0.0));
+        ui.add(
+            ProgressBar::new(pct / 100.0)
+                .desired_width(ui.available_width())
+                .fill(color),
+        );
+    });
+}

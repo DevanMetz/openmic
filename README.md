@@ -1,40 +1,42 @@
 # OpenMic
 
-OpenMic is a local, real-time microphone cleaner and soundboard for Windows. It processes your voice with RNNoise, mixes optional sound clips, and sends the result to VB-Audio Virtual Cable for Discord or any other voice application.
+OpenMic is a local, real-time microphone cleaner and soundboard for Windows — now written entirely in Rust. It processes your voice with RNNoise (the current xiph model, compiled from source), mixes optional sound clips, and sends the result to VB-Audio Virtual Cable for Discord or any other voice application.
 
 Audio stays on your computer. Nothing is recorded or uploaded.
 
+![OpenMic running](docs/screenshot.png)
+
 ## Features
 
-- Native RNNoise processing at 48 kHz
+- Native RNNoise processing at 48 kHz (vendored xiph source, built via `cc` — no Python, no prebuilt DLLs)
+- Opens devices at their native formats and resamples to/from the 48 kHz DSP core
 - Selectable microphone, processed output, and headphone monitor
-- Live routing changes with automatic audio-stream handoff
+- Live routing changes with automatic stream handoff (soundboard playhead preserved)
 - Noise-reduction wet/dry control
 - Input/output gain and adjustable noise gate
 - Live bypass and microphone mute
-- Persistent soundboard with independent volume
-- WAV, FLAC, OGG, AIFF, and MP3 support through libsndfile
-- Input and output level meters
+- Persistent soundboard with independent volume; WAV, FLAC, OGG, MP3, AIFF via symphonia
+- Input and output level meters plus live voice-probability readout
 - Automatic settings persistence
 - Optional Windows startup and automatic processing
-- Dark native Windows interface with separate Microphone and Soundboard tabs
+- Dark native GUI (egui)
 
 ## Requirements
 
-- Windows 10 or Windows 11
-- Python 3 (Python 3.13 is tested)
-- [VB-Audio Virtual Cable](https://vb-audio.com/Cable/)
+- Windows 10 or 11
+- [Rust](https://rustup.rs) (stable) and MSVC build tools
+- A C compiler for the vendored RNNoise: MSVC `cl.exe` cannot compile the VLA usage in `pitch.c`, so the build uses `clang` (e.g. the one shipped with AMD ROCm, or LLVM/Clang for Windows). It must target the MSVC ABI.
+- [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (recommended output)
 
-## Install
+## Build & run
 
 ```bat
 git clone https://github.com/DevanMetz/openmic.git
 cd openmic
-setup.bat
-run.bat
+cargo run --release
 ```
 
-`setup.bat` creates a local `.venv` and installs the pinned dependencies. OpenMic itself needs no administrator access. VB-Cable's driver installation may require it.
+The binary is `target\release\openmic.exe`. No administrator access needed; VB-Cable's driver install may require it.
 
 ## Discord setup
 
@@ -49,21 +51,16 @@ Use headphones before enabling the headphone monitor to prevent feedback.
 
 ## Soundboard
 
-Open the **Soundboard** tab, add local audio clips, select one, and press **Play**. The clip is mixed into the same processed output Discord receives. Double-clicking a clip also plays it. **Mute microphone** silences your voice without silencing the soundboard.
+Open the **Soundboard** tab, add local audio clips, select one, press **Play** (or double-click). The clip is mixed into the same processed output Discord receives. Route changes hand the clip playhead to the new engine. **Mute microphone** silences your voice without silencing the soundboard.
 
 ## Checks
 
 ```bat
-.venv\Scripts\python.exe test_controls.py
-.venv\Scripts\python.exe test_soundboard.py
-.venv\Scripts\python.exe test_routing.py
-.venv\Scripts\python.exe test_denoise.py
+cargo test
 ```
 
-The controls, routing, and soundboard checks are hardware-free. The RNNoise check uses deterministic noise and signal inputs.
+The suite covers the gate/bypass/mute DSP, soundboard mixing and mute isolation, clip decode/resample, streaming resampler continuity, settings round-trip, startup registry handling, and that RNNoise crushes stationary noise while flagging tones as speech.
 
 ## License
 
-MIT. RNNoise and installed dependencies retain their own licenses.
-
-OpenMic is an unofficial community project and is not affiliated with Discord or VB-Audio.
+MIT. The vendored xiph RNNoise under `vendor/rnnoise/` keeps its own BSD-style license (see `vendor/rnnoise/COPYING`).

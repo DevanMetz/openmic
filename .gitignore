@@ -1,4 +1,15 @@
-.venv/
+# Rust
+/target/
+
+# Local config
+settings.json
+
+# Legacy Python stack (removed; kept here so leftovers stay out of git)
+/.venv/
 __pycache__/
 *.py[cod]
-settings.json
+
+# Downloaded test fixtures
+*.raw
+*.tar.gz
+weights.rnn

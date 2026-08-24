@@ -1,0 +1,32 @@
+[package]
+name = "openmic"
+version = "0.2.0"
+edition = "2024"
+description = "Native real-time microphone cleaner and soundboard for Windows"
+license = "MIT"
+repository = "https://github.com/DevanMetz/openmic"
+
+[dependencies]
+anyhow = "1.0"
+arc-swap = "1.7"
+cpal = "0.18.2"
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+directories = "6.0"
+eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+parking_lot = "0.12"
+rfd = "0.15.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.5.5", features = ["all"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+cc = "1"
