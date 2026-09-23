@@ -1,4 +1,4 @@
-//! Realtime engine: mic capture -> RNNoise + gate + soundboard -> output/monitor streams.
+//! Realtime engine: mic capture -> voice cleaner + soundboard -> output/monitor streams.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -12,58 +12,8 @@ use cpal::{Device, Host, Sample, Stream};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 
-use crate::dsp::{apply_processing, Clip, Mixer, Params, FRAME, SR};
-
-/// FFI to the vendored xiph RNNoise compiled by build.rs.
-/// Frames are 480 int16-scaled f32 samples at 48 kHz; processing is in place.
-mod rnn {
-    use std::os::raw::c_float;
-
-    #[repr(C)]
-    pub struct DenoiseState {
-        _opaque: [u8; 0],
-    }
-
-    unsafe extern "C" {
-        fn rnnoise_create(model: *const std::ffi::c_void) -> *mut DenoiseState;
-        fn rnnoise_destroy(st: *mut DenoiseState);
-        fn rnnoise_process_frame(
-            st: *mut DenoiseState,
-            out: *mut c_float,
-            input: *const c_float,
-        ) -> c_float;
-    }
-
-    pub struct Denoiser {
-        st: *mut DenoiseState,
-    }
-
-    // The C state is only touched from the dedicated DSP thread, but the
-    // handle must cross into it once at startup.
-    unsafe impl Send for Denoiser {}
-
-    impl Denoiser {
-        pub fn new() -> Self {
-            // NULL model = the library's built-in trained weights.
-            unsafe { Self { st: rnnoise_create(std::ptr::null()) } }
-        }
-
-        /// Process `frame` in place; returns voice probability.
-        pub fn process_frame(&mut self, frame: &mut [f32]) -> f32 {
-            unsafe {
-                rnnoise_process_frame(self.st, frame.as_mut_ptr(), frame.as_ptr())
-            }
-        }
-    }
-
-    impl Drop for Denoiser {
-        fn drop(&mut self) {
-            if !self.st.is_null() {
-                unsafe { rnnoise_destroy(self.st) }
-            }
-        }
-    }
-}
+use crate::denoise::{Cleaner, ModelState};
+use crate::dsp::{Clip, Mixer, Params, FRAME, SR};
 
 /// Live meters and voice probability for the GUI (f32 bit patterns).
 #[derive(Default)]
@@ -71,6 +21,7 @@ pub struct Stats {
     in_peak: AtomicU32,
     out_peak: AtomicU32,
     prob: AtomicU32,
+    model: AtomicU32,
 }
 
 fn set_f32(atomic: &AtomicU32, value: f32) {
@@ -86,6 +37,7 @@ pub struct StatsSnapshot {
     pub in_peak: f32,
     pub out_peak: f32,
     pub prob: f32,
+    pub model: ModelState,
 }
 
 /// Deduped friendly names for a direction.
@@ -333,6 +285,7 @@ impl Engine {
             in_peak: get_f32(&self.stats.in_peak),
             out_peak: get_f32(&self.stats.out_peak),
             prob: get_f32(&self.stats.prob),
+            model: ModelState::from_u32(self.stats.model.load(Ordering::Relaxed)),
         }
     }
 
@@ -384,8 +337,7 @@ fn process_loop(
     mixer: Arc<Mutex<Mixer>>,
     params: Arc<ArcSwap<Params>>,
 ) -> Result<()> {
-    let mut denoiser = rnn::Denoiser::new();
-    let mut gate_gain = 1.0f32;
+    let mut cleaner = Cleaner::new();
     let mut in_res = crate::resample::Resampler::new(mic_rate, SR);
     let mut out_res = crate::resample::Resampler::new(SR, out_rate);
     let mut mon_res = crate::resample::Resampler::new(SR, mon_rate);
@@ -424,19 +376,10 @@ fn process_loop(
         );
 
         let p = **params.load();
-        // Input gain first (peak is measured pre-gain, like the Python app),
-        // then RNNoise operates on int16-scaled samples.
-        for s in &mut x {
-            *s = (*s * p.input_gain).clamp(-1.0, 1.0) * 32768.0;
-        }
-        let prob = denoiser.process_frame(&mut x);
-        let mut y = [0.0f32; FRAME];
-        for (dst, src) in y.iter_mut().zip(x.iter()) {
-            *dst = src / 32768.0;
-        }
-        let mut z = apply_processing(&x, &y, &p, &mut gate_gain);
+        let (mut z, prob) = cleaner.process(&x, &p);
         mixer.lock().mix(&mut z, p.sound_gain);
         set_f32(&stats.prob, prob);
+        stats.model.store(cleaner.state(&p) as u32, Ordering::Relaxed);
         set_f32(
             &stats.out_peak,
             z.iter().fold(0.0f32, |m, s| m.max(s.abs())),
@@ -469,78 +412,5 @@ fn process_loop(
 fn push_drop_oldest(q: &ArrayQueue<f32>, s: f32) {
     while q.push(s).is_err() {
         q.pop(); // device clock drift
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // Deterministic xorshift RNG so the test needs no rand dependency.
-    struct XorShift(u64);
-    impl XorShift {
-        fn next_uniform(&mut self) -> f32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 ^= self.0 >> 43;
-            ((self.0 >> 43) as f32 / (1u32 << 21) as f32) * 2.0 - 1.0
-        }
-    }
-
-    fn run_frames(input: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        let mut denoiser = rnn::Denoiser::new();
-        let mut out = Vec::with_capacity(input.len());
-        let mut probs = Vec::new();
-        for chunk in input.chunks_exact(FRAME) {
-            let mut frame = [0.0f32; FRAME];
-            frame.copy_from_slice(chunk);
-            probs.push(denoiser.process_frame(&mut frame));
-            out.extend_from_slice(&frame);
-        }
-        (out, probs)
-    }
-
-    fn rms(samples: &[f32]) -> f32 {
-        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
-    }
-
-    // Ported from test_denoise.py: RNNoise crushes stationary noise and
-    // raises speech probability on a tone. Inputs are int16-scaled like the
-    // realtime path feeds them.
-    #[test]
-    fn denoiser_crushes_noise_and_flags_tone() {
-        const SCALE: f32 = 32768.0;
-        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
-        let noise: Vec<f32> = (0..SR as usize * 2)
-            .map(|_| rng.next_uniform() * 0.1 * SCALE)
-            .collect();
-        let (out, probs) = run_frames(&noise);
-        let (rms_in, rms_out) = (rms(&noise), rms(&out));
-        eprintln!("reduction {rms_in} -> {rms_out} ratio={}", rms_out / rms_in);
-        for amp in [0.003f32, 0.01, 0.1] {
-            let n: Vec<f32> =
-                (0..SR as usize).map(|_| rng.next_uniform() * amp * SCALE).collect();
-            let (o, _) = run_frames(&n);
-            eprintln!("amp={amp} ratio={}", rms(&o) / rms(&n));
-        }
-        assert!(rms_out < rms_in * 0.3, "reduction {rms_in} -> {rms_out}");
-
-        let tone: Vec<f32> = (0..SR as usize)
-            .map(|i| {
-                use std::f32::consts::PI;
-                0.3 * SCALE * (2.0 * PI * 220.0 * i as f32 / SR as f32).sin()
-            })
-            .collect();
-        let (_, tone_probs) = run_frames(&tone);
-        let prob_tone = tone_probs.iter().cloned().fold(0.0f32, f32::max);
-        let prob_noise = probs.last().unwrap();
-        eprintln!("prob noise={prob_noise} tone={prob_tone}");
-        // The current xiph model reads stationary noise as fairly speech-like,
-        // but still separates a pure tone decisively.
-        assert!(prob_tone > 0.9, "speech prob on tone: {prob_tone}");
-        assert!(
-            prob_tone > prob_noise * 1.5,
-            "tone should read as more speech-like than noise"
-        );
     }
 }

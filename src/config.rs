@@ -4,17 +4,23 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::dsp::{Model, VOICE_THRESHOLD};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub microphone: String,
     pub output: String,
     pub monitor_output: String,
+    pub model: Model,
     pub strength: f32,
     pub input_gain_db: f32,
     pub output_gain_db: f32,
     pub gate: bool,
     pub gate_threshold_db: f32,
+    pub highpass: bool,
+    pub voice_gate: bool,
+    pub voice_threshold: f32,
     pub bypass: bool,
     pub mute: bool,
     pub monitor: bool,
@@ -31,11 +37,15 @@ impl Default for Settings {
             microphone: String::new(),
             output: String::new(),
             monitor_output: String::new(),
+            model: Model::default(),
             strength: 1.0,
             input_gain_db: 0.0,
             output_gain_db: 0.0,
             gate: false,
             gate_threshold_db: -50.0,
+            highpass: true,
+            voice_gate: true,
+            voice_threshold: VOICE_THRESHOLD,
             bypass: false,
             mute: false,
             monitor: false,
@@ -156,5 +166,16 @@ mod tests {
         assert_eq!(settings.sound_volume, 0.8);
         assert!(settings.auto_start);
         assert!(!settings.monitor);
+        assert_eq!(settings.model, Model::DeepFilter);
+        assert!(settings.highpass && settings.voice_gate);
+    }
+
+    #[test]
+    fn older_settings_files_gain_the_new_voice_defaults() {
+        let settings: Settings = serde_json::from_str(r#"{"strength": 0.8}"#).unwrap();
+        assert_eq!(settings.strength, 0.8);
+        assert_eq!(settings.model, Model::DeepFilter);
+        assert!(settings.highpass && settings.voice_gate);
+        assert_eq!(settings.voice_threshold, VOICE_THRESHOLD);
     }
 }

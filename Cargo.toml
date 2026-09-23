@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows"
 license = "MIT"
@@ -19,9 +19,25 @@ rfd = "0.15.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 symphonia = { version = "0.5.5", features = ["all"] }
+# DeepFilterNet 3 with its tract (pure Rust) runtime and embedded model; the
+# crates.io release predates the runtime, so pin the upstream commit.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet.git", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model"] }
+ndarray = "0.15"
+# deep_filter asks for tract ^0.21.4 but does not build against later 0.21.x
+# releases (breaking API changes); hold the whole family at 0.21.4.
+tract-core = "=0.21.4"
+tract-hir = "=0.21.4"
+tract-onnx = "=0.21.4"
+tract-pulse = "=0.21.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+
+# The DeepFilterNet runtime is far too slow unoptimised for realtime audio,
+# and tract's debug-only graph checks reject the DeepFilterNet 3 model.
+[profile.dev.package."*"]
+opt-level = 3
+debug-assertions = false
 
 [profile.release]
 lto = "thin"

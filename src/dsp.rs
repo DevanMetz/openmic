@@ -1,11 +1,24 @@
-//! Frame DSP: parameter blending, noise gate, soundboard mixing. Pure logic, no I/O.
+//! Frame DSP: parameter blending, gates, high-pass, soundboard mixing. Pure logic, no I/O.
+
+use serde::{Deserialize, Serialize};
 
 pub const SR: u32 = 48_000;
 pub const FRAME: usize = 480; // 10 ms at 48 kHz, the RNNoise frame size
 
+/// Which neural denoiser cleans the voice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Model {
+    /// RNNoise: tiny and fast; handles steady noise (fans, hum).
+    Rnnoise,
+    /// DeepFilterNet 3: much stronger on transient noise (keys, clicks).
+    #[default]
+    DeepFilter,
+}
+
 /// Live per-frame controls shared between the GUI and the processing thread.
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
+    pub model: Model,
     pub strength: f32,
     pub input_gain: f32,
     pub output_gain: f32,
@@ -13,6 +26,9 @@ pub struct Params {
     pub sound_gain: f32,
     pub gate_enabled: bool,
     pub gate_threshold_db: f32,
+    pub highpass: bool,
+    pub voice_gate: bool,
+    pub voice_threshold: f32,
     pub bypass: bool,
     pub mute: bool,
     pub monitor_on: bool,
@@ -21,6 +37,7 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
+            model: Model::default(),
             strength: 1.0,
             input_gain: 1.0,
             output_gain: 1.0,
@@ -28,6 +45,9 @@ impl Default for Params {
             sound_gain: 1.0,
             gate_enabled: false,
             gate_threshold_db: -50.0,
+            highpass: true,
+            voice_gate: true,
+            voice_threshold: VOICE_THRESHOLD,
             bypass: false,
             mute: false,
             monitor_on: false,
@@ -88,6 +108,126 @@ pub fn apply_processing(
         z.fill(0.0);
     }
     z
+}
+
+/// Rumble/handling-noise cutoff; below the lowest fundamental of speech.
+pub const HIGHPASS_HZ: f32 = 80.0;
+
+/// Fourth-order Butterworth high-pass: two cascaded RBJ biquads
+/// (transposed direct form II), 24 dB/octave so hum an octave below the
+/// cutoff drops ~24 dB while the voice band is untouched.
+pub struct HighPass {
+    stages: [Biquad; 2],
+}
+
+struct Biquad {
+    b: [f32; 3],
+    a: [f32; 2],
+    z: [f32; 2],
+}
+
+impl Biquad {
+    fn highpass(cutoff_hz: f32, q: f32) -> Self {
+        let w = std::f32::consts::TAU * cutoff_hz / SR as f32;
+        let alpha = w.sin() / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let cos = w.cos();
+        let b0 = (1.0 + cos) / 2.0 / a0;
+        Self {
+            b: [b0, -2.0 * b0, b0],
+            a: [-2.0 * cos / a0, (1.0 - alpha) / a0],
+            z: [0.0; 2],
+        }
+    }
+
+    fn process(&mut self, frame: &mut [f32]) {
+        let (b, a) = (self.b, self.a);
+        for s in frame {
+            let x = *s;
+            let y = b[0] * x + self.z[0];
+            self.z[0] = b[1] * x - a[0] * y + self.z[1];
+            self.z[1] = b[2] * x - a[1] * y;
+            *s = y;
+        }
+    }
+}
+
+impl HighPass {
+    pub fn new(cutoff_hz: f32) -> Self {
+        // Butterworth pole-pair Qs for order 4.
+        Self {
+            stages: [Biquad::highpass(cutoff_hz, 0.541_196), Biquad::highpass(cutoff_hz, 1.306_563)],
+        }
+    }
+
+    pub fn process(&mut self, frame: &mut [f32]) {
+        for stage in &mut self.stages {
+            stage.process(frame);
+        }
+    }
+}
+
+/// Default voice-probability threshold for the voice gate.
+pub const VOICE_THRESHOLD: f32 = 0.6;
+/// Keep the gate open this long after the last voiced frame so word endings
+/// and short pauses survive (the denoisers' 20-30 ms delay also lands here).
+const VOICE_HOLD_FRAMES: u32 = 30; // 300 ms
+/// Open over 5 ms (click-free); the models' latency means the gate starts
+/// opening before the voiced audio reaches it, so onsets are kept.
+const VOICE_ATTACK_SAMPLES: f32 = 240.0;
+/// Close with a 50 ms time constant, snapping to silence below -60 dB so
+/// loud non-voice sounds are removed rather than just attenuated.
+const VOICE_RELEASE_SECONDS: f32 = 0.05;
+const VOICE_CLOSED_GAIN: f32 = 1e-3;
+
+/// Gate driven by the model's voice probability instead of level: mutes
+/// everything that is not speech (keys, clicks, breathing) however loud.
+pub struct VoiceGate {
+    gain: f32,
+    hold: u32,
+    release: f32,
+}
+
+impl Default for VoiceGate {
+    /// Starts closed: nothing passes until the first voiced frame.
+    fn default() -> Self {
+        Self {
+            gain: 0.0,
+            hold: 0,
+            release: (-1.0 / (SR as f32 * VOICE_RELEASE_SECONDS)).exp(),
+        }
+    }
+}
+
+impl VoiceGate {
+    #[cfg(test)]
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Back to closed, e.g. while bypassed.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn process(&mut self, frame: &mut [f32], prob: f32, threshold: f32) {
+        if prob >= threshold {
+            self.hold = VOICE_HOLD_FRAMES;
+        } else {
+            self.hold = self.hold.saturating_sub(1);
+        }
+        let open = self.hold > 0;
+        for s in frame {
+            self.gain = if open {
+                (self.gain + 1.0 / VOICE_ATTACK_SAMPLES).min(1.0)
+            } else if self.gain > VOICE_CLOSED_GAIN {
+                self.gain * self.release
+            } else {
+                0.0
+            };
+            *s *= self.gain;
+        }
+    }
 }
 
 /// One loaded soundboard clip and its playhead.
@@ -163,7 +303,7 @@ mod tests {
 
     #[test]
     fn bypass_keeps_dry_signal_and_applies_output_gain() {
-        let mut params = Params {
+        let params = Params {
             bypass: true,
             output_gain: 2.0,
             ..Default::default()
@@ -225,6 +365,59 @@ mod tests {
         });
         assert_eq!(mixer.take_remaining().unwrap(), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
         assert!(!mixer.playing());
+    }
+
+    fn tone(freq: f32) -> Vec<f32> {
+        (0..SR as usize)
+            .map(|i| (std::f32::consts::TAU * freq * i as f32 / SR as f32).sin())
+            .collect()
+    }
+
+    fn tail_peak(x: &[f32]) -> f32 {
+        x[x.len() / 2..].iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn highpass_cuts_rumble_and_keeps_voice_band() {
+        let mut rumble = tone(30.0);
+        HighPass::new(HIGHPASS_HZ).process(&mut rumble);
+        assert!(tail_peak(&rumble) < 0.03, "30 Hz peak {}", tail_peak(&rumble));
+
+        let mut voice = tone(300.0);
+        HighPass::new(HIGHPASS_HZ).process(&mut voice);
+        assert!(tail_peak(&voice) > 0.95, "300 Hz peak {}", tail_peak(&voice));
+    }
+
+    #[test]
+    fn voice_gate_holds_through_pauses_then_closes() {
+        let mut gate = VoiceGate::default();
+        let mut before_voice = [1.0f32; FRAME];
+        gate.process(&mut before_voice, 0.1, VOICE_THRESHOLD);
+        assert!(before_voice.iter().all(|&s| s == 0.0), "starts closed");
+
+        let mut frame = [1.0f32; FRAME];
+        gate.process(&mut frame, 0.9, VOICE_THRESHOLD);
+        assert_eq!(gate.gain(), 1.0);
+
+        // A 200 ms pause between words stays fully open.
+        for _ in 0..20 {
+            let mut frame = [1.0f32; FRAME];
+            gate.process(&mut frame, 0.1, VOICE_THRESHOLD);
+            assert_eq!(frame[FRAME - 1], 1.0);
+        }
+        // Past the hold, non-voice is muted however loud it is.
+        for _ in 0..60 {
+            gate.process(&mut [1.0f32; FRAME], 0.1, VOICE_THRESHOLD);
+        }
+        let mut loud_click = [1.0f32; FRAME];
+        gate.process(&mut loud_click, 0.1, VOICE_THRESHOLD);
+        assert!(loud_click.iter().all(|&s| s == 0.0), "gain {}", gate.gain());
+
+        // Voice reopens it within one frame, without a click (ramped).
+        let mut onset = [1.0f32; FRAME];
+        gate.process(&mut onset, 0.9, VOICE_THRESHOLD);
+        assert!(onset[0] > 0.0 && onset[0] < 0.01);
+        assert_eq!(onset[FRAME - 1], 1.0);
     }
 
     #[test]

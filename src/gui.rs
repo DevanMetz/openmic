@@ -10,7 +10,8 @@ use eframe::egui::{
 
 use crate::config::{self, Settings};
 use crate::decode;
-use crate::dsp::{self, Params};
+use crate::denoise::ModelState;
+use crate::dsp::{self, Model, Params};
 use crate::engine::{list_devices, Engine};
 
 const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
@@ -90,6 +91,7 @@ impl App {
     fn params(&self) -> Params {
         let s = &self.settings;
         Params {
+            model: s.model,
             strength: s.strength.clamp(0.0, 1.0),
             input_gain: dsp::db_to_gain(s.input_gain_db),
             output_gain: dsp::db_to_gain(s.output_gain_db),
@@ -97,6 +99,9 @@ impl App {
             sound_gain: s.sound_volume.clamp(0.0, 1.0),
             gate_enabled: s.gate,
             gate_threshold_db: s.gate_threshold_db,
+            highpass: s.highpass,
+            voice_gate: s.voice_gate,
+            voice_threshold: s.voice_threshold.clamp(0.0, 1.0),
             bypass: s.bypass,
             mute: s.mute,
             monitor_on: s.monitor,
@@ -311,6 +316,18 @@ impl App {
         ui.group(|ui| {
             ui.strong(RichText::new("PROCESSING").color(CYAN));
             let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Model");
+                ComboBox::from_id_salt("model")
+                    .selected_text(model_name(self.settings.model))
+                    .show_ui(ui, |ui| {
+                        for model in [Model::DeepFilter, Model::Rnnoise] {
+                            changed |= ui
+                                .selectable_value(&mut self.settings.model, model, model_name(model))
+                                .changed();
+                        }
+                    });
+            });
             for (label, value, range) in [
                 (
                     "Noise reduction",
@@ -341,12 +358,36 @@ impl App {
                 });
             }
             ui.horizontal(|ui| {
-                changed |= ui.checkbox(&mut self.settings.gate, "Noise gate").changed();
+                changed |= ui
+                    .checkbox(&mut self.settings.voice_gate, "Voice gate")
+                    .on_hover_text("Silence everything that isn't speech, however loud")
+                    .changed();
+                ui.add_enabled_ui(self.settings.voice_gate, |ui| {
+                    changed |= ui
+                        .add(
+                            Slider::new(&mut self.settings.voice_threshold, 0.0..=1.0)
+                                .text("voice threshold")
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                        )
+                        .on_hover_text("Raise if noises open the gate; lower if words get cut")
+                        .changed();
+                });
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(&mut self.settings.highpass, "Rumble filter")
+                    .on_hover_text("Cut everything below 80 Hz (desk bumps, hum, handling noise)")
+                    .changed();
+                changed |= ui.checkbox(&mut self.settings.gate, "Level gate").changed();
                 changed |= ui
                     .checkbox(&mut self.settings.bypass, "Bypass reduction")
                     .changed();
                 changed |= ui.checkbox(&mut self.settings.mute, "Mute microphone").changed();
                 if ui.button("Reset").clicked() {
+                    self.settings.model = Model::default();
+                    self.settings.highpass = true;
+                    self.settings.voice_gate = true;
+                    self.settings.voice_threshold = dsp::VOICE_THRESHOLD;
                     self.settings.strength = 1.0;
                     self.settings.input_gain_db = 0.0;
                     self.settings.output_gain_db = 0.0;
@@ -398,10 +439,18 @@ impl App {
                     .as_ref()
                     .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
                 if !warning_fresh {
-                    self.status = (
-                        format!("Running · voice {:.0}%", stats.prob * 100.0),
-                        GREEN,
-                    );
+                    let voice = format!("voice {:.0}%", stats.prob * 100.0);
+                    self.status = match stats.model {
+                        ModelState::DeepFilterLoading => {
+                            (format!("Loading DeepFilterNet… · {voice}"), AMBER)
+                        }
+                        ModelState::DeepFilterFailed => {
+                            (format!("DeepFilterNet unavailable, using RNNoise · {voice}"), AMBER)
+                        }
+                        ModelState::DeepFilter | ModelState::Rnnoise => {
+                            (format!("Running · {voice}"), GREEN)
+                        }
+                    };
                 }
             }
         });
@@ -584,4 +633,11 @@ fn meter(ui: &mut egui::Ui, label: &str, peak: Option<f32>, color: Color32) {
                 .fill(color),
         );
     });
+}
+
+fn model_name(model: Model) -> &'static str {
+    match model {
+        Model::DeepFilter => "DeepFilterNet 3 (best)",
+        Model::Rnnoise => "RNNoise (light)",
+    }
 }

@@ -5,6 +5,7 @@
 mod config;
 mod resample;
 mod decode;
+mod denoise;
 mod dsp;
 mod engine;
 use eframe::egui;
