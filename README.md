@@ -44,9 +44,9 @@ The binary is `target\release\openmic.exe`. No administrator access needed; VB-C
 
 ## Discord setup
 
-1. Run OpenMic.
+1. Run OpenMic. If VB-Cable isn't installed, click **Get VB-Cable**, run its setup as administrator, and OpenMic switches to it on its own once it appears.
 2. Select your physical microphone.
-3. Set **Processed output** to **CABLE Input (VB-Audio Virtual Cable)**.
+3. OpenMic sends your voice to **CABLE Input (VB-Audio Virtual Cable)** automatically. It never defaults to your speakers, which would play your mic back out loud.
 4. In Discord, open **User Settings → Voice & Video**.
 5. Set **Input Device** to **CABLE Output (VB-Audio Virtual Cable)**.
 6. Disable Discord/Krisp noise suppression to avoid double processing.

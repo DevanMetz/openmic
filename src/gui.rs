@@ -40,6 +40,9 @@ pub struct App {
     playing_name: Option<String>,
     warn_until: Option<(String, Instant)>,
     dirty_since: Option<Instant>,
+    /// While VB-Cable is missing, devices are re-listed periodically so an
+    /// install is picked up without pressing Refresh.
+    last_device_poll: Instant,
 }
 
 impl App {
@@ -56,31 +59,17 @@ impl App {
             playing_name: None,
             warn_until: None,
             dirty_since: None,
+            last_device_poll: Instant::now(),
         };
         // Reflect the actual registry state, like the Python app did.
         app.settings.start_with_windows = config::startup_enabled();
 
-        if app.settings.microphone.is_empty() {
-            app.settings.microphone = app.inputs.first().cloned().unwrap_or_default();
-        }
-        if app.settings.output.is_empty() {
-            app.settings.output = app
-                .outputs
-                .iter()
-                .find(|n| n.contains("CABLE Input"))
-                .or_else(|| app.outputs.first())
-                .cloned()
-                .unwrap_or_default();
-        }
-        if app.settings.monitor_output.is_empty() {
-            app.settings.monitor_output = app
-                .outputs
-                .iter()
-                .find(|n| !n.contains("CABLE Input"))
-                .or_else(|| app.outputs.first())
-                .cloned()
-                .unwrap_or_default();
-        }
+        let host = cpal_host();
+        app.inputs = list_devices(&host, false);
+        app.outputs = list_devices(&host, true);
+        // Keep saved devices even if absent: a USB mic can appear after a
+        // Windows-startup launch, and must not be silently swapped out.
+        choose_routes(&mut app.settings, &app.inputs, &app.outputs, false, false);
 
         if app.settings.auto_start {
             app.start_engine();
@@ -120,6 +109,10 @@ impl App {
     }
 
     fn start_engine(&mut self) {
+        if self.settings.output.is_empty() {
+            self.status = ("Install VB-Cable or choose a processed output".into(), AMBER);
+            return;
+        }
         match Engine::start(
             &self.settings.microphone,
             &self.settings.output,
@@ -156,34 +149,40 @@ impl App {
         }
     }
 
-    fn refresh_devices(&mut self, live: bool) {
+    /// Re-list devices. `replace_missing` (the Refresh button) swaps out
+    /// choices whose device is gone; background polls only fill empty ones.
+    fn refresh_devices(&mut self, replace_missing: bool) {
         let host = cpal_host();
         let before = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
+        let had_cable = cable_input(&self.outputs).is_some();
         self.inputs = list_devices(&host, false);
         self.outputs = list_devices(&host, true);
-        if !self.inputs.iter().any(|n| *n == self.settings.microphone) {
-            self.settings.microphone = self.inputs.first().cloned().unwrap_or_default();
-        }
-        for (current, pool) in [
-            (&mut self.settings.output, &self.outputs),
-            (&mut self.settings.monitor_output, &self.outputs),
-        ] {
-            if !pool.iter().any(|n| *n == *current) {
-                *current = pool.first().cloned().unwrap_or_default();
-            }
-        }
-        self.touch();
+        let cable_appeared = !had_cable && cable_input(&self.outputs).is_some();
+        choose_routes(
+            &mut self.settings,
+            &self.inputs,
+            &self.outputs,
+            cable_appeared,
+            replace_missing,
+        );
         let after = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
-        if live && self.engine.is_some() && before != after {
+        if before == after {
+            return;
+        }
+        self.touch();
+        if self.engine.is_some() {
             self.restart_engine();
+        } else if cable_appeared && self.settings.auto_start {
+            // Nothing could run before VB-Cable existed; start now it does.
+            self.start_engine();
         }
     }
 
@@ -281,6 +280,39 @@ impl App {
             self.sound_status = ("Ready".into(), Color32::WHITE);
         }
     }
+    /// Discord hears OpenMic through VB-Cable; walk the user to a working route.
+    fn draw_cable_hint(&mut self, ui: &mut egui::Ui) {
+        match cable_input(&self.outputs).cloned() {
+            None => {
+                ui.label(
+                    RichText::new("VB-Cable isn't installed: Discord needs it to hear OpenMic.")
+                        .color(AMBER),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Get VB-Cable").clicked() {
+                        open_url(VB_CABLE_URL);
+                    }
+                    ui.weak("Run its setup as administrator; OpenMic switches to it automatically.");
+                });
+            }
+            Some(cable) if self.settings.output != cable => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Discord can't hear this output.").color(AMBER));
+                    if ui.button("Use VB-Cable").clicked() {
+                        self.settings.output = cable;
+                        self.touch();
+                        if self.engine.is_some() {
+                            self.restart_engine();
+                        }
+                    }
+                });
+            }
+            Some(_) => {
+                ui.weak("In Discord: Voice & Video > Input Device > CABLE Output");
+            }
+        }
+    }
+
     fn draw_mic_tab(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.strong(RichText::new("ROUTING").color(CYAN));
@@ -310,6 +342,7 @@ impl App {
                 }
                 ui.weak(RichText::new("Changes apply live").color(GREEN));
             });
+            self.draw_cable_hint(ui);
         });
 
         ui.add_space(8.0);
@@ -520,6 +553,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(100));
         self.poll_engine();
+        if cable_input(&self.outputs).is_none()
+            && self.last_device_poll.elapsed() >= Duration::from_secs(3)
+        {
+            self.last_device_poll = Instant::now();
+            self.refresh_devices(false);
+        }
 
         if let Some(t) = self.dirty_since {
             if t.elapsed() >= Duration::from_millis(300) {
@@ -639,5 +678,119 @@ fn model_name(model: Model) -> &'static str {
     match model {
         Model::DeepFilter => "DeepFilterNet 3 (best)",
         Model::Rnnoise => "RNNoise (light)",
+    }
+}
+
+const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
+
+/// VB-Audio Virtual Cable's playback side (Discord records "CABLE Output").
+fn cable_input(outputs: &[String]) -> Option<&String> {
+    outputs.iter().find(|n| n.contains("CABLE Input"))
+}
+
+/// Keep valid device choices and fill missing ones: the processed output
+/// prefers VB-Cable and the monitor avoids it. When VB-Cable has just been
+/// installed (`cable_appeared`), switch the processed output over to it.
+/// Without VB-Cable the processed output stays unset: defaulting to the
+/// first device would play the mic out of the speakers (feedback).
+/// Choices whose device is absent are only replaced if `replace_missing`.
+fn choose_routes(
+    s: &mut Settings,
+    inputs: &[String],
+    outputs: &[String],
+    cable_appeared: bool,
+    replace_missing: bool,
+) {
+    let needs = |current: &String, pool: &[String]| {
+        current.is_empty() || (replace_missing && !pool.contains(current))
+    };
+    if needs(&s.microphone, inputs) {
+        s.microphone = inputs.first().cloned().unwrap_or_default();
+    }
+    let cable = cable_input(outputs);
+    if cable_appeared || needs(&s.output, outputs) {
+        s.output = cable.cloned().unwrap_or_default();
+    }
+    if needs(&s.monitor_output, outputs) {
+        s.monitor_output = outputs
+            .iter()
+            .find(|n| Some(*n) != cable)
+            .or(outputs.first())
+            .cloned()
+            .unwrap_or_default();
+    }
+}
+
+fn open_url(url: &str) {
+    // Explorer hands URLs to the default browser.
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fresh_install_routes_voice_to_vb_cable_and_monitor_elsewhere() {
+        let mut s = Settings::default();
+        let inputs = names(&["Mic (USB)"]);
+        let outputs = names(&["Speakers (Realtek)", "CABLE Input (VB-Audio Virtual Cable)"]);
+        choose_routes(&mut s, &inputs, &outputs, false, false);
+        assert_eq!(s.microphone, "Mic (USB)");
+        assert_eq!(s.output, "CABLE Input (VB-Audio Virtual Cable)");
+        assert_eq!(s.monitor_output, "Speakers (Realtek)");
+    }
+
+    #[test]
+    fn never_defaults_the_voice_to_speakers() {
+        let mut s = Settings::default();
+        let outputs = names(&["Speakers (Realtek)"]);
+        choose_routes(&mut s, &names(&["Mic (USB)"]), &outputs, false, false);
+        assert_eq!(s.output, "", "would feed the mic back out of the speakers");
+        assert_eq!(s.monitor_output, "Speakers (Realtek)");
+    }
+
+    #[test]
+    fn keeps_valid_choices_until_vb_cable_is_installed() {
+        let mut s = Settings {
+            microphone: "Mic (USB)".into(),
+            output: "Speakers (Realtek)".into(),
+            monitor_output: "Headphones".into(),
+            ..Default::default()
+        };
+        let inputs = names(&["Mic (USB)"]);
+        let outputs = names(&["Speakers (Realtek)", "Headphones"]);
+        choose_routes(&mut s, &inputs, &outputs, false, false);
+        assert_eq!(s.output, "Speakers (Realtek)");
+
+        let outputs = names(&[
+            "Speakers (Realtek)",
+            "Headphones",
+            "CABLE Input (VB-Audio Virtual Cable)",
+        ]);
+        choose_routes(&mut s, &inputs, &outputs, false, true);
+        assert_eq!(s.output, "Speakers (Realtek)", "a deliberate choice survives a refresh");
+        choose_routes(&mut s, &inputs, &outputs, true, false);
+        assert_eq!(s.output, "CABLE Input (VB-Audio Virtual Cable)");
+        assert_eq!(s.monitor_output, "Headphones");
+    }
+
+    #[test]
+    fn late_usb_mic_is_not_swapped_out_except_by_refresh() {
+        let mut s = Settings {
+            microphone: "Mic (USB)".into(),
+            output: "CABLE Input (VB-Audio Virtual Cable)".into(),
+            ..Default::default()
+        };
+        let outputs = names(&["CABLE Input (VB-Audio Virtual Cable)", "Speakers"]);
+        let without_usb = names(&["Webcam Mic"]);
+        choose_routes(&mut s, &without_usb, &outputs, false, false);
+        assert_eq!(s.microphone, "Mic (USB)", "startup/poll keeps the saved mic");
+        choose_routes(&mut s, &without_usb, &outputs, false, true);
+        assert_eq!(s.microphone, "Webcam Mic", "Refresh replaces a device that is gone");
     }
 }
