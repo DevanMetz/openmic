@@ -11,15 +11,15 @@ Audio stays on your computer. Nothing is recorded or uploaded.
 - DeepFilterNet 3 noise suppression (pure-Rust tract runtime, model embedded in the binary) — strong on keyboard clicks and other transient noise, ~2% of one CPU core
 - RNNoise as a light alternative (vendored xiph source, built via `cc` — no Python, no prebuilt DLLs)
 - Voice gate: mutes everything that isn't speech, however loud, using RNNoise's voice detector with a 300 ms hold so word endings survive
-- Rumble filter: 4th-order 80 Hz high-pass for desk bumps, hum and handling noise
+- Rumble filter: 4th-order high-pass (80 Hz by default, 40–200 Hz) for desk bumps, hum and handling noise
+- Live scope that doubles as the control surface: see your mic against what Discord hears, the voice detector and the rumble filter, and drag the lines to adjust them
 - Opens devices at their native formats and resamples to/from the 48 kHz DSP core
-- Selectable microphone, processed output, and headphone monitor
+- Selectable microphone, processed output, and headphone monitor; VB-Cable is chosen automatically and made the default microphone while OpenMic runs
 - Live routing changes with automatic stream handoff (soundboard playhead preserved)
-- Noise-reduction wet/dry control
-- Input/output gain and an optional level-based gate
+- Noise-reduction strength, input/output gain and an optional level-based gate
 - Live bypass and microphone mute
 - Persistent soundboard with independent volume; WAV, FLAC, OGG, MP3, AIFF via symphonia
-- Input and output level meters plus live voice-probability readout
+- Input and output level meters
 - Automatic settings persistence
 - Optional Windows startup and automatic processing
 - Dark native GUI (egui)
@@ -46,12 +46,24 @@ The binary is `target\release\openmic.exe`. No administrator access needed; VB-C
 
 1. Run OpenMic. If VB-Cable isn't installed, click **Get VB-Cable**, run its setup as administrator, and OpenMic switches to it on its own once it appears.
 2. Select your physical microphone.
-3. OpenMic sends your voice to **CABLE Input (VB-Audio Virtual Cable)** automatically. It never defaults to your speakers, which would play your mic back out loud.
-4. In Discord, open **User Settings → Voice & Video**.
-5. Set **Input Device** to **CABLE Output (VB-Audio Virtual Cable)**.
-6. Disable Discord/Krisp noise suppression to avoid double processing.
+3. OpenMic sends your voice to **CABLE Input (VB-Audio Virtual Cable)** automatically on every launch. It never defaults to your speakers, which would play your mic back out loud.
+4. While it runs, OpenMic also makes **CABLE Output** your Windows default microphone, so Discord's **Input Device** can stay on **Default**. Your previous default comes back when OpenMic stops or closes (and on the next launch if it ever crashes). Untick **Make CABLE Output my Windows default mic while running** to set Discord's input to **CABLE Output** by hand instead.
+5. In Discord (**User Settings → Voice & Video**), disable Discord/Krisp noise suppression to avoid double processing.
 
-The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your voice. If the ends of quiet words get cut, lower **voice threshold**; if a noise opens the gate, raise it.
+The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your voice.
+
+## Adjusting
+
+Everything is adjusted by dragging in the **Live scope**; double-click any line to reset it.
+
+| Drag | Changes |
+|---|---|
+| Blue line (your mic) or its chip, up/down | Input gain |
+| Green line (to Discord) or its chip, up/down | Output gain |
+| **reduction** chip, up/down | Noise-reduction strength |
+| Dashed amber line | Level-gate threshold |
+| Voice chart, up/down | Voice-gate threshold: lower it if the ends of quiet words get cut, raise it if a noise opens the gate |
+| Rumble curve, left/right | Rumble-filter cutoff |
 
 Use headphones before enabling the headphone monitor to prevent feedback.
 

@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::dsp::{Model, VOICE_THRESHOLD};
+use crate::default_mic::SavedDefaults;
+use crate::dsp::{Model, HIGHPASS_HZ, VOICE_THRESHOLD};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +20,7 @@ pub struct Settings {
     pub gate: bool,
     pub gate_threshold_db: f32,
     pub highpass: bool,
+    pub highpass_hz: f32,
     pub voice_gate: bool,
     pub voice_threshold: f32,
     pub bypass: bool,
@@ -29,6 +31,12 @@ pub struct Settings {
     pub sounds: Vec<PathBuf>,
     pub start_with_windows: bool,
     pub auto_start: bool,
+    /// Make VB-Cable's "CABLE Output" the Windows default microphone while
+    /// processing, so Discord left on "Default" hears the cleaned voice.
+    pub default_mic: bool,
+    /// Windows' default microphones before OpenMic changed them; restored
+    /// when processing stops, including on the next launch after a crash.
+    pub saved_default_mic: Option<SavedDefaults>,
 }
 
 impl Default for Settings {
@@ -44,6 +52,7 @@ impl Default for Settings {
             gate: false,
             gate_threshold_db: -50.0,
             highpass: true,
+            highpass_hz: HIGHPASS_HZ,
             voice_gate: true,
             voice_threshold: VOICE_THRESHOLD,
             bypass: false,
@@ -54,6 +63,8 @@ impl Default for Settings {
             sounds: Vec::new(),
             start_with_windows: false,
             auto_start: true,
+            default_mic: true,
+            saved_default_mic: None,
         }
     }
 }

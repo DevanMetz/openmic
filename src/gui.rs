@@ -10,14 +10,16 @@ use eframe::egui::{
 
 use crate::config::{self, Settings};
 use crate::decode;
+use crate::default_mic;
 use crate::denoise::ModelState;
 use crate::dsp::{self, Model, Params};
 use crate::engine::{list_devices, Engine};
+use crate::viz::{self, Focus};
 
-const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
-const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
-const AMBER: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
-const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
+pub(crate) const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
+pub(crate) const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
+pub(crate) const AMBER: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+pub(crate) const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
 const MUTED: Color32 = Color32::from_rgb(0x94, 0xa3, 0xb8);
 
 #[derive(PartialEq)]
@@ -43,6 +45,11 @@ pub struct App {
     /// While VB-Cable is missing, devices are re-listed periodically so an
     /// install is picked up without pressing Refresh.
     last_device_poll: Instant,
+    /// (running, processed output, setting) the Windows default microphone
+    /// was last reconciled for.
+    default_mic_synced: Option<(bool, String, bool)>,
+    /// The processing setting under the pointer this frame.
+    focus: Option<Focus>,
 }
 
 impl App {
@@ -60,6 +67,8 @@ impl App {
             warn_until: None,
             dirty_since: None,
             last_device_poll: Instant::now(),
+            default_mic_synced: None,
+            focus: None,
         };
         // Reflect the actual registry state, like the Python app did.
         app.settings.start_with_windows = config::startup_enabled();
@@ -68,8 +77,9 @@ impl App {
         app.inputs = list_devices(&host, false);
         app.outputs = list_devices(&host, true);
         // Keep saved devices even if absent: a USB mic can appear after a
-        // Windows-startup launch, and must not be silently swapped out.
-        choose_routes(&mut app.settings, &app.inputs, &app.outputs, false, false);
+        // Windows-startup launch, and must not be silently swapped out. The
+        // processed output goes back to VB-Cable on every launch.
+        choose_routes(&mut app.settings, &app.inputs, &app.outputs, true, false);
 
         if app.settings.auto_start {
             app.start_engine();
@@ -89,6 +99,7 @@ impl App {
             gate_enabled: s.gate,
             gate_threshold_db: s.gate_threshold_db,
             highpass: s.highpass,
+            highpass_hz: s.highpass_hz.clamp(*dsp::HIGHPASS_RANGE.start(), *dsp::HIGHPASS_RANGE.end()),
             voice_gate: s.voice_gate,
             voice_threshold: s.voice_threshold.clamp(0.0, 1.0),
             bypass: s.bypass,
@@ -308,8 +319,67 @@ impl App {
                 });
             }
             Some(_) => {
-                ui.weak("In Discord: Voice & Video > Input Device > CABLE Output");
+                let changed = ui
+                    .checkbox(
+                        &mut self.settings.default_mic,
+                        "Make CABLE Output my Windows default mic while running",
+                    )
+                    .on_hover_text(
+                        "Apps set to the default microphone (Discord's default) hear your \
+                         cleaned voice. Your previous default comes back when OpenMic stops.",
+                    )
+                    .changed();
+                if changed {
+                    self.touch();
+                }
+                if self.settings.default_mic {
+                    ui.weak("In Discord: leave Voice & Video > Input Device on Default");
+                } else {
+                    ui.weak("In Discord: Voice & Video > Input Device > CABLE Output");
+                }
             }
+        }
+    }
+
+    /// Point the Windows default microphone at VB-Cable while processing into
+    /// it, and put the user's own default back otherwise. Runs only when the
+    /// relevant state changes.
+    fn sync_default_mic(&mut self) {
+        let running = self.engine.is_some();
+        let key = (running, self.settings.output.clone(), self.settings.default_mic);
+        if self.default_mic_synced.as_ref() == Some(&key) {
+            return;
+        }
+        self.default_mic_synced = Some(key);
+
+        let Ok(Some(cable_mic)) = default_mic::cable_capture_id() else {
+            return;
+        };
+        let want = running
+            && self.settings.default_mic
+            && cable_input(&self.outputs) == Some(&self.settings.output);
+        match (self.settings.saved_default_mic.clone(), want) {
+            (None, true) => {
+                let Ok(before) = default_mic::current() else { return };
+                if before.console == cable_mic && before.communications == cable_mic {
+                    return; // already the default; nothing to restore later
+                }
+                // Persist first so a crash can't lose the user's default.
+                self.settings.saved_default_mic = Some(before);
+                let _ = self.settings.save();
+                if let Err(e) = default_mic::set(&cable_mic) {
+                    self.settings.saved_default_mic = None;
+                    let _ = self.settings.save();
+                    self.warn_until = Some((short(&format!("{e:#}")), Instant::now()));
+                }
+            }
+            (Some(saved), false) => {
+                if default_mic::restore(&saved, &cable_mic).is_ok() {
+                    self.settings.saved_default_mic = None;
+                    let _ = self.settings.save();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -349,9 +419,18 @@ impl App {
         ui.group(|ui| {
             ui.strong(RichText::new("PROCESSING").color(CYAN));
             let mut changed = false;
+            // Which setting the pointer is on, so the scope can highlight it.
+            let mut focus = None;
+            let mut watch = |r: egui::Response, f: Focus| {
+                if r.hovered() || r.dragged() {
+                    focus = Some(f);
+                }
+                r.changed()
+            };
             ui.horizontal(|ui| {
-                ui.label("Model");
-                ComboBox::from_id_salt("model")
+                let label = ui.label("Model");
+                watch(label, Focus::Model);
+                let combo = ComboBox::from_id_salt("model")
                     .selected_text(model_name(self.settings.model))
                     .show_ui(ui, |ui| {
                         for model in [Model::DeepFilter, Model::Rnnoise] {
@@ -360,58 +439,22 @@ impl App {
                                 .changed();
                         }
                     });
-            });
-            for (label, value, range) in [
-                (
-                    "Noise reduction",
-                    &mut self.settings.strength,
-                    0.0..=1.0,
-                ),
-                ("Input gain", &mut self.settings.input_gain_db, -12.0..=24.0),
-                (
-                    "Output gain",
-                    &mut self.settings.output_gain_db,
-                    -24.0..=12.0,
-                ),
-                (
-                    "Gate threshold",
-                    &mut self.settings.gate_threshold_db,
-                    -80.0..=-20.0,
-                ),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(label);
-                    let slider = if label == "Noise reduction" {
-                        Slider::new(value, range)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                    } else {
-                        Slider::new(value, range).suffix(" dB")
-                    };
-                    changed |= ui.add(slider).changed();
-                });
-            }
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .checkbox(&mut self.settings.voice_gate, "Voice gate")
-                    .on_hover_text("Silence everything that isn't speech, however loud")
-                    .changed();
-                ui.add_enabled_ui(self.settings.voice_gate, |ui| {
-                    changed |= ui
-                        .add(
-                            Slider::new(&mut self.settings.voice_threshold, 0.0..=1.0)
-                                .text("voice threshold")
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                        )
-                        .on_hover_text("Raise if noises open the gate; lower if words get cut")
-                        .changed();
-                });
+                watch(combo.response, Focus::Model);
             });
             ui.horizontal(|ui| {
-                changed |= ui
-                    .checkbox(&mut self.settings.highpass, "Rumble filter")
-                    .on_hover_text("Cut everything below 80 Hz (desk bumps, hum, handling noise)")
-                    .changed();
-                changed |= ui.checkbox(&mut self.settings.gate, "Level gate").changed();
+                changed |= watch(
+                    ui.checkbox(&mut self.settings.voice_gate, "Voice gate")
+                        .on_hover_text("Silence everything that isn't speech, however loud"),
+                    Focus::VoiceGate,
+                );
+                changed |= watch(
+                    ui.checkbox(&mut self.settings.highpass, "Rumble filter")
+                        .on_hover_text("Cut low rumble: desk bumps, hum, handling noise"),
+                    Focus::Rumble,
+                );
+                changed |= watch(ui.checkbox(&mut self.settings.gate, "Level gate"), Focus::LevelGate);
+            });
+            ui.horizontal(|ui| {
                 changed |= ui
                     .checkbox(&mut self.settings.bypass, "Bypass reduction")
                     .changed();
@@ -419,6 +462,7 @@ impl App {
                 if ui.button("Reset").clicked() {
                     self.settings.model = Model::default();
                     self.settings.highpass = true;
+                    self.settings.highpass_hz = dsp::HIGHPASS_HZ;
                     self.settings.voice_gate = true;
                     self.settings.voice_threshold = dsp::VOICE_THRESHOLD;
                     self.settings.strength = 1.0;
@@ -435,6 +479,7 @@ impl App {
             if changed {
                 self.apply_live();
             }
+            self.focus = focus;
         });
 
         ui.add_space(8.0);
@@ -485,6 +530,15 @@ impl App {
                         }
                     };
                 }
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.strong(RichText::new("LIVE SCOPE · drag to adjust").color(CYAN));
+            let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
+            if viz::scope(ui, &frames, &mut self.settings, self.focus) {
+                self.apply_live();
             }
         });
     }
@@ -549,10 +603,18 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_engine(false);
+        self.sync_default_mic();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // The live scope animates at ~30 fps while processing.
+        let frame_time = if self.engine.is_some() { 33 } else { 100 };
+        ctx.request_repaint_after(Duration::from_millis(frame_time));
         self.poll_engine();
+        self.sync_default_mic();
         if cable_input(&self.outputs).is_none()
             && self.last_device_poll.elapsed() >= Duration::from_secs(3)
         {
@@ -690,7 +752,8 @@ fn cable_input(outputs: &[String]) -> Option<&String> {
 
 /// Keep valid device choices and fill missing ones: the processed output
 /// prefers VB-Cable and the monitor avoids it. When VB-Cable has just been
-/// installed (`cable_appeared`), switch the processed output over to it.
+/// installed or the app launches (`prefer_cable`), switch the processed
+/// output over to it.
 /// Without VB-Cable the processed output stays unset: defaulting to the
 /// first device would play the mic out of the speakers (feedback).
 /// Choices whose device is absent are only replaced if `replace_missing`.
@@ -698,7 +761,7 @@ fn choose_routes(
     s: &mut Settings,
     inputs: &[String],
     outputs: &[String],
-    cable_appeared: bool,
+    prefer_cable: bool,
     replace_missing: bool,
 ) {
     let needs = |current: &String, pool: &[String]| {
@@ -708,7 +771,7 @@ fn choose_routes(
         s.microphone = inputs.first().cloned().unwrap_or_default();
     }
     let cable = cable_input(outputs);
-    if cable_appeared || needs(&s.output, outputs) {
+    if (prefer_cable && cable.is_some()) || needs(&s.output, outputs) {
         s.output = cable.cloned().unwrap_or_default();
     }
     if needs(&s.monitor_output, outputs) {
@@ -755,6 +818,18 @@ mod tests {
     }
 
     #[test]
+    fn launch_always_returns_the_voice_to_vb_cable() {
+        let mut s = Settings {
+            microphone: "Mic (USB)".into(),
+            output: "Speakers (Realtek)".into(),
+            ..Default::default()
+        };
+        let outputs = names(&["Speakers (Realtek)", "CABLE Input (VB-Audio Virtual Cable)"]);
+        choose_routes(&mut s, &names(&["Mic (USB)"]), &outputs, true, false);
+        assert_eq!(s.output, "CABLE Input (VB-Audio Virtual Cable)");
+    }
+
+    #[test]
     fn keeps_valid_choices_until_vb_cable_is_installed() {
         let mut s = Settings {
             microphone: "Mic (USB)".into(),
@@ -773,7 +848,7 @@ mod tests {
             "CABLE Input (VB-Audio Virtual Cable)",
         ]);
         choose_routes(&mut s, &inputs, &outputs, false, true);
-        assert_eq!(s.output, "Speakers (Realtek)", "a deliberate choice survives a refresh");
+        assert_eq!(s.output, "Speakers (Realtek)", "a choice made this session survives a refresh");
         choose_routes(&mut s, &inputs, &outputs, true, false);
         assert_eq!(s.output, "CABLE Input (VB-Audio Virtual Cable)");
         assert_eq!(s.monitor_output, "Headphones");

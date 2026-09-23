@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows"
 license = "MIT"
@@ -32,6 +32,18 @@ tract-pulse = "=0.21.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# Same version cpal already pulls in; used to set the default microphone.
+windows = { version = "0.62", features = [
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_UI_Shell_PropertiesSystem",
+] }
+# The #[interface] macro (IPolicyConfig) expands to paths in windows-core.
+windows-core = "0.62"
 
 # The DeepFilterNet runtime is far too slow unoptimised for realtime audio,
 # and tract's debug-only graph checks reject the DeepFilterNet 3 model.

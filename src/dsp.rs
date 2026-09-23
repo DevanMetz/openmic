@@ -27,6 +27,7 @@ pub struct Params {
     pub gate_enabled: bool,
     pub gate_threshold_db: f32,
     pub highpass: bool,
+    pub highpass_hz: f32,
     pub voice_gate: bool,
     pub voice_threshold: f32,
     pub bypass: bool,
@@ -46,6 +47,7 @@ impl Default for Params {
             gate_enabled: false,
             gate_threshold_db: -50.0,
             highpass: true,
+            highpass_hz: HIGHPASS_HZ,
             voice_gate: true,
             voice_threshold: VOICE_THRESHOLD,
             bypass: false,
@@ -110,14 +112,17 @@ pub fn apply_processing(
     z
 }
 
-/// Rumble/handling-noise cutoff; below the lowest fundamental of speech.
+/// Default rumble/handling-noise cutoff; below the lowest fundamental of speech.
 pub const HIGHPASS_HZ: f32 = 80.0;
+/// Range the rumble cutoff can be dragged over.
+pub const HIGHPASS_RANGE: std::ops::RangeInclusive<f32> = 40.0..=200.0;
 
 /// Fourth-order Butterworth high-pass: two cascaded RBJ biquads
 /// (transposed direct form II), 24 dB/octave so hum an octave below the
 /// cutoff drops ~24 dB while the voice band is untouched.
 pub struct HighPass {
     stages: [Biquad; 2],
+    cutoff_hz: f32,
 }
 
 struct Biquad {
@@ -153,10 +158,27 @@ impl Biquad {
 }
 
 impl HighPass {
+    // Butterworth pole-pair Qs for order 4.
+    const QS: [f32; 2] = [0.541_196, 1.306_563];
+
     pub fn new(cutoff_hz: f32) -> Self {
-        // Butterworth pole-pair Qs for order 4.
         Self {
-            stages: [Biquad::highpass(cutoff_hz, 0.541_196), Biquad::highpass(cutoff_hz, 1.306_563)],
+            stages: Self::QS.map(|q| Biquad::highpass(cutoff_hz, q)),
+            cutoff_hz,
+        }
+    }
+
+    /// Retune without clearing the filter state, so dragging the cutoff
+    /// while talking doesn't click.
+    pub fn set_cutoff(&mut self, cutoff_hz: f32) {
+        if cutoff_hz == self.cutoff_hz {
+            return;
+        }
+        self.cutoff_hz = cutoff_hz;
+        for (stage, q) in self.stages.iter_mut().zip(Self::QS) {
+            let tuned = Biquad::highpass(cutoff_hz, q);
+            stage.b = tuned.b;
+            stage.a = tuned.a;
         }
     }
 
@@ -165,6 +187,12 @@ impl HighPass {
             stage.process(frame);
         }
     }
+}
+
+/// Rumble filter gain at `freq_hz` for `cutoff_hz`, dB (4th-order
+/// Butterworth magnitude).
+pub fn highpass_response_db(freq_hz: f32, cutoff_hz: f32) -> f32 {
+    -10.0 * (1.0 + (cutoff_hz / freq_hz).powi(8)).log10()
 }
 
 /// Default voice-probability threshold for the voice gate.
@@ -200,7 +228,6 @@ impl Default for VoiceGate {
 }
 
 impl VoiceGate {
-    #[cfg(test)]
     pub fn gain(&self) -> f32 {
         self.gain
     }
@@ -386,6 +413,22 @@ mod tests {
         let mut voice = tone(300.0);
         HighPass::new(HIGHPASS_HZ).process(&mut voice);
         assert!(tail_peak(&voice) > 0.95, "300 Hz peak {}", tail_peak(&voice));
+    }
+
+    #[test]
+    fn highpass_response_matches_the_filter() {
+        for (freq, cutoff) in [(30.0, 80.0), (50.0, 80.0), (80.0, 80.0), (150.0, 80.0), (150.0, 160.0)] {
+            let mut x = tone(freq);
+            let mut hp = HighPass::new(HIGHPASS_HZ);
+            hp.set_cutoff(cutoff); // retuning must give the same filter
+            hp.process(&mut x);
+            let measured = 20.0 * tail_peak(&x).log10();
+            let predicted = highpass_response_db(freq, cutoff);
+            assert!(
+                (measured - predicted).abs() < 1.0,
+                "{freq} Hz @ {cutoff} Hz: filter {measured:.1} dB vs curve {predicted:.1} dB"
+            );
+        }
     }
 
     #[test]

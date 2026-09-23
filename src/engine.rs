@@ -1,5 +1,6 @@
 //! Realtime engine: mic capture -> voice cleaner + soundboard -> output/monitor streams.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,6 +16,21 @@ use parking_lot::Mutex;
 use crate::denoise::{Cleaner, ModelState};
 use crate::dsp::{Clip, Mixer, Params, FRAME, SR};
 
+/// How much processing history the GUI scope shows: 3 s of 10 ms frames.
+pub const SCOPE_FRAMES: usize = 300;
+
+/// One processed frame as the scope draws it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScopeFrame {
+    /// RMS of the mic after input gain, dBFS.
+    pub input_db: f32,
+    /// RMS of the cleaned voice (before the soundboard), dBFS.
+    pub output_db: f32,
+    pub prob: f32,
+    pub voice_gate: f32,
+    pub level_gate: f32,
+}
+
 /// Live meters and voice probability for the GUI (f32 bit patterns).
 #[derive(Default)]
 pub struct Stats {
@@ -22,6 +38,7 @@ pub struct Stats {
     out_peak: AtomicU32,
     prob: AtomicU32,
     model: AtomicU32,
+    history: Mutex<VecDeque<ScopeFrame>>,
 }
 
 fn set_f32(atomic: &AtomicU32, value: f32) {
@@ -280,6 +297,11 @@ impl Engine {
         self.mixer.lock().take_remaining()
     }
 
+    /// The last few seconds of processing, oldest first.
+    pub fn scope(&self) -> Vec<ScopeFrame> {
+        self.stats.history.lock().iter().copied().collect()
+    }
+
     pub fn stats(&self) -> StatsSnapshot {
         StatsSnapshot {
             in_peak: get_f32(&self.stats.in_peak),
@@ -377,6 +399,21 @@ fn process_loop(
 
         let p = **params.load();
         let (mut z, prob) = cleaner.process(&x, &p);
+        let (voice_gate, level_gate) = cleaner.gate_gains(&p);
+        let frame = ScopeFrame {
+            input_db: rms_db(x.iter().map(|s| (s * p.input_gain).clamp(-1.0, 1.0))),
+            output_db: rms_db(z.iter().copied()),
+            prob,
+            voice_gate,
+            level_gate,
+        };
+        // Never block the audio thread on the GUI; a skipped point is invisible.
+        if let Some(mut history) = stats.history.try_lock() {
+            if history.len() == SCOPE_FRAMES {
+                history.pop_front();
+            }
+            history.push_back(frame);
+        }
         mixer.lock().mix(&mut z, p.sound_gain);
         set_f32(&stats.prob, prob);
         stats.model.store(cleaner.state(&p) as u32, Ordering::Relaxed);
@@ -407,6 +444,12 @@ fn process_loop(
             } {}
         }
     }
+}
+
+fn rms_db(samples: impl ExactSizeIterator<Item = f32>) -> f32 {
+    let n = samples.len().max(1) as f32;
+    let mean_square = samples.map(|s| s * s).sum::<f32>() / n;
+    10.0 * mean_square.max(1e-12).log10()
 }
 
 fn push_drop_oldest(q: &ArrayQueue<f32>, s: f32) {

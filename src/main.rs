@@ -5,11 +5,13 @@
 mod config;
 mod resample;
 mod decode;
+mod default_mic;
 mod denoise;
 mod dsp;
 mod engine;
 use eframe::egui;
 mod gui;
+mod viz;
 
 fn main() -> eframe::Result<()> {
     let settings = config::Settings::load();

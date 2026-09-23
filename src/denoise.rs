@@ -66,6 +66,12 @@ impl Cleaner {
         }
     }
 
+    /// Current (voice gate, level gate) gains, for the scope.
+    pub fn gate_gains(&self, p: &Params) -> (f32, f32) {
+        let voice = if p.voice_gate && !p.bypass { self.voice_gate.gain() } else { 1.0 };
+        (voice, self.level_gate)
+    }
+
     pub fn state(&self, p: &Params) -> ModelState {
         match p.model {
             Model::Rnnoise => ModelState::Rnnoise,
@@ -82,6 +88,7 @@ impl Cleaner {
         let mut dry: [f32; FRAME] =
             std::array::from_fn(|i| (mic[i] * p.input_gain).clamp(-1.0, 1.0));
         if p.highpass {
+            self.highpass.set_cutoff(p.highpass_hz);
             self.highpass.process(&mut dry);
         }
 
