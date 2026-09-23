@@ -223,10 +223,33 @@ pub mod rnn {
     }
 }
 
+/// DeepFilterNet treats quiet input as silence: speech averaging below about
+/// -55 dBFS came out ~45 dB down, while RNNoise kept it. The model therefore
+/// sees the voice normalised towards this level, and the same gain is taken
+/// back off its output, so what Discord hears keeps the real level.
+const DEEP_TARGET_DB: f32 = -25.0;
+/// At most this much boost (room noise between words must not be blown up
+/// into something the model mistakes for speech).
+const DEEP_MAX_BOOST_DB: f32 = 30.0;
+/// Gain slew per 10 ms frame: raise slowly (no pumping between words),
+/// lower fast when a loud voice arrives after a quiet stretch. The level
+/// estimate itself sinks 6 dB/s, so after a loud burst quiet speech is
+/// boosted again within a few seconds.
+const DEEP_GAIN_UP_DB: f32 = 0.2;
+const DEEP_GAIN_DOWN_DB: f32 = 3.0;
+/// DeepFilterNet's output lags its input by exactly three frames.
+const DEEP_DELAY_FRAMES: usize = 3;
+
 /// DeepFilterNet 3 (embedded model, pure-Rust tract runtime) on 10 ms frames.
 pub struct DeepFilter {
     model: df::tract::DfTract,
     strength: f32,
+    /// Peak-following estimate of the voice level, dBFS.
+    level_db: f32,
+    gain_db: f32,
+    /// Linear gains applied to the last frames, oldest first, so the output
+    /// is undone with the gain its input actually had.
+    applied: [f32; DEEP_DELAY_FRAMES],
 }
 
 impl DeepFilter {
@@ -249,7 +272,15 @@ impl DeepFilter {
                 model.hop_size
             ));
         }
-        Ok(Self { model, strength: 1.0 })
+        Ok(Self {
+            model,
+            strength: 1.0,
+            // Start fully boosted: a quiet voice is right from the first word,
+            // and a loud one pulls the gain down within a few frames.
+            level_db: DEEP_TARGET_DB - DEEP_MAX_BOOST_DB,
+            gain_db: DEEP_MAX_BOOST_DB,
+            applied: [crate::dsp::db_to_gain(DEEP_MAX_BOOST_DB); DEEP_DELAY_FRAMES],
+        })
     }
 
     /// Map the 0..1 reduction strength to DeepFilterNet's attenuation limit,
@@ -270,11 +301,31 @@ impl DeepFilter {
 
     /// Enhance one frame of [-1, 1] samples.
     pub fn process(&mut self, input: &[f32; FRAME], out: &mut [f32; FRAME]) -> Result<()> {
-        let noisy = ndarray::ArrayView2::from_shape((1, FRAME), input)?;
-        let enh = ndarray::ArrayViewMut2::from_shape((1, FRAME), out)?;
+        let mean_square = input.iter().map(|s| s * s).sum::<f32>() / FRAME as f32;
+        let frame_db = 10.0 * mean_square.max(1e-12).log10();
+        // Follow voice peaks quickly, let the estimate sink 6 dB/s in pauses.
+        self.level_db = if frame_db > self.level_db {
+            self.level_db + (frame_db - self.level_db) * 0.3
+        } else {
+            (self.level_db - 0.06).max(-100.0)
+        };
+        let target = (DEEP_TARGET_DB - self.level_db).clamp(0.0, DEEP_MAX_BOOST_DB);
+        self.gain_db += (target - self.gain_db).clamp(-DEEP_GAIN_DOWN_DB, DEEP_GAIN_UP_DB);
+        let gain = crate::dsp::db_to_gain(self.gain_db);
+
+        let boosted = input.map(|s| s * gain);
+        let noisy = ndarray::ArrayView2::from_shape((1, FRAME), &boosted[..])?;
+        let enh = ndarray::ArrayViewMut2::from_shape((1, FRAME), &mut out[..])?;
         self.model
             .process(noisy, enh)
             .map_err(|e| anyhow!("DeepFilterNet: {e:#}"))?;
+
+        let undo = 1.0 / self.applied[0];
+        self.applied.rotate_left(1);
+        self.applied[DEEP_DELAY_FRAMES - 1] = gain;
+        for s in out.iter_mut() {
+            *s *= undo;
+        }
         Ok(())
     }
 }
@@ -473,9 +524,6 @@ mod tests {
         );
     }
 
-    /// DeepFilterNet 3's output lag (measured 1440 samples).
-    const DEEP_FILTER_DELAY_FRAMES: usize = 3;
-
     /// Non-periodic voiced-ish test signal: harmonics over a wandering pitch.
     fn wandering_voice(seconds: f32) -> Vec<f32> {
         use std::f32::consts::TAU;
@@ -514,7 +562,7 @@ mod tests {
         let mut cleaner = Cleaner::new();
         let delay = if p.model == Model::DeepFilter {
             cleaner.wait_for_deep_filter();
-            DEEP_FILTER_DELAY_FRAMES
+            DEEP_DELAY_FRAMES
         } else {
             RNNOISE_DELAY_FRAMES
         };
@@ -533,7 +581,7 @@ mod tests {
         let p = Params { highpass: false, voice_gate: false, ..Default::default() };
         for (model, frames) in [
             (Model::Rnnoise, RNNOISE_DELAY_FRAMES),
-            (Model::DeepFilter, DEEP_FILTER_DELAY_FRAMES),
+            (Model::DeepFilter, DEEP_DELAY_FRAMES),
         ] {
             // run_cleaner already removes the expected delay.
             let out = run_cleaner(&voice, &Params { model, ..p });
@@ -562,6 +610,53 @@ mod tests {
         }
         // Only frames judged pure noise are zeroed.
         assert_eq!(deep.model.apply_stages(-20.0), (false, true, false));
+    }
+
+    // Regression: DeepFilterNet silenced quiet voices (speech averaging below
+    // about -55 dBFS came out ~45 dB down; a Yeti at 0 dB gain sits there).
+    #[test]
+    fn deep_filter_keeps_quiet_voices() {
+        // Real microphones always have a noise floor; keep it 30 dB under the voice.
+        let mut rng = XorShift(3);
+        let voice: Vec<f32> = wandering_voice(2.0)
+            .iter()
+            .map(|s| s + 0.003 * rng.next_uniform())
+            .collect();
+        let p = Params { highpass: false, voice_gate: false, ..Default::default() };
+        let settled = SR as usize..voice.len() - SR as usize / 10;
+        let change = |scale: f32| {
+            let x: Vec<f32> = voice.iter().map(|s| s * scale).collect();
+            let out = run_cleaner(&x, &p);
+            db(energy(&out[settled.clone()])) - db(energy(&x[settled.clone()]))
+        };
+        let loud = change(1.0);
+        // Down to -34 dB: a voice averaging about -55 dBFS, as quiet as real
+        // setups get (a Yeti at 0 dB gain sits around -40 dBFS).
+        for scale in [0.05, 0.02] {
+            let quiet = change(scale);
+            assert!(
+                (quiet - loud).abs() < 3.0,
+                "at {:.0} dB quieter the voice changed by {quiet:.1} dB vs {loud:.1} dB loud",
+                -20.0 * scale.log10()
+            );
+        }
+    }
+
+    #[test]
+    fn deep_filter_restores_original_levels_when_boost_changes() {
+        let mut voice = wandering_voice(1.0);
+        for (i, sample) in voice.iter_mut().enumerate() {
+            *sample *= if i < SR as usize / 3 || i >= 2 * SR as usize / 3 { 0.02 } else { 1.0 };
+        }
+        // With reduction at zero, normalization must cancel itself even as
+        // the voice jumps between quiet and loud. Compare aligned samples.
+        let p = Params { strength: 0.0, highpass: false, voice_gate: false, ..Default::default() };
+        let out = run_cleaner(&voice, &p);
+        let end = voice.len() - DEEP_DELAY_FRAMES * FRAME;
+        let error: Vec<f32> = voice[..end].iter().zip(&out).map(|(x, y)| x - y).collect();
+        let relative_error = energy(&error) / energy(&voice[..end]);
+        assert!(out.iter().all(|s| s.is_finite()));
+        assert!(relative_error < 0.001, "gain compensation changed the signal: {relative_error}");
     }
 
     #[test]

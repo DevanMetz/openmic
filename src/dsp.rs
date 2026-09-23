@@ -61,12 +61,6 @@ pub fn db_to_gain(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
-/// Peak mapped to a 0..100 bar over a 60 dB window (matches the Python meter).
-pub fn meter_percent(peak: f32) -> f32 {
-    let db = 20.0 * peak.max(1e-6).log10();
-    ((db + 60.0) * 100.0 / 60.0).clamp(0.0, 100.0)
-}
-
 /// Gate release coefficient per 10 ms frame for a 150 ms release time.
 pub fn gate_release() -> f32 {
     (-(FRAME as f32) / (SR as f32 * 0.15)).exp()
@@ -461,12 +455,5 @@ mod tests {
         gate.process(&mut onset, 0.9, VOICE_THRESHOLD);
         assert!(onset[0] > 0.0 && onset[0] < 0.01);
         assert_eq!(onset[FRAME - 1], 1.0);
-    }
-
-    #[test]
-    fn meter_maps_60db_window() {
-        assert_eq!(meter_percent(0.0), 0.0);
-        assert_eq!(meter_percent(1.0), 100.0);
-        assert!((meter_percent(10f32.powf(-30.0 / 20.0)) - 50.0).abs() < 0.01);
     }
 }

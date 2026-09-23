@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, CentralPanel, Color32, ComboBox, ProgressBar, RichText, ScrollArea, Slider,
+    self, CentralPanel, Color32, ComboBox, RichText, ScrollArea, Slider,
 };
 
 use crate::config::{self, Settings};
@@ -15,12 +15,14 @@ use crate::denoise::ModelState;
 use crate::dsp::{self, Model, Params};
 use crate::engine::{list_devices, Engine};
 use crate::viz::{self, Focus};
+use crate::widgets;
 
 pub(crate) const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
 pub(crate) const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
 pub(crate) const AMBER: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
+pub(crate) const VIOLET: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
 pub(crate) const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
-const MUTED: Color32 = Color32::from_rgb(0x94, 0xa3, 0xb8);
+pub(crate) const MUTED: Color32 = Color32::from_rgb(0x94, 0xa3, 0xb8);
 
 #[derive(PartialEq)]
 enum Tab {
@@ -42,34 +44,24 @@ pub struct App {
     playing_name: Option<String>,
     warn_until: Option<(String, Instant)>,
     dirty_since: Option<Instant>,
-    /// While VB-Cable is missing, devices are re-listed periodically so an
-    /// install is picked up without pressing Refresh.
+    /// Re-list devices while VB-Cable is missing or a start request is
+    /// waiting for a saved device to connect.
     last_device_poll: Instant,
     /// (running, processed output, setting) the Windows default microphone
     /// was last reconciled for.
     default_mic_synced: Option<(bool, String, bool)>,
     /// The processing setting under the pointer this frame.
     focus: Option<Focus>,
+    /// Peak-hold positions of the input/output meters, dBFS.
+    hold: [f32; 2],
+    /// Start was blocked by a device that isn't connected (e.g. a USB mic
+    /// still coming up after a Windows-startup launch); start once it is.
+    waiting_for_device: bool,
 }
 
 impl App {
     pub fn new(settings: Settings) -> Self {
-        let mut app = Self {
-            settings,
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            tab: Tab::Mic,
-            engine: None,
-            status: ("Stopped".into(), MUTED),
-            sound_status: ("Ready".into(), Color32::WHITE),
-            selected: 0,
-            playing_name: None,
-            warn_until: None,
-            dirty_since: None,
-            last_device_poll: Instant::now(),
-            default_mic_synced: None,
-            focus: None,
-        };
+        let mut app = Self::stopped(settings);
         // Reflect the actual registry state, like the Python app did.
         app.settings.start_with_windows = config::startup_enabled();
 
@@ -85,6 +77,27 @@ impl App {
             app.start_engine();
         }
         app
+    }
+
+    fn stopped(settings: Settings) -> Self {
+        Self {
+            settings,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            tab: Tab::Mic,
+            engine: None,
+            status: ("Stopped".into(), MUTED),
+            sound_status: ("Ready".into(), Color32::WHITE),
+            selected: 0,
+            playing_name: None,
+            warn_until: None,
+            dirty_since: None,
+            last_device_poll: Instant::now(),
+            default_mic_synced: None,
+            focus: None,
+            hold: [-60.0; 2],
+            waiting_for_device: false,
+        }
     }
 
     fn params(&self) -> Params {
@@ -120,8 +133,25 @@ impl App {
     }
 
     fn start_engine(&mut self) {
+        self.waiting_for_device = false;
         if self.settings.output.is_empty() {
+            self.waiting_for_device = true;
             self.status = ("Install VB-Cable or choose a processed output".into(), AMBER);
+            return;
+        }
+        let missing = [
+            (&self.settings.microphone, &self.inputs, "a microphone"),
+            (&self.settings.output, &self.outputs, "a processed output"),
+            (&self.settings.monitor_output, &self.outputs, "a monitor output"),
+        ]
+        .into_iter()
+        .find(|(name, pool, _)| !pool.contains(name))
+        .map(|(name, _, fallback)| {
+            if name.is_empty() { fallback } else { name.as_str() }
+        });
+        if let Some(name) = missing {
+            self.waiting_for_device = true;
+            self.status = (short(&format!("Waiting for {name} to connect")), AMBER);
             return;
         }
         match Engine::start(
@@ -139,9 +169,11 @@ impl App {
     }
 
     fn stop_engine(&mut self, announce: bool) {
+        self.waiting_for_device = false;
         if let Some(engine) = self.engine.take() {
             engine.stop();
         }
+        self.hold = [-60.0; 2];
         self.playing_name = None;
         if announce {
             self.status = ("Stopped".into(), MUTED);
@@ -164,14 +196,18 @@ impl App {
     /// choices whose device is gone; background polls only fill empty ones.
     fn refresh_devices(&mut self, replace_missing: bool) {
         let host = cpal_host();
+        self.update_devices(list_devices(&host, false), list_devices(&host, true), replace_missing);
+    }
+
+    fn update_devices(&mut self, inputs: Vec<String>, outputs: Vec<String>, replace_missing: bool) {
         let before = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
         let had_cable = cable_input(&self.outputs).is_some();
-        self.inputs = list_devices(&host, false);
-        self.outputs = list_devices(&host, true);
+        self.inputs = inputs;
+        self.outputs = outputs;
         let cable_appeared = !had_cable && cable_input(&self.outputs).is_some();
         choose_routes(
             &mut self.settings,
@@ -185,14 +221,14 @@ impl App {
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
-        if before == after {
-            return;
+        if before != after {
+            self.touch();
         }
-        self.touch();
-        if self.engine.is_some() {
+        if self.engine.is_some() && before != after {
             self.restart_engine();
-        } else if cable_appeared && self.settings.auto_start {
-            // Nothing could run before VB-Cable existed; start now it does.
+        } else if self.waiting_for_device && self.engine.is_none() {
+            // Retry even when the saved names did not change. Stop cancels
+            // this request, regardless of the automatic-start preference.
             self.start_engine();
         }
     }
@@ -293,52 +329,263 @@ impl App {
     }
     /// Discord hears OpenMic through VB-Cable; walk the user to a working route.
     fn draw_cable_hint(&mut self, ui: &mut egui::Ui) {
-        match cable_input(&self.outputs).cloned() {
-            None => {
-                ui.label(
-                    RichText::new("VB-Cable isn't installed: Discord needs it to hear OpenMic.")
-                        .color(AMBER),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Get VB-Cable").clicked() {
-                        open_url(VB_CABLE_URL);
+        let cable = cable_input(&self.outputs).cloned();
+        let tone = match &cable {
+            Some(c) if self.settings.output == *c => GREEN,
+            _ => AMBER,
+        };
+        egui::Frame::new()
+            .fill(tone.gamma_multiply(0.08))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                match cable {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("VB-Cable isn't installed: Discord needs it to hear OpenMic.")
+                                    .color(AMBER),
+                            );
+                            if ui.button("Get VB-Cable").clicked() {
+                                open_url(VB_CABLE_URL);
+                            }
+                        });
+                        ui.weak("Run its setup as administrator; OpenMic switches to it automatically.");
                     }
-                    ui.weak("Run its setup as administrator; OpenMic switches to it automatically.");
-                });
-            }
-            Some(cable) if self.settings.output != cable => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Discord can't hear this output.").color(AMBER));
-                    if ui.button("Use VB-Cable").clicked() {
-                        self.settings.output = cable;
-                        self.touch();
-                        if self.engine.is_some() {
-                            self.restart_engine();
+                    Some(cable) if self.settings.output != cable => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Discord can't hear this output.").color(AMBER));
+                            if ui.button("Use VB-Cable").clicked() {
+                                self.settings.output = cable;
+                                self.touch();
+                                if self.engine.is_some() || self.waiting_for_device {
+                                    self.restart_engine();
+                                }
+                            }
+                        });
+                    }
+                    Some(_) => {
+                        let changed = ui
+                            .checkbox(
+                                &mut self.settings.default_mic,
+                                "Make CABLE Output my Windows default mic while running",
+                            )
+                            .on_hover_text(
+                                "Apps set to the default microphone (Discord's default) hear your \
+                                 cleaned voice. Your previous default comes back when OpenMic stops.",
+                            )
+                            .changed();
+                        if changed {
+                            self.touch();
                         }
+                        ui.weak(if self.settings.default_mic {
+                            "In Discord: leave Voice & Video > Input Device on Default"
+                        } else {
+                            "In Discord: Voice & Video > Input Device > CABLE Output"
+                        });
+                    }
+                }
+            });
+    }
+
+    fn draw_routing(&mut self, ui: &mut egui::Ui) {
+        let cable = cable_input(&self.outputs).is_some();
+        let mut refresh = false;
+        widgets::card(
+            ui,
+            "ROUTING",
+            CYAN,
+            |ui| {
+                refresh = ui.small_button("Refresh").clicked();
+                if cable {
+                    widgets::badge(ui, "VB-Cable connected", GREEN);
+                } else {
+                    widgets::badge(ui, "VB-Cable not installed", AMBER);
+                }
+            },
+            |ui| {
+                let mut changed = false;
+                egui::Grid::new("routing").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    for (label, id, field, pool) in [
+                        ("Microphone", 0, &mut self.settings.microphone, &self.inputs),
+                        ("Processed output", 1, &mut self.settings.output, &self.outputs),
+                        ("Monitor output", 2, &mut self.settings.monitor_output, &self.outputs),
+                    ] {
+                        ui.label(RichText::new(label).weak());
+                        changed |= combo(ui, id, field, pool).changed();
+                        ui.end_row();
                     }
                 });
-            }
-            Some(_) => {
-                let changed = ui
-                    .checkbox(
-                        &mut self.settings.default_mic,
-                        "Make CABLE Output my Windows default mic while running",
-                    )
-                    .on_hover_text(
-                        "Apps set to the default microphone (Discord's default) hear your \
-                         cleaned voice. Your previous default comes back when OpenMic stops.",
-                    )
-                    .changed();
                 if changed {
                     self.touch();
+                    if self.engine.is_some() || self.waiting_for_device {
+                        self.restart_engine();
+                    }
                 }
-                if self.settings.default_mic {
-                    ui.weak("In Discord: leave Voice & Video > Input Device on Default");
-                } else {
-                    ui.weak("In Discord: Voice & Video > Input Device > CABLE Output");
-                }
+                ui.add_space(4.0);
+                self.draw_cable_hint(ui);
+            },
+        );
+        if refresh {
+            self.refresh_devices(true);
+        }
+    }
+
+    fn draw_processing(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        // Which setting the pointer is on, so the scope can highlight it.
+        let mut focus = None;
+        let mut reset = false;
+        widgets::card(
+            ui,
+            "PROCESSING",
+            GREEN,
+            |ui| {
+                reset = ui
+                    .small_button("Reset")
+                    .on_hover_text("Restore every processing setting to its default")
+                    .clicked();
+            },
+            |ui| {
+                ui.horizontal(|ui| {
+                    let (picked, hovered) = widgets::segmented(
+                        ui,
+                        &mut self.settings.model,
+                        &[
+                            (Model::DeepFilter, "DeepFilterNet 3", "best"),
+                            (Model::Rnnoise, "RNNoise", "light"),
+                        ],
+                        GREEN,
+                    );
+                    changed |= picked;
+                    if hovered {
+                        focus = Some(Focus::Model);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let s = &mut self.settings;
+                    for (on, text, color, target, tip) in [
+                        (&mut s.voice_gate, "Voice gate", VIOLET, Some(Focus::VoiceGate),
+                            "Silence everything that isn't speech, however loud"),
+                        (&mut s.highpass, "Rumble filter", AMBER, Some(Focus::Rumble),
+                            "Cut low rumble: desk bumps, hum, handling noise"),
+                        (&mut s.gate, "Level gate", AMBER, Some(Focus::LevelGate),
+                            "Fade out anything quieter than a set level"),
+                        (&mut s.bypass, "Bypass", MUTED, None,
+                            "Send your raw microphone, unprocessed"),
+                        (&mut s.mute, "Mute mic", RED, None,
+                            "Silence your voice; the soundboard still plays"),
+                    ] {
+                        let r = widgets::pill(ui, on, text, color).on_hover_text(tip);
+                        if r.hovered() {
+                            focus = target.or(focus);
+                        }
+                        changed |= r.changed();
+                    }
+                });
+            },
+        );
+        if reset {
+            let s = &mut self.settings;
+            s.model = Model::default();
+            s.highpass = true;
+            s.highpass_hz = dsp::HIGHPASS_HZ;
+            s.voice_gate = true;
+            s.voice_threshold = dsp::VOICE_THRESHOLD;
+            s.strength = 1.0;
+            s.input_gain_db = 0.0;
+            s.output_gain_db = 0.0;
+            s.gate = false;
+            s.gate_threshold_db = -50.0;
+            s.bypass = false;
+            s.mute = false;
+            s.monitor_volume = 1.0;
+            changed = true;
+        }
+        if changed {
+            self.apply_live();
+        }
+        self.focus = focus;
+    }
+
+    fn draw_monitor(&mut self, ui: &mut egui::Ui) {
+        let snapshot = self.engine.as_ref().map(Engine::stats);
+        widgets::card(
+            ui,
+            "MONITOR & LEVELS",
+            CYAN,
+            |_| {},
+            |ui| {
+                ui.horizontal(|ui| {
+                    let mut changed = widgets::pill(
+                        ui,
+                        &mut self.settings.monitor,
+                        "Headphone monitor",
+                        CYAN,
+                    )
+                    .on_hover_text("Hear the processed voice yourself (use headphones)")
+                    .changed();
+                    ui.add_space(8.0);
+                    changed |= volume_slider(ui, &mut self.settings.monitor_volume);
+                    if changed {
+                        self.apply_live();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let gap = 16.0;
+                    let half = (ui.available_width() - gap - 2.0 * ui.spacing().item_spacing.x) / 2.0;
+                    widgets::level_meter(ui, "Input", snapshot.map(|s| s.in_peak), &mut self.hold[0], half);
+                    ui.add_space(gap);
+                    widgets::level_meter(ui, "Output", snapshot.map(|s| s.out_peak), &mut self.hold[1], half);
+                });
+            },
+        );
+        if let Some(stats) = snapshot {
+            let warning_fresh = self
+                .warn_until
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
+            if !warning_fresh {
+                let voice = format!("voice {:.0}%", stats.prob * 100.0);
+                self.status = match stats.model {
+                    ModelState::DeepFilterLoading => {
+                        (format!("Loading DeepFilterNet… · {voice}"), AMBER)
+                    }
+                    ModelState::DeepFilterFailed => {
+                        (format!("DeepFilterNet unavailable, using RNNoise · {voice}"), AMBER)
+                    }
+                    ModelState::DeepFilter | ModelState::Rnnoise => {
+                        (format!("Running · {voice}"), GREEN)
+                    }
+                };
             }
         }
+    }
+
+    fn draw_mic_tab(&mut self, ui: &mut egui::Ui) {
+        self.draw_routing(ui);
+        ui.add_space(8.0);
+        self.draw_processing(ui);
+        ui.add_space(8.0);
+        self.draw_monitor(ui);
+        ui.add_space(8.0);
+        widgets::card(
+            ui,
+            "LIVE SCOPE",
+            CYAN,
+            |ui| {
+                ui.weak("drag or scroll the lines to adjust");
+            },
+            |ui| {
+                let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
+                if viz::scope(ui, &frames, &mut self.settings, self.focus) {
+                    self.apply_live();
+                }
+            },
+        );
     }
 
     /// Point the Windows default microphone at VB-Cable while processing into
@@ -383,166 +630,6 @@ impl App {
         }
     }
 
-    fn draw_mic_tab(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.strong(RichText::new("ROUTING").color(CYAN));
-            macro_rules! route_row {
-                ($label:expr, $id:expr, $field:ident, $pool:expr) => {{
-                    let changed = ui
-                        .horizontal(|ui| {
-                            ui.label($label);
-                            let field = &mut self.settings.$field;
-                            combo(ui, $id, field, &$pool).changed()
-                        })
-                        .inner;
-                    if changed {
-                        self.touch();
-                        if self.engine.is_some() {
-                            self.restart_engine();
-                        }
-                    }
-                }};
-            }
-            route_row!("Microphone", 0, microphone, self.inputs);
-            route_row!("Processed output", 1, output, self.outputs);
-            route_row!("Monitor output", 2, monitor_output, self.outputs);
-            ui.horizontal(|ui| {
-                if ui.button("Refresh").clicked() {
-                    self.refresh_devices(true);
-                }
-                ui.weak(RichText::new("Changes apply live").color(GREEN));
-            });
-            self.draw_cable_hint(ui);
-        });
-
-        ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.strong(RichText::new("PROCESSING").color(CYAN));
-            let mut changed = false;
-            // Which setting the pointer is on, so the scope can highlight it.
-            let mut focus = None;
-            let mut watch = |r: egui::Response, f: Focus| {
-                if r.hovered() || r.dragged() {
-                    focus = Some(f);
-                }
-                r.changed()
-            };
-            ui.horizontal(|ui| {
-                let label = ui.label("Model");
-                watch(label, Focus::Model);
-                let combo = ComboBox::from_id_salt("model")
-                    .selected_text(model_name(self.settings.model))
-                    .show_ui(ui, |ui| {
-                        for model in [Model::DeepFilter, Model::Rnnoise] {
-                            changed |= ui
-                                .selectable_value(&mut self.settings.model, model, model_name(model))
-                                .changed();
-                        }
-                    });
-                watch(combo.response, Focus::Model);
-            });
-            ui.horizontal(|ui| {
-                changed |= watch(
-                    ui.checkbox(&mut self.settings.voice_gate, "Voice gate")
-                        .on_hover_text("Silence everything that isn't speech, however loud"),
-                    Focus::VoiceGate,
-                );
-                changed |= watch(
-                    ui.checkbox(&mut self.settings.highpass, "Rumble filter")
-                        .on_hover_text("Cut low rumble: desk bumps, hum, handling noise"),
-                    Focus::Rumble,
-                );
-                changed |= watch(ui.checkbox(&mut self.settings.gate, "Level gate"), Focus::LevelGate);
-            });
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .checkbox(&mut self.settings.bypass, "Bypass reduction")
-                    .changed();
-                changed |= ui.checkbox(&mut self.settings.mute, "Mute microphone").changed();
-                if ui.button("Reset").clicked() {
-                    self.settings.model = Model::default();
-                    self.settings.highpass = true;
-                    self.settings.highpass_hz = dsp::HIGHPASS_HZ;
-                    self.settings.voice_gate = true;
-                    self.settings.voice_threshold = dsp::VOICE_THRESHOLD;
-                    self.settings.strength = 1.0;
-                    self.settings.input_gain_db = 0.0;
-                    self.settings.output_gain_db = 0.0;
-                    self.settings.gate = false;
-                    self.settings.gate_threshold_db = -50.0;
-                    self.settings.bypass = false;
-                    self.settings.mute = false;
-                    self.settings.monitor_volume = 1.0;
-                    changed = true;
-                }
-            });
-            if changed {
-                self.apply_live();
-            }
-            self.focus = focus;
-        });
-
-        ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.strong(RichText::new("MONITOR & LEVELS").color(CYAN));
-            ui.horizontal(|ui| {
-                let mut changed =
-                    ui.checkbox(&mut self.settings.monitor, "Headphone monitor").changed();
-                changed |= ui
-                    .add(
-                        Slider::new(&mut self.settings.monitor_volume, 0.0..=1.0)
-                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                    )
-                    .changed();
-                if changed {
-                    self.apply_live();
-                }
-            });
-            let snapshot = self.engine.as_ref().map(Engine::stats);
-            meter(
-                ui,
-                "Input",
-                snapshot.map(|s| s.in_peak),
-                CYAN,
-            );
-            meter(
-                ui,
-                "Output",
-                snapshot.map(|s| s.out_peak),
-                GREEN,
-            );
-            if let Some(stats) = snapshot {
-                let warning_fresh = self
-                    .warn_until
-                    .as_ref()
-                    .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
-                if !warning_fresh {
-                    let voice = format!("voice {:.0}%", stats.prob * 100.0);
-                    self.status = match stats.model {
-                        ModelState::DeepFilterLoading => {
-                            (format!("Loading DeepFilterNet… · {voice}"), AMBER)
-                        }
-                        ModelState::DeepFilterFailed => {
-                            (format!("DeepFilterNet unavailable, using RNNoise · {voice}"), AMBER)
-                        }
-                        ModelState::DeepFilter | ModelState::Rnnoise => {
-                            (format!("Running · {voice}"), GREEN)
-                        }
-                    };
-                }
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.strong(RichText::new("LIVE SCOPE · drag to adjust").color(CYAN));
-            let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
-            if viz::scope(ui, &frames, &mut self.settings, self.focus) {
-                self.apply_live();
-            }
-        });
-    }
-
     fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
         ui.label("Play clips directly into your processed microphone output.");
         let sounds = self.settings.sounds.clone();
@@ -584,13 +671,7 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Sound volume");
-            if ui
-                .add(
-                    Slider::new(&mut self.settings.sound_volume, 0.0..=1.0)
-                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                )
-                .changed()
-            {
+            if volume_slider(ui, &mut self.settings.sound_volume) {
                 self.apply_live();
             }
         });
@@ -606,6 +687,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_engine(false);
         self.sync_default_mic();
+        let _ = self.settings.save();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -615,7 +697,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(frame_time));
         self.poll_engine();
         self.sync_default_mic();
-        if cable_input(&self.outputs).is_none()
+        if (cable_input(&self.outputs).is_none() || self.waiting_for_device)
             && self.last_device_poll.elapsed() >= Duration::from_secs(3)
         {
             self.last_device_poll = Instant::now();
@@ -654,7 +736,8 @@ impl eframe::App for App {
             ui.add_space(10.0);
             ui.separator();
             ui.horizontal(|ui| {
-                let running = self.engine.is_some();
+                // Waiting for a device counts as on: Stop cancels the wait.
+                let running = self.engine.is_some() || self.waiting_for_device;
                 let btn = egui::Button::new(if running {
                     RichText::new("Stop OpenMic").color(Color32::BLACK)
                 } else {
@@ -666,6 +749,8 @@ impl eframe::App for App {
                     if running {
                         self.stop_engine(true);
                     } else {
+                        // A stopped app may have an old device list.
+                        self.refresh_devices(false);
                         self.start_engine();
                     }
                 }
@@ -713,34 +798,20 @@ fn file_name(path: &PathBuf) -> String {
 }
 
 fn combo(ui: &mut egui::Ui, id: usize, value: &mut String, pool: &[String]) -> egui::Response {
-    ComboBox::from_id_salt(id)
+    let mut changed = false;
+    let mut response = ComboBox::from_id_salt(id)
         .width(360.0)
         .selected_text(value.as_str())
         .show_ui(ui, |ui| {
             for name in pool {
-                ui.selectable_value(value, name.clone(), name);
+                changed |= ui.selectable_value(value, name.clone(), name).changed();
             }
         })
-        .response
-}
-
-fn meter(ui: &mut egui::Ui, label: &str, peak: Option<f32>, color: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        let pct = dsp::meter_percent(peak.unwrap_or(0.0));
-        ui.add(
-            ProgressBar::new(pct / 100.0)
-                .desired_width(ui.available_width())
-                .fill(color),
-        );
-    });
-}
-
-fn model_name(model: Model) -> &'static str {
-    match model {
-        Model::DeepFilter => "DeepFilterNet 3 (best)",
-        Model::Rnnoise => "RNNoise (light)",
+        .response;
+    if changed {
+        response.mark_changed();
     }
+    response
 }
 
 const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
@@ -787,6 +858,15 @@ fn choose_routes(
 fn open_url(url: &str) {
     // Explorer hands URLs to the default browser.
     let _ = std::process::Command::new("explorer").arg(url).spawn();
+}
+
+/// A 0..100% volume slider that also takes the mouse wheel (1% per notch).
+fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> bool {
+    let response = ui.add(
+        Slider::new(value, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+    );
+    let notches = viz::wheel_notches(ui, response.id, response.hovered() && !response.dragged());
+    response.changed() | viz::step_by(value, notches, 0.01, 0.0..=1.0)
 }
 
 #[cfg(test)]
@@ -867,5 +947,87 @@ mod tests {
         assert_eq!(s.microphone, "Mic (USB)", "startup/poll keeps the saved mic");
         choose_routes(&mut s, &without_usb, &outputs, false, true);
         assert_eq!(s.microphone, "Webcam Mic", "Refresh replaces a device that is gone");
+    }
+
+    #[test]
+    fn stop_cancels_waiting_even_when_vb_cable_appears() {
+        let mut app = App::stopped(Settings::default());
+        app.start_engine();
+        assert!(app.waiting_for_device, "a start request survives a missing output");
+
+        app.stop_engine(true);
+        app.update_devices(Vec::new(), names(&["CABLE Input", "Headphones"]), false);
+        assert!(app.settings.auto_start);
+        assert!(!app.waiting_for_device, "Stop cancels the pending start request");
+        assert!(app.engine.is_none());
+        assert_eq!(app.status.0, "Stopped");
+    }
+
+    #[test]
+    fn device_poll_retries_unchanged_saved_routes() {
+        let mut app = App::stopped(Settings {
+            microphone: "USB mic".into(),
+            output: "CABLE Input".into(),
+            monitor_output: "Headphones".into(),
+            ..Default::default()
+        });
+        app.outputs = names(&["CABLE Input"]);
+        app.start_engine();
+        assert_eq!(app.status.0, "Waiting for USB mic to connect");
+
+        app.update_devices(names(&["USB mic"]), names(&["CABLE Input"]), false);
+        assert!(app.waiting_for_device);
+        assert_eq!(app.settings.microphone, "USB mic");
+        assert_eq!(app.settings.monitor_output, "Headphones");
+        assert_eq!(app.status.0, "Waiting for Headphones to connect");
+    }
+
+    #[test]
+    fn selecting_a_route_reports_a_change() {
+        let ctx = egui::Context::default();
+        let pool = names(&["First mic", "Second mic"]);
+        let mut value = pool[0].clone();
+        let mut frame = |events| {
+            let mut response = None;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 880.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    response = Some(combo(ui, 0, &mut value, &pool));
+                },
+            );
+            response.unwrap()
+        };
+        let response = frame(Vec::new());
+        let popup_id = response.id.with("popup");
+        egui::Popup::open_id(&ctx, popup_id);
+        frame(Vec::new());
+        // Let the popup finish its sizing pass before interacting with it.
+        frame(Vec::new());
+        let menu = egui::AreaState::load(&ctx, popup_id).unwrap().rect();
+        let pos = egui::pos2(menu.left() + 20.0, menu.bottom() - 12.0);
+        frame(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let response = frame(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(value, pool[1]);
+        assert!(response.changed(), "routing must save and restart when a device is selected");
     }
 }

@@ -12,6 +12,7 @@ mod engine;
 use eframe::egui;
 mod gui;
 mod viz;
+mod widgets;
 
 fn main() -> eframe::Result<()> {
     let settings = config::Settings::load();

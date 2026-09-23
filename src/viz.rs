@@ -8,7 +8,7 @@
 //! - voice chart: drag the dashed line for the voice-gate threshold
 //! - rumble curve: drag left/right for the filter cutoff
 //!
-//! Double-click any of them to reset it.
+//! Scroll the wheel over any of them for fine steps; double-click to reset.
 
 use std::sync::Arc;
 
@@ -19,9 +19,7 @@ use eframe::egui::{
 use crate::config::Settings;
 use crate::dsp::{self, Model, HIGHPASS_HZ, HIGHPASS_RANGE, VOICE_THRESHOLD};
 use crate::engine::{ScopeFrame, SCOPE_FRAMES};
-use crate::gui::{AMBER, CYAN, GREEN, RED};
-
-const VIOLET: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
+use crate::gui::{AMBER, CYAN, GREEN, RED, VIOLET};
 const FLOOR_DB: f32 = -80.0;
 const LEVEL_HEIGHT: f32 = 150.0;
 /// Room above the level plot for the draggable legend chips.
@@ -34,7 +32,7 @@ const GATE_THRESHOLD: std::ops::RangeInclusive<f32> = -80.0..=-20.0;
 const GRAB: f32 = 8.0;
 
 /// A setting the user is pointing at, in the panel or on the scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Focus {
     Model,
     Reduction,
@@ -49,14 +47,14 @@ impl Focus {
     fn caption(self) -> &'static str {
         match self {
             Focus::Model => "Blue is your mic, green is what Discord hears; the gap is the noise removed.",
-            Focus::Reduction => "Drag the reduction chip: lower keeps a little room tone, 100% removes all it can.",
-            Focus::InputGain => "Drag the blue line up or down to change input gain (before cleaning).",
-            Focus::OutputGain => "Drag the green line up or down to change what Discord hears.",
-            Focus::LevelGate => "Drag the dashed line: anything quieter fades out.",
+            Focus::Reduction => "Drag or scroll the reduction chip: lower keeps some room tone, 100% removes all it can.",
+            Focus::InputGain => "Drag or scroll the blue line to change input gain (0.5 dB per notch).",
+            Focus::OutputGain => "Drag or scroll the green line to change what Discord hears (0.5 dB per notch).",
+            Focus::LevelGate => "Drag or scroll the dashed line: anything quieter fades out (1 dB per notch).",
             Focus::VoiceGate => {
-                "Drag the dashed line: when violet (voice certainty) is above it the gate opens (green strip)."
+                "Drag or scroll: when violet (voice certainty) is above the line the gate opens (1% per notch)."
             }
-            Focus::Rumble => "Drag the curve sideways: everything left of it is cut (hum, bumps, handling).",
+            Focus::Rumble => "Drag sideways or scroll: everything left of the curve is cut (1 Hz per notch).",
         }
     }
 
@@ -90,7 +88,7 @@ pub fn scope(
     });
     let caption = panel_focus
         .or(pointed)
-        .map_or("Drag the lines to adjust; double-click one to reset it.", Focus::caption);
+        .map_or("Drag the lines or scroll over them to adjust; double-click one to reset it.", Focus::caption);
     ui.weak(caption);
     changed
 }
@@ -203,6 +201,64 @@ fn nudge(value: &mut f32, delta: f32, range: std::ops::RangeInclusive<f32>) -> b
     changed
 }
 
+/// Consume vertical wheel input for the active control. Keep fractional
+/// touchpad movement between frames until it amounts to a whole notch.
+pub fn wheel_notches(ui: &egui::Ui, id: Id, active: bool) -> f32 {
+    let id = id.with("wheel remainder");
+    if !active {
+        ui.data_mut(|d| d.remove::<f32>(id));
+        return 0.0;
+    }
+    let delta = ui.input_mut(|i| {
+        let mut notches = 0.0;
+        for event in &mut i.events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                notches += match unit {
+                    egui::MouseWheelUnit::Line => delta.y,
+                    egui::MouseWheelUnit::Page => delta.y * 3.0,
+                    egui::MouseWheelUnit::Point => delta.y / 50.0,
+                };
+                delta.y = 0.0;
+            }
+        }
+        // Don't also scroll a containing panel with the consumed gesture.
+        i.smooth_scroll_delta.y = 0.0;
+        notches
+    });
+    ui.data_mut(|d| {
+        let total = d.get_temp::<f32>(id).unwrap_or_default() + delta;
+        let whole = total.trunc();
+        d.insert_temp(id, total - whole);
+        whole
+    })
+}
+
+/// Step `value` by whole `step`s on the step grid, so scrolling lands on
+/// round numbers even after a drag.
+pub fn step_by(value: &mut f32, notches: f32, step: f32, range: std::ops::RangeInclusive<f32>) -> bool {
+    let notches = notches.trunc();
+    if notches == 0.0 {
+        return false;
+    }
+    let next = (((*value / step).round() + notches) * step).clamp(*range.start(), *range.end());
+    let changed = next != *value;
+    *value = next;
+    changed
+}
+
+/// Fine adjustment of `target` by mouse-wheel notches.
+fn scroll(s: &mut Settings, target: Focus, notches: f32) -> bool {
+    match target {
+        Focus::InputGain => step_by(&mut s.input_gain_db, notches, 0.5, INPUT_GAIN),
+        Focus::OutputGain => step_by(&mut s.output_gain_db, notches, 0.5, OUTPUT_GAIN),
+        Focus::Reduction => step_by(&mut s.strength, notches, 0.01, 0.0..=1.0),
+        Focus::LevelGate => step_by(&mut s.gate_threshold_db, notches, 1.0, GATE_THRESHOLD),
+        Focus::VoiceGate => step_by(&mut s.voice_threshold, notches, 0.01, 0.05..=0.95),
+        Focus::Rumble => step_by(&mut s.highpass_hz, notches, 1.0, HIGHPASS_RANGE),
+        Focus::Model => false,
+    }
+}
+
 fn reset(s: &mut Settings, target: Focus) {
     match target {
         Focus::InputGain => s.input_gain_db = 0.0,
@@ -313,8 +369,10 @@ fn level_chart(
         }
     }
 
+    let mut dragging = body.dragged();
     for (i, (target, hit, _, _)) in chip_layout.iter().enumerate() {
         let r = ui.interact(*hit, c.id().with(("chip", i)), Sense::click_and_drag());
+        dragging |= r.dragged();
         if r.hovered() || r.dragged() {
             pointed = Some(*target);
         }
@@ -332,6 +390,10 @@ fn level_chart(
     }
     if let Some(target) = pointed {
         ui.ctx().set_cursor_icon(target.cursor());
+    }
+    for target in [Focus::InputGain, Focus::OutputGain, Focus::Reduction, Focus::LevelGate] {
+        let notches = wheel_notches(ui, c.id().with(target), pointed == Some(target) && !dragging);
+        *changed |= scroll(s, target, notches);
     }
     let focus = panel.or(pointed);
 
@@ -458,6 +520,8 @@ fn voice_chart(
         reset(s, Focus::VoiceGate);
         *changed = true;
     }
+    let notches = wheel_notches(ui, c.id(), body.hovered() && !body.dragged());
+    *changed |= scroll(s, Focus::VoiceGate, notches);
     if let Some(target) = pointed {
         ui.ctx().set_cursor_icon(target.cursor());
     }
@@ -530,6 +594,8 @@ fn rumble_chart(
         reset(s, Focus::Rumble);
         *changed = true;
     }
+    let notches = wheel_notches(ui, c.id(), body.hovered() && !body.dragged());
+    *changed |= scroll(s, Focus::Rumble, notches);
     if let Some(target) = pointed {
         ui.ctx().set_cursor_icon(target.cursor());
     }
@@ -563,4 +629,62 @@ fn rumble_chart(
     let title = if s.highpass { "rumble filter" } else { "rumble filter (off)" };
     c.label(rect.left_top() + Vec2::new(6.0, 3.0), Align2::LEFT_TOP, title, color);
     pointed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_steps_land_on_the_grid_and_respect_limits() {
+        let mut gain = 3.37;
+        assert!(step_by(&mut gain, 1.0, 0.5, INPUT_GAIN));
+        assert_eq!(gain, 4.0, "snaps a dragged value onto the 0.5 dB grid");
+        step_by(&mut gain, -3.0, 0.5, INPUT_GAIN);
+        assert_eq!(gain, 2.5);
+        let mut top = 24.0;
+        assert!(!step_by(&mut top, 1.0, 0.5, INPUT_GAIN), "clamped at the maximum");
+        let mut threshold = 0.6;
+        step_by(&mut threshold, 1.0, 0.01, 0.05..=0.95);
+        assert!((threshold - 0.61).abs() < 1e-6);
+        assert!(!step_by(&mut threshold, 0.0, 0.01, 0.05..=0.95), "no wheel, no change");
+        gain = 3.37;
+        assert!(!step_by(&mut gain, 0.25, 0.5, INPUT_GAIN), "a partial notch cannot snap a dragged value");
+    }
+
+    #[test]
+    fn touchpad_motion_accumulates_and_is_consumed_by_one_control() {
+        let ctx = egui::Context::default();
+        let frame = |points, active| {
+            let mut steps = 0.0;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, points),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    steps = wheel_notches(ui, Id::new("gain"), active);
+                    if active {
+                        assert_eq!(wheel_notches(ui, Id::new("other"), true), 0.0);
+                        assert_eq!(ui.input(|i| i.smooth_scroll_delta.y), 0.0);
+                    }
+                },
+            );
+            steps
+        };
+        for _ in 0..3 {
+            assert_eq!(frame(12.5, true), 0.0);
+        }
+        assert_eq!(frame(12.5, true), 1.0);
+        assert_eq!(frame(-25.0, true), 0.0);
+        assert_eq!(frame(-25.0, true), -1.0);
+        assert_eq!(frame(25.0, true), 0.0);
+        assert_eq!(frame(0.0, false), 0.0);
+        assert_eq!(frame(25.0, true), 0.0, "leaving a control clears its partial gesture");
+    }
 }
