@@ -6,6 +6,8 @@ Audio stays on your computer. Nothing is recorded or uploaded.
 
 ![OpenMic v0.4.0 running with live scope and processing controls](docs/screenshot.png)
 
+[Requirements and setup](#requirements) · [Contributing](CONTRIBUTING.md)
+
 ## Features
 
 - DeepFilterNet 3 noise suppression (pure-Rust tract runtime, model embedded in the binary) — strong on keyboard clicks and other transient noise, ~2% of one CPU core. Quiet microphones are level-matched into the model and back, so a soft voice isn't mistaken for silence
