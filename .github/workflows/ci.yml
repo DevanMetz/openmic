@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The vendored RNNoise needs clang (MSVC can't compile its VLAs); the
+      # runner image ships LLVM but doesn't always put it on PATH.
+      - name: Put clang on PATH
+        shell: pwsh
+        run: |
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: clang --version
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked

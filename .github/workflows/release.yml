@@ -1,0 +1,41 @@
+name: Release
+
+# Push a tag like v0.6.0 to build openmic.exe and attach it to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $package = (cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq 'openmic'
+          if ($env:GITHUB_REF_NAME -ne "v$($package.version)") { throw "Release tag does not match Cargo.toml" }
+      - name: Put clang on PATH
+        shell: pwsh
+        run: |
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: cargo test --locked --release
+      - run: cargo build --locked --release
+      - name: Name the binary after the tag
+        shell: pwsh
+        run: |
+          $asset = "openmic-$env:GITHUB_REF_NAME-windows-x64.exe"
+          Copy-Item target\release\openmic.exe $asset
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content "$asset.sha256" -Encoding ascii
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            openmic-${{ github.ref_name }}-windows-x64.exe
+            openmic-${{ github.ref_name }}-windows-x64.exe.sha256
+          body_path: docs/releases/${{ github.ref_name }}.md

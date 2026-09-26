@@ -334,6 +334,8 @@ impl DeepFilter {
 /// work) before covering that frame with RNNoise.
 const DEEP_FRAME_TIMEOUT: Duration = Duration::from_millis(6);
 
+// Frames travel by value: boxing them would allocate on the audio path.
+#[allow(clippy::large_enum_variant)]
 enum DeepReply {
     Ready,
     Frame(u64, [f32; FRAME]),
@@ -439,7 +441,7 @@ mod tests {
         let mut denoiser = rnn::Denoiser::new();
         let mut out = Vec::with_capacity(input.len());
         let mut probs = Vec::new();
-        for chunk in input.chunks_exact(FRAME) {
+        for chunk in input.as_chunks::<FRAME>().0 {
             let mut frame = [0.0f32; FRAME];
             frame.copy_from_slice(chunk);
             probs.push(denoiser.process_frame(&mut frame));
@@ -567,8 +569,8 @@ mod tests {
             RNNOISE_DELAY_FRAMES
         };
         let mut out = Vec::with_capacity(mix.len());
-        for chunk in mix.chunks_exact(FRAME) {
-            out.extend_from_slice(&cleaner.process(chunk.try_into().unwrap(), p).0);
+        for chunk in mix.as_chunks::<FRAME>().0 {
+            out.extend_from_slice(&cleaner.process(chunk, p).0);
         }
         out.drain(..delay * FRAME);
         out.extend(std::iter::repeat_n(0.0, delay * FRAME));
@@ -732,7 +734,7 @@ mod tests {
         let n = clean.len() / FRAME;
         let (mut pad, mut pad_n, mut gap, mut gap_n, mut sig, mut err) =
             (0.0, 0, 0.0, 0, 0.0, 0.0);
-        for (i, (c, o)) in clean.chunks_exact(FRAME).zip(out.chunks_exact(FRAME)).enumerate() {
+        for (i, (c, o)) in clean.as_chunks::<FRAME>().0.iter().zip(out.as_chunks::<FRAME>().0).enumerate() {
             if i + 10 < pad_frames || i > n - pad_frames + 40 {
                 pad += energy(o);
                 pad_n += 1;

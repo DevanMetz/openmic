@@ -314,3 +314,43 @@ pub fn level_meter(ui: &mut egui::Ui, label: &str, peak: Option<f32>, hold: &mut
         );
     });
 }
+
+/// Peak waveform, mirrored around a center line, on a -48..0 dBFS scale so
+/// quiet speech still shows. `peaks` holds one level per time block. With
+/// `window` set, that many blocks span the width and the newest sits at the
+/// right edge (a live, scrolling view); otherwise all of `peaks` is fitted.
+pub fn waveform(ui: &mut egui::Ui, peaks: &[f32], window: Option<usize>, height: f32, color: Color32) -> Response {
+    const FLOOR_DB: f32 = -48.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+    let visuals = ui.visuals();
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(6), visuals.extreme_bg_color);
+    let mid = rect.center().y;
+    painter.line_segment(
+        [Pos2::new(rect.left() + 4.0, mid), Pos2::new(rect.right() - 4.0, mid)],
+        Stroke::new(1.0, outline(visuals).gamma_multiply(0.5)),
+    );
+
+    let span = window.unwrap_or(peaks.len()).max(1);
+    // Blocks before the first peak (an empty live window) draw nothing.
+    let first = peaks.len() as isize - span as isize;
+    let columns = ((rect.width() - 8.0) / 3.0).max(1.0) as usize;
+    let half = height / 2.0 - 3.0;
+    for column in 0..columns {
+        let from = first + (column * span / columns) as isize;
+        let to = first + ((column + 1) * span / columns).max(column * span / columns + 1) as isize;
+        let level = (from.max(0)..to.max(0))
+            .filter_map(|i| peaks.get(i as usize))
+            .fold(None, |m: Option<f32>, &p| Some(m.map_or(p, |m| m.max(p))));
+        let Some(level) = level else { continue };
+        let db = 20.0 * level.max(1e-6).log10();
+        let h = ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * half;
+        let x = rect.left() + 4.0 + column as f32 * 3.0 + 1.0;
+        painter.line_segment(
+            [Pos2::new(x, mid - h.max(0.5)), Pos2::new(x, mid + h.max(0.5))],
+            Stroke::new(2.0, color),
+        );
+    }
+    response
+}

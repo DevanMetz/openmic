@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows"
 license = "MIT"
@@ -9,16 +9,27 @@ repository = "https://github.com/DevanMetz/openmic"
 [dependencies]
 anyhow = "1.0"
 arc-swap = "1.7"
-cpal = "0.18.2"
+# Whisper speech-to-text for dictation, pure Rust like the tract runtime.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+# "realtime" promotes the WASAPI stream threads to Pro Audio (MMCSS) priority.
+cpal = { version = "0.18.2", features = ["realtime"] }
+# Same version cpal's "realtime" feature pulls in; used for the DSP thread.
+audio_thread_priority = { version = "0.35", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 directories = "6.0"
 eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+global-hotkey = "0.8"
 parking_lot = "0.12"
 rfd = "0.15.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 symphonia = { version = "0.5.5", features = ["all"] }
+tempfile = "3"
+# Downloads the dictation model on first use (Windows' own TLS stack).
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 # DeepFilterNet 3 with its tract (pure Rust) runtime and embedded model; the
 # crates.io release predates the runtime, so pin the upstream commit.
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet.git", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model"] }
@@ -32,14 +43,19 @@ tract-pulse = "=0.21.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-# Same version cpal already pulls in; used to set the default microphone.
+tray-icon = "0.25"
+# Same version cpal already pulls in; used to set the default microphone
+# and to keep a single running instance.
 windows = { version = "0.62", features = [
   "Win32_Devices_FunctionDiscovery",
   "Win32_Foundation",
   "Win32_Media_Audio",
+  "Win32_Security",
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
+  "Win32_System_Threading",
   "Win32_System_Variant",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell_PropertiesSystem",
 ] }
 # The #[interface] macro (IPolicyConfig) expands to paths in windows-core.
@@ -58,3 +74,4 @@ strip = true
 
 [build-dependencies]
 cc = "1"
+winresource = "0.1"
