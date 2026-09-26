@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use symphonia::core::audio::SampleBuffer;
+use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -34,7 +34,7 @@ pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
         .make(&track.codec_params, &DecoderOptions::default())
         .context("create audio decoder")?;
 
-    let mut interleaved: Vec<f32> = Vec::new();
+    let mut mono: Vec<f32> = Vec::new();
     let mut rate = 0u32;
     loop {
         let packet = match format.next_packet() {
@@ -54,32 +54,33 @@ pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
                 let spec = *decoded.spec();
                 if rate == 0 {
                     rate = spec.rate;
+                } else if spec.rate != rate {
+                    bail!("audio sample rate changes within the file");
                 }
-                let mut buf = SampleBuffer::<f32>::new(packet.dur(), spec);
-                buf.copy_interleaved_ref(decoded);
-                interleaved.extend_from_slice(buf.samples());
+                append_mono(&mut mono, decoded);
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(e).context("decode audio packet"),
         }
     }
 
-    if rate == 0 || interleaved.is_empty() {
+    if rate == 0 || mono.is_empty() {
         bail!("audio file is empty");
     }
 
-    // Average channels to mono.
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(1).max(1);
-    let mono: Vec<f32> = if channels > 1 {
-        interleaved
-            .chunks(channels)
-            .map(|ch| ch.iter().sum::<f32>() / channels as f32)
-            .collect()
-    } else {
-        interleaved
-    };
-
     Ok(resample_linear(&mono, rate, crate::dsp::SR))
+}
+
+fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) {
+    let spec = *decoded.spec();
+    let channels = spec.channels.count();
+    // Packet duration is in container time-base ticks, which need not equal
+    // decoded frames. Size the buffer using the decoder's actual output.
+    let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+    buf.copy_interleaved_ref(decoded);
+    mono.extend(buf.samples().chunks_exact(channels).map(|frame| {
+        frame.iter().sum::<f32>() / channels as f32
+    }));
 }
 
 /// Naive linear interpolation resampler (matches the Python np.interp approach).
@@ -107,6 +108,19 @@ fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use symphonia::core::audio::{AudioBuffer, Channels, Signal, SignalSpec};
+
+    #[test]
+    fn downmix_uses_decoded_frames_and_channels() {
+        let spec = SignalSpec::new(48_000, Channels::FRONT_LEFT | Channels::FRONT_RIGHT);
+        let mut decoded = AudioBuffer::<f32>::new(8, spec);
+        decoded.render_reserved(Some(3));
+        decoded.chan_mut(0).copy_from_slice(&[0.25, -0.5, 0.75]);
+        decoded.chan_mut(1).copy_from_slice(&[0.75, 0.5, 0.25]);
+        let mut mono = Vec::new();
+        append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded)));
+        assert_eq!(mono, vec![0.5, 0.0, 0.5]);
+    }
 
     /// Minimal 44-byte-header PCM16 WAV writer for the test fixtures.
     fn write_wav(path: &Path, samples_i16: &[i16], rate: u16, channels: u16) {

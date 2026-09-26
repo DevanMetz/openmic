@@ -362,11 +362,11 @@ fn level_chart(
         }
         _ => {}
     }
-    if body.double_clicked() {
-        if let Some(target) = hovered_target {
-            reset(s, target);
-            *changed = true;
-        }
+    if body.double_clicked()
+        && let Some(target) = hovered_target
+    {
+        reset(s, target);
+        *changed = true;
     }
 
     let mut dragging = body.dragged();

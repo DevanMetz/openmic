@@ -251,44 +251,98 @@ impl VoiceGate {
     }
 }
 
-/// One loaded soundboard clip and its playhead.
+/// Most clips that can sound at once; the oldest is cut to make room.
+pub const MAX_VOICES: usize = 16;
+
+/// One playing soundboard clip and its playhead.
 #[derive(Clone)]
 pub struct Clip {
+    /// Identifies the pad, so a pad restarts rather than stacking on itself.
+    pub key: u64,
     pub samples: std::sync::Arc<Vec<f32>>,
     pub pos: usize,
+    /// The pad's own volume, on top of the soundboard volume.
+    pub gain: f32,
+}
+
+impl Clip {
+    pub fn new(key: u64, samples: std::sync::Arc<Vec<f32>>, gain: f32) -> Self {
+        Self { key, samples, pos: 0, gain }
+    }
 }
 
 /// Soundboard mixer state; voice-independent by design (mute silences only the mic).
 #[derive(Default)]
 pub struct Mixer {
-    pub clip: Option<Clip>,
+    voices: Vec<Clip>,
 }
 
 impl Mixer {
-    pub fn playing(&self) -> bool {
-        self.clip.is_some()
+    /// Keys of the clips currently sounding.
+    pub fn playing_keys(&self) -> Vec<u64> {
+        self.voices.iter().map(|v| v.key).collect()
     }
 
-    /// Mix the current clip into `frame` in place, advancing/completing playback.
-    pub fn mix(&mut self, frame: &mut [f32], gain: f32) {
-        let Some(mut clip) = self.clip.take() else {
+    /// Start `clip`. With `overlap` it layers over other pads (the same pad
+    /// restarts); without it, it replaces whatever was playing.
+    pub fn play(&mut self, clip: Clip, overlap: bool) {
+        if clip.samples.is_empty() {
             return;
-        };
-        let end = (clip.pos + frame.len()).min(clip.samples.len());
-        let count = end - clip.pos;
-        for (s, src) in frame[..count].iter_mut().zip(&clip.samples[clip.pos..end]) {
-            *s = (*s + src * gain).clamp(-1.0, 1.0);
         }
-        clip.pos = end;
-        if end < clip.samples.len() {
-            self.clip = Some(clip);
+        if overlap {
+            self.voices.retain(|v| v.key != clip.key);
+            if self.voices.len() >= MAX_VOICES {
+                self.voices.remove(0);
+            }
+        } else {
+            self.voices.clear();
+        }
+        self.voices.push(clip);
+    }
+
+    pub fn stop(&mut self) {
+        self.voices.clear();
+    }
+
+    /// Stop one pad's clip, leaving any others playing.
+    pub fn stop_key(&mut self, key: u64) {
+        self.voices.retain(|v| v.key != key);
+    }
+
+    /// Change a playing pad's volume.
+    pub fn set_gain(&mut self, key: u64, gain: f32) {
+        for voice in self.voices.iter_mut().filter(|v| v.key == key) {
+            voice.gain = gain;
         }
     }
 
-    /// Remaining samples from the current playhead (route-switch handoff).
-    pub fn take_remaining(&mut self) -> Option<Vec<f32>> {
-        let clip = self.clip.take()?;
-        Some(clip.samples[clip.pos..].to_vec())
+    /// Mix the playing clips into `frame` in place, advancing/completing playback.
+    pub fn mix(&mut self, frame: &mut [f32], gain: f32) {
+        if self.voices.is_empty() {
+            return;
+        }
+        for clip in &mut self.voices {
+            let end = (clip.pos + frame.len()).min(clip.samples.len());
+            let g = gain * clip.gain;
+            for (s, src) in frame.iter_mut().zip(&clip.samples[clip.pos..end]) {
+                *s += src * g;
+            }
+            clip.pos = end;
+        }
+        for s in frame {
+            *s = s.clamp(-1.0, 1.0);
+        }
+        self.voices.retain(|v| v.pos < v.samples.len());
+    }
+
+    /// The playing clips with their playheads (route-switch handoff).
+    pub fn take_remaining(&mut self) -> Vec<Clip> {
+        std::mem::take(&mut self.voices)
+    }
+
+    /// Resume clips handed over by [`Self::take_remaining`].
+    pub fn resume(&mut self, clips: Vec<Clip>) {
+        self.voices = clips;
     }
 }
 
@@ -337,55 +391,91 @@ mod tests {
 
     #[test]
     fn mute_silences_frame() {
-        let mut params = Params::default();
-        params.mute = true;
+        let params = Params { mute: true, ..Default::default() };
         let ones = [1.0_f32; FRAME];
         assert!(apply_processing(&ones, &ones, &params, &mut 1.0f32).iter().all(|&s| s == 0.0));
+    }
+
+    fn clip(key: u64, samples: Vec<f32>) -> Clip {
+        Clip::new(key, std::sync::Arc::new(samples), 1.0)
     }
 
     // Ported from test_soundboard.py mixing section.
     #[test]
     fn mixer_plays_completes_and_outlives_mic_mute() {
         let mut mixer = Mixer::default();
-        mixer.clip = Some(Clip {
-            samples: std::sync::Arc::new(vec![0.4; FRAME + 120]),
-            pos: 0,
-        });
+        mixer.play(clip(1, vec![0.4; FRAME + 120]), false);
         let mut first = [0.0; FRAME];
         mixer.mix(&mut first, 0.5);
         assert!(first.iter().all(|&s| (s - 0.2).abs() < 1e-6));
-        assert!(mixer.playing());
+        assert!(!mixer.playing_keys().is_empty());
 
         let mut second = [0.0; FRAME];
         mixer.mix(&mut second, 0.5);
         assert!(second[..120].iter().all(|&s| (s - 0.2).abs() < 1e-6));
         assert!(second[120..].iter().all(|&s| s == 0.0));
-        assert!(!mixer.playing());
+        assert!(mixer.playing_keys().is_empty());
 
         // Mute must not silence the soundboard.
-        let mut params = Params::default();
-        params.mute = true;
+        let params = Params { mute: true, ..Default::default() };
         let muted_mic = apply_processing(&[1.0; FRAME], &[1.0; FRAME], &params, &mut 1.0f32);
-        mixer.clip = Some(Clip {
-            samples: std::sync::Arc::new(vec![0.25; FRAME]),
-            pos: 0,
-        });
+        mixer.play(clip(1, vec![0.25; FRAME]), false);
         let mut mixed = muted_mic;
         mixer.mix(&mut mixed, 0.5);
         assert!(mixed.iter().all(|&s| (s - 0.125).abs() < 1e-6));
-        mixer.mix(&mut [0.0; FRAME], 0.5);
-        assert!(!mixer.playing());
+        assert!(mixer.playing_keys().is_empty(), "a clip ends on its last sample");
     }
 
     #[test]
-    fn take_remaining_hands_off_playhead() {
+    fn overlapping_pads_layer_and_the_same_pad_restarts() {
         let mut mixer = Mixer::default();
-        mixer.clip = Some(Clip {
-            samples: std::sync::Arc::new((0..8).map(|i| i as f32).collect()),
-            pos: 3,
-        });
-        assert_eq!(mixer.take_remaining().unwrap(), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
-        assert!(!mixer.playing());
+        mixer.play(clip(1, vec![0.1; FRAME * 4]), true);
+        mixer.mix(&mut [0.0; FRAME], 1.0);
+        mixer.play(Clip::new(2, std::sync::Arc::new(vec![0.2; FRAME * 4]), 0.5), true);
+        let mut frame = [0.0; FRAME];
+        mixer.mix(&mut frame, 1.0);
+        assert!(frame.iter().all(|&s| (s - 0.2).abs() < 1e-6), "0.1 + 0.2 * 0.5");
+        assert_eq!(mixer.playing_keys(), vec![1, 2]);
+
+        mixer.play(clip(1, vec![0.1; FRAME * 4]), true);
+        assert_eq!(mixer.playing_keys(), vec![2, 1], "pad 1 restarted, not doubled");
+
+        mixer.set_gain(2, 0.0);
+        let mut frame = [0.0; FRAME];
+        mixer.mix(&mut frame, 1.0);
+        assert!(frame.iter().all(|&s| (s - 0.1).abs() < 1e-6));
+
+        mixer.play(clip(3, vec![0.1; FRAME]), false);
+        assert_eq!(mixer.playing_keys(), vec![3], "without overlap a pad replaces the rest");
+    }
+
+    #[test]
+    fn overlap_caps_the_voice_count() {
+        let mut mixer = Mixer::default();
+        for key in 0..MAX_VOICES as u64 + 3 {
+            mixer.play(clip(key, vec![0.0; FRAME]), true);
+        }
+        let keys = mixer.playing_keys();
+        assert_eq!(keys.len(), MAX_VOICES);
+        assert_eq!(keys[0], 3, "the oldest clips make room");
+    }
+
+    #[test]
+    fn take_remaining_hands_off_playheads() {
+        let mut mixer = Mixer::default();
+        mixer.play(clip(7, (0..8).map(|i| i as f32 * 0.1).collect()), false);
+        let mut frame = [0.0; 3];
+        mixer.mix(&mut frame, 1.0);
+        let handed = mixer.take_remaining();
+        assert!(mixer.playing_keys().is_empty());
+        assert_eq!(handed.len(), 1);
+        assert_eq!((handed[0].key, handed[0].pos), (7, 3));
+
+        let mut resumed = Mixer::default();
+        resumed.resume(handed);
+        let mut next = [0.0f32; 2];
+        resumed.mix(&mut next, 1.0);
+        assert!((next[0] - 0.3).abs() < 1e-6 && (next[1] - 0.4).abs() < 1e-6, "{next:?}");
     }
 
     fn tone(freq: f32) -> Vec<f32> {
