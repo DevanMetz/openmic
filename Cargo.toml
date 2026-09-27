@@ -26,6 +26,8 @@ parking_lot = "0.12"
 rfd = "0.15.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Verifies downloaded updates against the release checksum.
+sha2 = "0.10"
 symphonia = { version = "0.5.5", features = ["all"] }
 tempfile = "3"
 # Downloads the dictation model on first use (Windows' own TLS stack).

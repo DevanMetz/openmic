@@ -22,6 +22,7 @@ use crate::engine::{list_devices, Engine};
 use crate::hotkeys::{self, Hotkeys};
 use crate::record::{Recorder, Source, Take};
 use crate::tray::Tray;
+use crate::update::{self, Updater};
 use crate::viz::{self, Focus};
 use routes::{cable_input, choose_routes};
 
@@ -165,6 +166,11 @@ pub struct App {
     hidden: bool,
     /// Quit was chosen: let the window close instead of hiding it.
     quitting: bool,
+    /// New releases: checked daily, installed when the user asks.
+    updater: Updater,
+    /// This launch is a freshly installed update.
+    just_updated: bool,
+    update_error: Option<String>,
 }
 
 impl App {
@@ -175,8 +181,15 @@ impl App {
         ctx: &egui::Context,
         start_hidden: bool,
         instance: crate::instance::Instance,
+        just_updated: bool,
     ) -> Self {
         let mut app = Self::stopped(settings);
+        app.just_updated = just_updated;
+        {
+            // Development builds never replace themselves on their own.
+            let ctx = ctx.clone();
+            app.updater = Updater::new(!cfg!(debug_assertions), move || ctx.request_repaint());
+        }
         // Reflect the actual registry state, like the Python app did.
         app.settings.start_with_windows = config::startup_enabled();
         if app.settings.start_with_windows {
@@ -262,6 +275,9 @@ impl App {
             last_dictation: String::new(),
             hidden: false,
             quitting: false,
+            updater: Updater::new(false, || {}),
+            just_updated: false,
+            update_error: None,
         }
     }
 
@@ -594,6 +610,29 @@ impl App {
         }
     }
 
+    /// Swap in the downloaded version, start it, and quit this copy.
+    fn install_update(&mut self, ctx: &egui::Context) {
+        if let Some(why) = self.update_blocker() {
+            self.update_error = Some(why.into());
+            return;
+        }
+        match self.updater.install() {
+            Ok(()) => self.run_command(ctx, Command::Quit),
+            Err(e) => self.update_error = Some(short(&format!("{e:#}"))),
+        }
+    }
+
+    /// Work a restart would lose.
+    fn update_blocker(&self) -> Option<&'static str> {
+        if self.recorder.is_some() || self.take.is_some() {
+            Some("Save or discard your recording first")
+        } else if self.dictating.is_some() || self.dictation.busy() {
+            Some("Wait for speech to text to finish")
+        } else {
+            None
+        }
+    }
+
     /// Closing the window hides it to the tray, unless quitting.
     fn handle_close(&mut self, ctx: &egui::Context) {
         let close = ctx.input(|i| i.viewport().close_requested());
@@ -832,6 +871,7 @@ impl App {
         self.poll_engine();
         self.poll_recording();
         self.poll_dictation();
+        self.updater.tick(self.settings.check_for_updates);
         self.sync_default_mic();
         if (cable_input(&self.outputs).is_none() || self.waiting_for_device)
             && self.last_device_poll.elapsed() >= DEVICE_POLL
@@ -896,7 +936,17 @@ impl eframe::App for App {
                 ui.heading("OpenMic");
                 ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("Clean voice. Instant sounds. Fully local.");
+                    match self.updater.status() {
+                        update::Status::Available(release) | update::Status::Downloading(release)
+                        | update::Status::Ready(release) => {
+                            if ui.link(RichText::new(format!("{} available", release.tag)).color(GREEN)).clicked() {
+                                self.tab = Tab::Settings;
+                            }
+                        }
+                        _ => {
+                            ui.weak("Clean voice. Instant sounds. Fully local.");
+                        }
+                    }
                 });
             });
             ui.add_space(6.0);

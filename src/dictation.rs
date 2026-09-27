@@ -313,7 +313,7 @@ impl Transport for DownloadTransport {
     }
 }
 
-fn download_agent(idle_timeout: Duration) -> ureq::Agent {
+pub(crate) fn download_agent(idle_timeout: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()
@@ -335,7 +335,7 @@ fn check_download_cancelled(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-fn read_download_chunk(reader: &mut impl Read, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
+pub(crate) fn read_download_chunk(reader: &mut impl Read, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
     check_download_cancelled(cancel)?;
     let read = reader.read(buf);
     // Prefer the requested cancellation over the I/O timeout that woke us.

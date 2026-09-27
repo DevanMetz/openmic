@@ -2,7 +2,7 @@
 
 OpenMic is a local, real-time microphone cleaner and soundboard for Windows. It cleans your voice with DeepFilterNet 3 (or the lighter RNNoise), silences everything that isn't speech, mixes optional sound clips, and sends the result to VB-Audio Virtual Cable for Discord or any other voice application.
 
-Audio stays on your computer. Nothing is recorded unless you use **Record** or speech to text, and nothing is uploaded.
+Audio stays on your computer. Nothing is recorded unless you use **Record** or speech to text, and nothing is uploaded. The only network requests are the speech model download you ask for and a daily check for new OpenMic releases, which you can turn off.
 
 ![OpenMic v0.4.0 running with live scope and processing controls](docs/screenshot.png)
 
@@ -31,6 +31,7 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - Automatic settings persistence
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back
+- Easy updates: OpenMic checks GitHub for a new release once a day, then downloads it, verifies its SHA-256 checksum and restarts as the new version when you click **Restart to update**
 - Native GUI (egui) that follows your system's light or dark theme
 
 ## Download
@@ -102,6 +103,10 @@ Set shortcuts for **Mute mic**, **Bypass processing**, **Stop all clips** and **
 
 Closing the window hides OpenMic to the notification area, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** tab to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area.
 
+## Updates
+
+OpenMic checks GitHub Releases once a day and shows **vX.Y.Z available** at the top of the window when there's a newer version. On the **Settings** tab, click **Download update**, then **Restart to update**: OpenMic verifies the download against the release's SHA-256 checksum, replaces its executable in place (so shortcuts and **Start with Windows** keep working), and opens again as the new version. Nothing installs until you click, so an update never interrupts a call. Untick **Check for updates daily** to stop the check, or use **Check now**. If OpenMic's folder isn't writable (for example under Program Files), download the new version from the releases page instead.
+
 ## Speech to text
 
 On the **Settings** tab, pick a model under **Speech to text** and click **Download** (once; English-only Tiny, Base or Small, or Base and Small for any language). Then set a **Speech to text** shortcut under **Hotkeys**. Hold it while you speak and let go: OpenMic transcribes what your selected microphone heard and types it into the app you're using, such as Discord's message box. Choose **Press to start, again to stop** for longer dictation (it stops by itself after 5 minutes). Transcription runs on your PC; the last result can be copied from the Settings tab, including when typing into the target app fails. Apps running as administrator don't accept typed text from OpenMic.
@@ -113,7 +118,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-The suite covers the voice gate, rumble filter, DeepFilterNet stage settings, model alignment and quiet-voice preservation, the level gate/bypass/mute DSP, scope wheel and touchpad steps, late-device waiting, cancellation and reconnecting, safe routing defaults, output priming and clock-drift correction, soundboard mixing, overlap and mute isolation, clip decode/resample, streaming resampler continuity and treble, settings defaults and migration, presets, hotkey parsing and reassignment, tray commands, the app icon, and RNNoise noise suppression and voice detection. CI runs clippy and the tests on every push and pull request; pushing a `v*` tag builds a release.
+The suite covers the voice gate, rumble filter, DeepFilterNet stage settings, model alignment and quiet-voice preservation, the level gate/bypass/mute DSP, scope wheel and touchpad steps, late-device waiting, cancellation and reconnecting, safe routing defaults, output priming and clock-drift correction, soundboard mixing, overlap and mute isolation, clip decode/resample, streaming resampler continuity and treble, settings defaults and migration, presets, hotkey parsing and reassignment, tray commands, the app icon, update version checks, checksum verification and executable replacement, and RNNoise noise suppression and voice detection. CI runs clippy and the tests on every push and pull request; pushing a `v*` tag builds a release.
 
 To compare the models on a real speech recording mixed with fan noise, typing and rumble:
 

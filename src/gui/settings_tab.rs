@@ -3,8 +3,9 @@
 
 use eframe::egui::{self, RichText};
 
-use super::{App, Binding, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
+use super::{open_url, short, App, Binding, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
 use crate::dictation::SpeechModel;
+use crate::update::{self, Status};
 use crate::widgets;
 
 impl App {
@@ -105,8 +106,91 @@ impl App {
                 } else {
                     "Closing the window quits OpenMic."
                 });
+                ui.add_space(4.0);
+                self.draw_updates(ui);
             },
         );
+    }
+
+    /// Update check toggle, then what the updater is doing and what to do next.
+    fn draw_updates(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.settings.check_for_updates, "Check for updates daily")
+                .on_hover_text("Asks GitHub for the latest OpenMic release; nothing else is sent")
+                .changed()
+            {
+                self.touch();
+            }
+            let status = self.updater.status().clone();
+            let busy = matches!(status, Status::Checking | Status::Downloading(_));
+            if !busy && !matches!(status, Status::Ready(_)) && ui.small_button("Check now").clicked() {
+                self.update_error = None;
+                self.updater.check();
+            }
+        });
+
+        let current = format!("v{}", env!("CARGO_PKG_VERSION"));
+        ui.horizontal(|ui| match self.updater.status().clone() {
+            Status::Idle if self.just_updated => {
+                ui.label(RichText::new(format!("Updated to {current}")).color(GREEN));
+            }
+            Status::Idle => {
+                ui.weak(format!("OpenMic {current}"));
+            }
+            Status::Checking => {
+                ui.spinner();
+                ui.weak("Checking for updates…");
+            }
+            Status::UpToDate => {
+                ui.label(RichText::new(format!("{current} is the latest version")).color(MUTED));
+            }
+            Status::Failed(e) => {
+                ui.label(RichText::new(short(&e)).color(AMBER)).on_hover_text(&e);
+                if ui.small_button("Download page").clicked() {
+                    open_url(update::RELEASES_PAGE);
+                }
+            }
+            Status::Available(release) => {
+                ui.label(RichText::new(format!("{} is available", release.tag)).color(GREEN));
+                if ui.button("Download update").clicked() {
+                    self.update_error = None;
+                    self.updater.download();
+                }
+                if ui.small_button("What's new").clicked() {
+                    open_url(&release.page);
+                }
+            }
+            Status::Downloading(release) => {
+                let (done, total) = self.updater.progress().unwrap_or_default();
+                let fraction = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .desired_width(150.0)
+                        .text(format!("{} / {} MB", done / 1_000_000, total / 1_000_000)),
+                )
+                .on_hover_text(format!("Downloading {}", release.tag));
+                if ui.button("Cancel").clicked() {
+                    self.updater.cancel_download();
+                }
+            }
+            Status::Ready(release) => {
+                ui.label(RichText::new(format!("{} is downloaded and verified", release.tag)).color(GREEN));
+                let blocker = self.update_blocker();
+                if ui
+                    .add_enabled(blocker.is_none(), egui::Button::new("Restart to update"))
+                    .on_hover_text("OpenMic closes and opens again as the new version (a few seconds)")
+                    .on_disabled_hover_text(blocker.unwrap_or_default())
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    self.install_update(&ctx);
+                }
+            }
+        });
+        if let Some(error) = &self.update_error {
+            ui.label(RichText::new(error).color(RED));
+        }
     }
 
     fn draw_speech_card(&mut self, ui: &mut egui::Ui) {

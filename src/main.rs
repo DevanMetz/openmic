@@ -16,6 +16,7 @@ mod instance;
 mod record;
 mod resample;
 mod tray;
+mod update;
 mod viz;
 mod widgets;
 
@@ -24,6 +25,9 @@ use std::sync::Arc;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
+    // After an update, wait for the old copy to quit before claiming the
+    // single-instance lock and the audio devices.
+    let updated = update::finish_update();
     let Ok(instance) = instance::acquire() else {
         return Ok(()); // the running copy shows its window instead
     };
@@ -46,6 +50,6 @@ fn main() -> eframe::Result<()> {
                 .with_visible(!start_hidden),
             ..Default::default()
         },
-        Box::new(move |cc| Ok(Box::new(gui::App::new(settings, &cc.egui_ctx, start_hidden, instance)))),
+        Box::new(move |cc| Ok(Box::new(gui::App::new(settings, &cc.egui_ctx, start_hidden, instance, updated)))),
     )
 }

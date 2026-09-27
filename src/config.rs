@@ -51,6 +51,8 @@ pub struct Settings {
     pub speech_model: SpeechModel,
     /// Dictate while the shortcut is held; otherwise it starts and stops.
     pub dictation_hold: bool,
+    /// Look for a new OpenMic release on GitHub once a day.
+    pub check_for_updates: bool,
 }
 
 impl Default for Settings {
@@ -86,6 +88,7 @@ impl Default for Settings {
             saved_default_mic: None,
             speech_model: SpeechModel::default(),
             dictation_hold: true,
+            check_for_updates: true,
         }
     }
 }

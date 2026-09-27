@@ -26,6 +26,7 @@ jobs:
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - run: cargo test --locked --release
       - run: cargo build --locked --release
+      # The in-app updater looks for exactly these asset names (src/update.rs).
       - name: Name the binary after the tag
         shell: pwsh
         run: |
