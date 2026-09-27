@@ -2,6 +2,7 @@
 //! module; routing rules live in `routes`.
 
 mod mic_tab;
+mod overlay;
 mod routes;
 mod settings_tab;
 mod sound_tab;
@@ -84,6 +85,8 @@ pub enum Command {
     ToggleMute,
     ToggleBypass,
     ToggleRunning,
+    /// Pin or unpin the level meter.
+    ToggleOverlay,
     StopClips,
     PlayPad(PathBuf),
     /// The speech-to-text shortcut went down...
@@ -176,6 +179,8 @@ pub struct App {
     update_checked_at: Option<Instant>,
     /// The "What's new" window is open.
     show_release_notes: bool,
+    /// Peak-hold position of the pinned level meter, dBFS.
+    overlay_hold: f32,
     update_error: Option<String>,
 }
 
@@ -285,6 +290,7 @@ impl App {
             updated_at: None,
             update_checked_at: None,
             show_release_notes: false,
+            overlay_hold: -60.0,
             update_error: None,
         }
     }
@@ -614,6 +620,10 @@ impl App {
                 self.apply_live();
             }
             Command::ToggleRunning => self.toggle_running(),
+            Command::ToggleOverlay => {
+                self.settings.overlay = !self.settings.overlay;
+                self.touch();
+            }
             Command::StopClips => self.stop_clips(),
             Command::PlayPad(path) => {
                 if let Some(index) = self.settings.sounds.iter().position(|p| p.path == path) {
@@ -928,7 +938,7 @@ impl App {
         let (muted, bypassed, running) = (self.settings.mute, self.settings.bypass, self.running());
         let listening = self.dictating.is_some();
         if let Some(tray) = &mut self.tray {
-            tray.sync(muted, bypassed, running, listening);
+            tray.sync(muted, bypassed, running, listening, self.settings.overlay);
         }
 
         if let Some(t) = self.dirty_since
@@ -960,11 +970,14 @@ impl eframe::App for App {
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
-        // The live scope and the recorder animate at ~30 fps. Hidden, a
-        // slow tick still handles device loss and the default mic; tray and
-        // hotkey commands wake it immediately.
+        self.show_overlay(ctx);
+        // The live scope, the recorder and the pinned meter animate at ~30
+        // fps. Hidden, a slow tick still handles device loss and the default
+        // mic; tray and hotkey commands wake it immediately.
         let animating = self.engine.is_some() || self.recorder.is_some();
+        let meter_live = self.settings.overlay && self.engine.is_some();
         let frame_time = match (self.hidden, animating) {
+            (true, _) if meter_live => 33,
             (true, _) => 250,
             (false, true) => 33,
             (false, false) => 100,

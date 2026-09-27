@@ -22,8 +22,9 @@ mod windows_tray {
         mute: CheckMenuItem,
         bypass: CheckMenuItem,
         running: MenuItem,
-        /// (muted, bypassed, running, listening) as last shown.
-        shown: Option<(bool, bool, bool, bool)>,
+        meter: CheckMenuItem,
+        /// (muted, bypassed, running, listening, meter pinned) as last shown.
+        shown: Option<(bool, bool, bool, bool, bool)>,
     }
 
     impl Tray {
@@ -34,6 +35,7 @@ mod windows_tray {
             let mute = CheckMenuItem::new("Mute mic", true, false, None);
             let bypass = CheckMenuItem::new("Bypass processing", true, false, None);
             let running = MenuItem::new("Start OpenMic", true, None);
+            let meter = CheckMenuItem::new("Pin level meter", true, false, None);
             let quit = MenuItem::new("Quit OpenMic", true, None);
             let menu = Menu::new();
             menu.append_items(&[
@@ -42,6 +44,7 @@ mod windows_tray {
                 &mute,
                 &bypass,
                 &running,
+                &meter,
                 &PredefinedMenuItem::separator(),
                 &quit,
             ])
@@ -52,6 +55,7 @@ mod windows_tray {
                 (mute.id().clone(), Command::ToggleMute),
                 (bypass.id().clone(), Command::ToggleBypass),
                 (running.id().clone(), Command::ToggleRunning),
+                (meter.id().clone(), Command::ToggleOverlay),
                 (quit.id().clone(), Command::Quit),
             ];
             {
@@ -83,18 +87,19 @@ mod windows_tray {
                 .with_icon(tray_icon(false)?)
                 .build()
                 .context("create tray icon")?;
-            Ok(Self { icon, mute, bypass, running, shown: None })
+            Ok(Self { icon, mute, bypass, running, meter, shown: None })
         }
 
         /// `listening`: dictation is recording speech to type.
-        pub fn sync(&mut self, muted: bool, bypassed: bool, running: bool, listening: bool) {
-            let state = (muted, bypassed, running, listening);
+        pub fn sync(&mut self, muted: bool, bypassed: bool, running: bool, listening: bool, pinned: bool) {
+            let state = (muted, bypassed, running, listening, pinned);
             if self.shown == Some(state) {
                 return;
             }
             self.shown = Some(state);
             self.mute.set_checked(muted);
             self.bypass.set_checked(bypassed);
+            self.meter.set_checked(pinned);
             self.running.set_text(if running { "Stop OpenMic" } else { "Start OpenMic" });
             let icon = if listening { listening_icon() } else { tray_icon(muted) };
             let _ = self.icon.set_icon(icon.ok());
@@ -134,6 +139,6 @@ mod fallback {
             anyhow::bail!("no notification area on this platform")
         }
 
-        pub fn sync(&mut self, _muted: bool, _bypassed: bool, _running: bool, _listening: bool) {}
+        pub fn sync(&mut self, _muted: bool, _bypassed: bool, _running: bool, _listening: bool, _pinned: bool) {}
     }
 }

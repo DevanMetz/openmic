@@ -53,6 +53,10 @@ pub struct Settings {
     pub dictation_hold: bool,
     /// Look for a new OpenMic release on GitHub once a day.
     pub check_for_updates: bool,
+    /// Show the level meter pinned on top of other windows.
+    pub overlay: bool,
+    /// Where the pinned meter was last dragged to (screen points).
+    pub overlay_pos: Option<[f32; 2]>,
 }
 
 impl Default for Settings {
@@ -89,6 +93,8 @@ impl Default for Settings {
             speech_model: SpeechModel::default(),
             dictation_hold: true,
             check_for_updates: true,
+            overlay: false,
+            overlay_pos: None,
         }
     }
 }

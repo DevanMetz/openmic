@@ -290,11 +290,16 @@ impl App {
     fn draw_monitor(&mut self, ui: &mut egui::Ui) {
         let snapshot = self.engine.as_ref().map(Engine::stats);
         let mut reopen = false;
+        let mut pinned = self.settings.overlay;
         widgets::card(
             ui,
             "MONITOR & LEVELS",
             CYAN,
-            |_| {},
+            |ui| {
+                ui.checkbox(&mut pinned, "Pin meter to screen").on_hover_text(
+                    "A small level meter that stays on top of other windows, even with OpenMic in the tray",
+                );
+            },
             |ui| {
                 ui.horizontal(|ui| {
                     let toggled = widgets::pill(
@@ -325,6 +330,10 @@ impl App {
                 });
             },
         );
+        if pinned != self.settings.overlay {
+            self.settings.overlay = pinned;
+            self.touch();
+        }
         if reopen {
             self.restart_engine();
         }
