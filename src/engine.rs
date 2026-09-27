@@ -26,6 +26,12 @@ const TARGET_LATENCY_MS: usize = 25;
 /// Backlog beyond the target that is dropped at once (after a stall, say)
 /// rather than trimmed out gradually.
 const MAX_EXTRA_LATENCY_MS: usize = 100;
+/// Microphone audio waiting beyond this is dropped at once: processing fell
+/// behind (an overloaded CPU, a stall), and catching up later would leave
+/// the voice that far behind for good.
+const MAX_INPUT_BACKLOG_MS: usize = 100;
+/// What a trim leaves queued: about one microphone callback.
+const INPUT_KEEP_MS: usize = 20;
 /// Queue-depth smoothing per 10 ms frame (about a 1 s time constant).
 const DRIFT_SMOOTHING: f32 = 0.01;
 /// Rate trim per unit of relative depth error, and its limit (±0.2%, far
@@ -423,9 +429,9 @@ impl Engine {
                             "processing thread: real-time priority refused".into()
                         });
                     }
-                    if let Err(e) =
-                        process_loop(&stop, &mic_q, mic_rate, out, mon, &stats, &mixer, &params)
-                    {
+                    if let Err(e) = process_loop(
+                        &stop, &mic_q, mic_rate, out, mon, &stats, &mixer, &params, &reports.warn,
+                    ) {
                         *reports.fatal.lock() = Some(format!("{e:#}"));
                     }
                 })
@@ -556,14 +562,25 @@ fn process_loop(
     stats: &Stats,
     mixer: &Mutex<Mixer>,
     params: &ArcSwap<Params>,
+    warn: &Mutex<Option<String>>,
 ) -> Result<()> {
     let mut cleaner = Cleaner::new();
     let mut in_res = Resampler::new(mic_rate, SR);
     let mut scratch = [0.0f32; FRAME];
+    // Mic samples one 48 kHz frame needs, plus the resampler's lookahead.
+    // Taking no more keeps any backlog in `mic_q`, where it can be trimmed.
+    let per_frame = FRAME * mic_rate as usize / SR as usize + 16;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        let dropped = trim_input_backlog(mic_q, mic_rate);
+        if dropped > 0 {
+            let ms = dropped * 1000 / mic_rate as usize;
+            warn.lock().get_or_insert_with(|| {
+                format!("processing fell behind; skipped {ms} ms of mic audio to stay in sync")
+            });
         }
 
         // Feed the input resampler until it yields a full 48 kHz frame.
@@ -576,7 +593,7 @@ fn process_loop(
                 while let Some(s) = mic_q.pop() {
                     in_res.push(&[s]);
                     moved = true;
-                    if in_res.backlog() > 8_000 {
+                    if in_res.backlog() >= per_frame {
                         break;
                     }
                 }
@@ -621,6 +638,20 @@ fn process_loop(
     }
 }
 
+/// Drop the oldest mic samples once the backlog passes
+/// [`MAX_INPUT_BACKLOG_MS`], down to [`INPUT_KEEP_MS`]. Returns how many.
+fn trim_input_backlog(queue: &ArrayQueue<f32>, rate: u32) -> usize {
+    let ms = |ms: usize| rate as usize * ms / 1000;
+    if queue.len() <= ms(MAX_INPUT_BACKLOG_MS) {
+        return 0;
+    }
+    let mut dropped = 0;
+    while queue.len() > ms(INPUT_KEEP_MS) && queue.pop().is_some() {
+        dropped += 1;
+    }
+    dropped
+}
+
 fn peak(frame: &[f32]) -> f32 {
     frame.iter().fold(0.0f32, |m, s| m.max(s.abs()))
 }
@@ -634,6 +665,50 @@ fn rms_db(samples: impl ExactSizeIterator<Item = f32>) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_short_mic_backlog_is_left_alone_and_a_long_one_trimmed() {
+        let queue = ArrayQueue::new(32_768);
+        for _ in 0..4_800 {
+            queue.push(0.0).unwrap(); // 100 ms at 48 kHz: at the limit
+        }
+        assert_eq!(trim_input_backlog(&queue, 48_000), 0);
+        queue.push(0.0).unwrap();
+        assert_eq!(trim_input_backlog(&queue, 48_000), 4_801 - 960);
+        assert_eq!(queue.len(), 960, "keeps about one callback (20 ms)");
+    }
+
+    /// After a half-second stall the loop must skip the stale audio rather
+    /// than play it all back late.
+    #[test]
+    fn processing_catches_up_after_a_stall_instead_of_lagging() {
+        let mic_q = Arc::new(ArrayQueue::new(32_768));
+        for i in 0..24_000 {
+            mic_q.push((i as f32 * 0.05).sin() * 0.1).unwrap(); // 500 ms at 48 kHz
+        }
+        let (stop, stats, warn) = (Arc::new(AtomicBool::new(false)), Arc::new(Stats::default()), Arc::new(Mutex::new(None)));
+        let worker = {
+            let (mic_q, stop, stats, warn) = (Arc::clone(&mic_q), Arc::clone(&stop), Arc::clone(&stats), Arc::clone(&warn));
+            thread::spawn(move || {
+                let out = Output::new(Arc::new(OutQueue::new(48_000)), 48_000);
+                let (mixer, params) = (Mutex::new(Mixer::default()), ArcSwap::from_pointee(Params::default()));
+                process_loop(&stop, &mic_q, 48_000, out, None, &stats, &mixer, &params, &warn)
+            })
+        };
+        let started = std::time::Instant::now();
+        while !mic_q.is_empty() && started.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        worker.thread().unpark();
+        worker.join().unwrap().unwrap();
+
+        let processed = stats.history.lock().len();
+        assert!(processed <= 3, "processed {processed} frames of stale audio (at most ~20 ms expected)");
+        let warning = warn.lock().clone().expect("the skip is reported");
+        assert!(warning.contains("skipped 480 ms"), "{warning}");
+    }
 
     /// Drive a producer at 48 kHz against an output clock `ppm` off, through
     /// the real queue, callback and drift loop, and return the queue depth

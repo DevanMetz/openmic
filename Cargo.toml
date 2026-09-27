@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows"
 license = "MIT"
@@ -62,6 +62,12 @@ windows = { version = "0.62", features = [
 ] }
 # The #[interface] macro (IPolicyConfig) expands to paths in windows-core.
 windows-core = "0.62"
+
+# OpenMic's own DSP, resampler and scope drawing unoptimised run slower than
+# real time, so `cargo run` would lag. Level 1 is enough for full speed and
+# keeps rebuilds quick; debug assertions stay on.
+[profile.dev]
+opt-level = 1
 
 # The DeepFilterNet runtime is far too slow unoptimised for realtime audio,
 # and tract's debug-only graph checks reject the DeepFilterNet 3 model.
