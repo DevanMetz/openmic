@@ -17,9 +17,15 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::dictation::{download_agent, read_download_chunk};
+use crate::logfile;
 
 const LATEST_RELEASE: &str = "https://api.github.com/repos/DevanMetz/openmic/releases/latest";
 pub const RELEASES_PAGE: &str = "https://github.com/DevanMetz/openmic/releases";
+
+/// The release workflow signs each executable with the private half of this
+/// Ed25519 key (a GitHub Actions secret); updates without a valid signature
+/// are refused, so a tampered release can't install itself.
+const RELEASE_KEY: [u8; 32] = hex32("038930dcfe3be8b281437f0fee9a9112ba999e4da32b2f59f6a64db5ce4943d3");
 
 /// How often a running OpenMic looks for a new release.
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -48,8 +54,12 @@ pub struct Release {
     pub tag: String,
     /// The release page, with its notes.
     pub page: String,
+    /// The release notes (Markdown).
+    pub notes: String,
+    exe_name: String,
     exe_url: String,
     sha_url: String,
+    sig_url: String,
     size: u64,
 }
 
@@ -60,6 +70,8 @@ fn newer_release(json: &str, current: Version) -> Result<Option<Release>> {
     struct Latest {
         tag_name: String,
         html_url: String,
+        #[serde(default)]
+        body: Option<String>,
         assets: Vec<Asset>,
     }
     #[derive(Deserialize)]
@@ -73,17 +85,22 @@ fn newer_release(json: &str, current: Version) -> Result<Option<Release>> {
         return Ok(None);
     }
     let exe_name = format!("openmic-{}-windows-x64.exe", latest.tag_name);
-    let sha_name = format!("{exe_name}.sha256");
-    let find = |name: &str| latest.assets.iter().find(|a| a.name == name);
-    let (Some(exe), Some(sha)) = (find(&exe_name), find(&sha_name)) else {
+    let find = |suffix: &str| latest.assets.iter().find(|a| a.name == format!("{exe_name}{suffix}"));
+    let (Some(exe), Some(sha)) = (find(""), find(".sha256")) else {
         bail!("{} has no Windows download yet", latest.tag_name);
+    };
+    let Some(sig) = find(".sig") else {
+        bail!("{} isn't signed; download it from the releases page", latest.tag_name);
     };
     Ok(Some(Release {
         exe_url: exe.browser_download_url.clone(),
         sha_url: sha.browser_download_url.clone(),
+        sig_url: sig.browser_download_url.clone(),
+        exe_name,
         size: exe.size,
         tag: latest.tag_name,
         page: latest.html_url,
+        notes: latest.body.unwrap_or_default(),
     }))
 }
 
@@ -99,6 +116,48 @@ fn parse_checksum(text: &str) -> Result<[u8; 32]> {
         *byte = pair.context("the release checksum is malformed")?;
     }
     Ok(hash)
+}
+
+const fn hex_digit(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => panic!("not lowercase hex"),
+    }
+}
+
+const fn hex32(hex: &str) -> [u8; 32] {
+    let bytes = hex.as_bytes();
+    assert!(bytes.len() == 64);
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = hex_digit(bytes[2 * i]) << 4 | hex_digit(bytes[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// What the release workflow signs: the asset name (so an old signed build
+/// can't pose as a newer release) and the executable's SHA-256.
+fn signed_message(exe_name: &str, sha256: &[u8]) -> String {
+    let hex: String = sha256.iter().map(|b| format!("{b:02x}")).collect();
+    format!("openmic-release-v1\n{exe_name}\n{hex}\n")
+}
+
+/// Check a hex Ed25519 signature (the `.sig` asset) over the release.
+fn verify_signature(key: &[u8; 32], exe_name: &str, sha256: &[u8], signature_hex: &str) -> Result<()> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let hex = signature_hex.trim();
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| hex.get(2 * i..2 * i + 2).and_then(|p| u8::from_str_radix(p, 16).ok()))
+        .collect::<Option<_>>()
+        .filter(|b: &Vec<u8>| hex.len() == 128 && b.len() == 64)
+        .context("the update's signature is malformed")?;
+    let signature = Signature::from_slice(&bytes).context("the update's signature is malformed")?;
+    let key = VerifyingKey::from_bytes(key).context("OpenMic's release key is invalid")?;
+    key.verify_strict(signed_message(exe_name, sha256).as_bytes(), &signature)
+        .map_err(|_| anyhow::anyhow!("the update's signature doesn't match; nothing was changed"))
 }
 
 /// Where the running executable is, and the files an update puts beside it.
@@ -143,16 +202,20 @@ fn check(agent: &ureq::Agent, url: &str) -> Result<Option<Release>> {
 fn download(
     agent: &ureq::Agent,
     release: &Release,
+    key: &[u8; 32],
     dest: &Path,
     done: &AtomicU64,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let checksum = agent
-        .get(&release.sha_url)
-        .call()
-        .and_then(|r| r.into_body().read_to_string())
-        .context("download the update's checksum")?;
-    let expected = parse_checksum(&checksum)?;
+    let fetch = |url: &str, what: &str| {
+        agent
+            .get(url)
+            .call()
+            .and_then(|r| r.into_body().read_to_string())
+            .with_context(|| format!("download the update's {what}"))
+    };
+    let expected = parse_checksum(&fetch(&release.sha_url, "checksum")?)?;
+    let signature = fetch(&release.sig_url, "signature")?;
 
     let partial = dest.with_extension("part");
     let result = (|| -> Result<()> {
@@ -178,10 +241,11 @@ fn download(
         if got != release.size {
             bail!("the update download was cut short");
         }
-        if hasher.finalize().as_slice() != expected {
+        let hash = hasher.finalize();
+        if hash.as_slice() != expected {
             bail!("the update failed its checksum; nothing was changed");
         }
-        Ok(())
+        verify_signature(key, &release.exe_name, &hash, &signature)
     })();
     if let Err(e) = result {
         let _ = fs::remove_file(&partial);
@@ -305,6 +369,15 @@ impl Updater {
     /// Collect finished work, and start the daily check when `enabled`.
     pub fn tick(&mut self, enabled: bool) {
         while let Ok(event) = self.events.1.try_recv() {
+            match &event {
+                Event::Checked(Ok(Some(release))) => logfile::info(format_args!("update available: {}", release.tag)),
+                Event::Checked(Err(e)) => logfile::warn(format_args!("update check failed: {e:#}")),
+                Event::Downloaded(release, Ok(())) => {
+                    logfile::info(format_args!("update {} downloaded and verified", release.tag));
+                }
+                Event::Downloaded(_, Err(e)) => logfile::warn(format_args!("update download stopped: {e:#}")),
+                Event::Checked(Ok(None)) => {}
+            }
             self.status = match event {
                 Event::Checked(Ok(Some(release))) => Status::Available(release),
                 Event::Checked(Ok(None)) => Status::UpToDate,
@@ -346,7 +419,7 @@ impl Updater {
         self.cancel.store(false, Ordering::Relaxed);
         self.status = Status::Downloading(release.clone());
         self.spawn("openmic-update-download", move |done, cancel| {
-            let result = download(&agent(), &release, &paths.staged, done, cancel);
+            let result = download(&agent(), &release, &RELEASE_KEY, &paths.staged, done, cancel);
             Event::Downloaded(release, result)
         });
     }
@@ -393,6 +466,30 @@ fn feed() -> String {
         .unwrap_or_else(|| LATEST_RELEASE.into())
 }
 
+/// Put the updater in any state, for drawing the window in tests.
+#[cfg(test)]
+impl Updater {
+    pub fn set_status_for_test(&mut self, status: Status) {
+        self.status = status;
+    }
+}
+
+#[cfg(test)]
+impl Release {
+    pub fn sample(tag: &str) -> Self {
+        Self {
+            tag: tag.into(),
+            page: "https://example.test/release".into(),
+            notes: "## Fixes\n\n- Faster **updates**, see [the docs](https://example.test)".into(),
+            exe_name: format!("openmic-{tag}-windows-x64.exe"),
+            exe_url: String::new(),
+            sha_url: String::new(),
+            sig_url: String::new(),
+            size: 54_000_000,
+        }
+    }
+}
+
 fn agent() -> ureq::Agent {
     download_agent(Duration::from_secs(20))
 }
@@ -412,32 +509,91 @@ mod tests {
         assert_eq!(current_version(), parse_version(env!("CARGO_PKG_VERSION")).unwrap());
     }
 
-    fn release_json(tag: &str, with_checksum: bool) -> String {
-        let mut assets = vec![format!(
-            r#"{{"name": "openmic-{tag}-windows-x64.exe", "browser_download_url": "https://example.test/{tag}.exe", "size": 5}}"#
-        )];
-        if with_checksum {
-            assets.push(format!(
-                r#"{{"name": "openmic-{tag}-windows-x64.exe.sha256", "browser_download_url": "https://example.test/{tag}.sha256", "size": 100}}"#
-            ));
-        }
+    /// A release listing with the executable plus assets with these suffixes.
+    fn release_json(tag: &str, suffixes: &[&str]) -> String {
+        let assets: Vec<String> = [""]
+            .iter()
+            .chain(suffixes)
+            .map(|suffix| {
+                let ext = if suffix.is_empty() { ".exe" } else { suffix };
+                format!(
+                    r#"{{"name": "openmic-{tag}-windows-x64.exe{suffix}", "browser_download_url": "https://example.test/{tag}{ext}", "size": 5}}"#
+                )
+            })
+            .collect();
         format!(
             r#"{{"tag_name": "{tag}", "html_url": "https://example.test/releases/{tag}", "assets": [{}]}}"#,
             assets.join(",")
         )
     }
 
+    const SIGNED: &[&str] = &[".sha256", ".sig"];
+
     #[test]
-    fn only_a_newer_release_with_both_assets_is_offered() {
-        let release = newer_release(&release_json("v0.7.0", true), (0, 6, 0)).unwrap().unwrap();
+    fn only_a_newer_signed_release_is_offered() {
+        let release = newer_release(&release_json("v0.7.0", SIGNED), (0, 6, 0)).unwrap().unwrap();
         assert_eq!(release.tag, "v0.7.0");
+        assert_eq!(release.exe_name, "openmic-v0.7.0-windows-x64.exe");
         assert_eq!(release.exe_url, "https://example.test/v0.7.0.exe");
         assert_eq!(release.sha_url, "https://example.test/v0.7.0.sha256");
+        assert_eq!(release.sig_url, "https://example.test/v0.7.0.sig");
         assert_eq!(release.size, 5);
+        assert_eq!(release.notes, "", "a release without notes still offers the update");
 
-        assert_eq!(newer_release(&release_json("v0.6.0", true), (0, 6, 0)).unwrap(), None);
-        assert_eq!(newer_release(&release_json("v0.5.0", true), (0, 6, 0)).unwrap(), None);
-        assert!(newer_release(&release_json("v0.7.0", false), (0, 6, 0)).is_err(), "never install unverified");
+        let with_notes = release_json("v0.7.0", SIGNED).replacen('{', r###"{"body": "## Fixes\n- Faster","###, 1);
+        let release = newer_release(&with_notes, (0, 6, 0)).unwrap().unwrap();
+        assert_eq!(release.notes, "## Fixes\n- Faster");
+
+        assert_eq!(newer_release(&release_json("v0.6.0", SIGNED), (0, 6, 0)).unwrap(), None);
+        assert_eq!(newer_release(&release_json("v0.5.0", SIGNED), (0, 6, 0)).unwrap(), None);
+        assert!(newer_release(&release_json("v0.7.0", &[".sig"]), (0, 6, 0)).is_err());
+        let unsigned = newer_release(&release_json("v0.7.0", &[".sha256"]), (0, 6, 0));
+        assert!(unsigned.unwrap_err().to_string().contains("isn't signed"), "never install unsigned");
+    }
+
+    /// Checks that scripts/sign_release.py and this updater agree, using the
+    /// real key: sign a file with the script, then
+    /// `OPENMIC_SIGNED_FILE=path cargo test -- --ignored release_script`
+    #[test]
+    #[ignore]
+    fn release_script_signatures_verify_with_the_embedded_key() {
+        let path = PathBuf::from(std::env::var("OPENMIC_SIGNED_FILE").expect("set OPENMIC_SIGNED_FILE"));
+        let exe = fs::read(&path).unwrap();
+        let signature = fs::read_to_string(path.with_extension("exe.sig")).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        verify_signature(&RELEASE_KEY, name, &Sha256::digest(&exe), &signature).unwrap();
+    }
+
+    #[test]
+    fn the_embedded_release_key_is_a_valid_ed25519_key() {
+        assert!(ed25519_dalek::VerifyingKey::from_bytes(&RELEASE_KEY).is_ok());
+    }
+
+    /// A throwaway key standing in for the release workflow's secret key.
+    fn test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn sign(key: &ed25519_dalek::SigningKey, exe_name: &str, exe: &[u8]) -> String {
+        use ed25519_dalek::Signer;
+        let signature = key.sign(signed_message(exe_name, &Sha256::digest(exe)).as_bytes());
+        signature.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn signatures_bind_the_file_name_and_contents() {
+        let key = test_key();
+        let public = key.verifying_key().to_bytes();
+        let name = "openmic-v0.7.0-windows-x64.exe";
+        let signature = sign(&key, name, b"exe");
+        verify_signature(&public, name, &Sha256::digest(b"exe"), &signature).unwrap();
+        assert!(verify_signature(&public, name, &Sha256::digest(b"other"), &signature).is_err());
+        assert!(
+            verify_signature(&public, "openmic-v0.8.0-windows-x64.exe", &Sha256::digest(b"exe"), &signature).is_err(),
+            "an old signed build can't pose as a newer release"
+        );
+        assert!(verify_signature(&RELEASE_KEY, name, &Sha256::digest(b"exe"), &signature).is_err());
+        assert!(verify_signature(&public, name, &Sha256::digest(b"exe"), "abcd").is_err());
     }
 
     #[test]
@@ -453,7 +609,7 @@ mod tests {
     /// Each connection answers one request as keep-alive, then hangs up
     /// without a reply if another request arrives on it: the stale pooled
     /// connection that once failed a real update with "peer disconnected".
-    fn serve(body: &'static [u8], checksum: String, requests: usize) -> (String, thread::JoinHandle<()>) {
+    fn serve(body: &'static [u8], checksum: String, signature: String) -> (String, thread::JoinHandle<()>) {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -471,11 +627,17 @@ mod tests {
         };
         let server = thread::spawn(move || {
             let mut open = Vec::new();
-            for _ in 0..requests {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let request = read_request(&mut reader).unwrap();
-                let content = if request.contains(".exe ") { body } else { checksum.as_bytes() };
+                let content = if request.contains(".exe ") {
+                    body
+                } else if request.contains(".sig ") {
+                    signature.as_bytes()
+                } else {
+                    checksum.as_bytes()
+                };
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", content.len()).unwrap();
                 stream.write_all(content).unwrap();
                 open.push(thread::spawn(move || {
@@ -496,35 +658,53 @@ mod tests {
         Release {
             tag: "v9.9.9".into(),
             page: String::new(),
+            notes: String::new(),
+            exe_name: "openmic.exe".into(),
             exe_url: format!("{base}/openmic.exe"),
             sha_url: format!("{base}/openmic.exe.sha256"),
+            sig_url: format!("{base}/openmic.exe.sig"),
             size,
         }
     }
 
+    /// Serve `exe` with a checksum of `listed` and a signature by `signer`,
+    /// then download it as the updater does, trusting the test key.
+    fn fetch(exe: &'static [u8], listed: &[u8], signer: &ed25519_dalek::SigningKey) -> (Result<()>, tempfile::TempDir, u64) {
+        let checksum = format!("{:x}  openmic.exe", Sha256::digest(listed));
+        let (base, server) = serve(exe, checksum, sign(signer, "openmic.exe", exe));
+        let dir = tempfile::tempdir().unwrap();
+        let done = AtomicU64::new(0);
+        let trusted = test_key().verifying_key().to_bytes();
+        let release = test_release(&base, exe.len() as u64);
+        let dest = dir.path().join("openmic.exe.update");
+        let result = download(&agent(), &release, &trusted, &dest, &done, &AtomicBool::new(false));
+        server.join().unwrap();
+        (result, dir, done.load(Ordering::Relaxed))
+    }
+
     #[test]
     fn a_verified_download_is_kept() {
-        let checksum = format!("{:x}  openmic.exe", Sha256::digest(b"new exe"));
-        let (base, server) = serve(b"new exe", checksum, 2);
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("openmic.exe.update");
-        let done = AtomicU64::new(0);
-        download(&agent(), &test_release(&base, 7), &dest, &done, &AtomicBool::new(false)).unwrap();
-        server.join().unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"new exe");
-        assert_eq!(done.load(Ordering::Relaxed), 7);
+        let (result, dir, done) = fetch(b"new exe", b"new exe", &test_key());
+        result.unwrap();
+        assert_eq!(fs::read(dir.path().join("openmic.exe.update")).unwrap(), b"new exe");
+        assert_eq!(done, 7);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no partial file left");
     }
 
     #[test]
-    fn a_tampered_download_is_discarded() {
-        let checksum = format!("{:x}  openmic.exe", Sha256::digest(b"the real exe"));
-        let (base, server) = serve(b"evil exe", checksum, 2);
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("openmic.exe.update");
-        let result = download(&agent(), &test_release(&base, 8), &dest, &AtomicU64::new(0), &AtomicBool::new(false));
-        server.join().unwrap();
+    fn a_corrupted_download_is_discarded() {
+        let (result, dir, _) = fetch(b"bad exe", b"the real exe", &test_key());
         assert!(result.unwrap_err().to_string().contains("checksum"));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Someone who can edit the release replaces the executable and its
+    /// checksum, but can't sign without the release key.
+    #[test]
+    fn a_replaced_release_without_the_key_is_refused() {
+        let forger = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let (result, dir, _) = fetch(b"evil exe", b"evil exe", &forger);
+        assert!(result.unwrap_err().to_string().contains("signature"));
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 

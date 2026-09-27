@@ -121,6 +121,16 @@ impl App {
             self.touch();
         }
         ui.weak("Click the version number at the top to check now.");
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Open log folder")
+                .on_hover_text("openmic.log records device changes, errors and updates; attach it to a bug report")
+                .clicked()
+            {
+                super::open_url(&crate::logfile::dir().display().to_string());
+            }
+        });
     }
 
     fn draw_speech_card(&mut self, ui: &mut egui::Ui) {

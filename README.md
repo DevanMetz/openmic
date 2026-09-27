@@ -32,7 +32,8 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back
 - Easy updates: OpenMic checks GitHub for a new release once a day, then downloads it, verifies its SHA-256 checksum and restarts as the new version when you click **Restart to update**; click the version number to check any time
-- Native GUI (egui) that follows your system's light or dark theme
+- Native GUI (egui) that follows your system's light or dark theme; resizable, fits short laptop screens, and works with screen readers
+- A log file (**Settings → Open log folder**) recording device changes, errors and updates, for bug reports
 
 ## Download
 
@@ -105,11 +106,15 @@ Closing the window hides OpenMic to the notification area, where processing and 
 
 ## Updates
 
-OpenMic checks GitHub Releases once a day. To check right away, click the version number next to the title. When there's a newer version, the top of the window shows **vX.Y.Z available**: click **Update**, then **Restart to update**. OpenMic verifies the download against the release's SHA-256 checksum, replaces its executable in place (so shortcuts and **Start with Windows** keep working), and opens again as the new version. Nothing installs until you click, so an update never interrupts a call. Untick **Check for updates daily** on the **Settings** tab to stop the daily check. If OpenMic's folder isn't writable (for example under Program Files), download the new version from the releases page instead.
+OpenMic checks GitHub Releases once a day. To check right away, click the version number next to the title. When there's a newer version, the top of the window shows **vX.Y.Z available**: click **What's new** to read the release notes, then **Update** and **Restart to update**. OpenMic checks the download against the release's SHA-256 checksum and its Ed25519 signature (made by the release workflow's private key; the public key is built into OpenMic, so a tampered release is refused), replaces its executable in place (so shortcuts and **Start with Windows** keep working), and opens again as the new version. Nothing installs until you click, so an update never interrupts a call. Untick **Check for updates daily** on the **Settings** tab to stop the daily check. If OpenMic's folder isn't writable (for example under Program Files), download the new version from the releases page instead.
 
 ## Speech to text
 
 On the **Settings** tab, pick a model under **Speech to text** and click **Download** (once; English-only Tiny, Base or Small, or Base and Small for any language). Then set a **Speech to text** shortcut under **Hotkeys**. Hold it while you speak and let go: OpenMic transcribes what your selected microphone heard and types it into the app you're using, such as Discord's message box. Choose **Press to start, again to stop** for longer dictation (it stops by itself after 5 minutes). Transcription runs on your PC; the last result can be copied from the Settings tab, including when typing into the target app fails. Apps running as administrator don't accept typed text from OpenMic.
+
+## Logs
+
+OpenMic writes `openmic.log` in its settings folder (`%APPDATA%\OpenMic\OpenMic\config`): startup, processing starts and stops, lost and reconnected devices, audio warnings, default-mic changes, update activity and crashes. Past 1 MB it is renamed to `openmic.old.log` at the next launch. Open the folder from **Settings → Open log folder** and attach the log to a bug report.
 
 ## Checks
 

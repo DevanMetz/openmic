@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows"
 license = "MIT"
@@ -20,13 +20,15 @@ audio_thread_priority = { version = "0.35", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 directories = "6.0"
-eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 global-hotkey = "0.8"
 parking_lot = "0.12"
 rfd = "0.15.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Verifies downloaded updates against the release checksum.
+# Verify downloaded updates: the release checksum, and the Ed25519
+# signature made by the release workflow's key.
+ed25519-dalek = "2"
 sha2 = "0.10"
 symphonia = { version = "0.5.5", features = ["all"] }
 tempfile = "3"
@@ -57,8 +59,10 @@ windows = { version = "0.62", features = [
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Threading",
   "Win32_System_Variant",
+  "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 # The #[interface] macro (IPolicyConfig) expands to paths in windows-core.
 windows-core = "0.62"

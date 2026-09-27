@@ -23,6 +23,7 @@ use crate::engine::{list_devices, Engine};
 use crate::hotkeys::{self, Hotkeys};
 use crate::record::{Recorder, Source, Take};
 use crate::tray::Tray;
+use crate::logfile;
 use crate::update::Updater;
 use crate::viz::{self, Focus};
 use routes::{cable_input, choose_routes};
@@ -173,6 +174,8 @@ pub struct App {
     updated_at: Option<Instant>,
     /// When the user last clicked the version to check for updates.
     update_checked_at: Option<Instant>,
+    /// The "What's new" window is open.
+    show_release_notes: bool,
     update_error: Option<String>,
 }
 
@@ -281,6 +284,7 @@ impl App {
             updater: Updater::new(false, || {}),
             updated_at: None,
             update_checked_at: None,
+            show_release_notes: false,
             update_error: None,
         }
     }
@@ -326,6 +330,9 @@ impl App {
                 true
             }
             Err(e) => {
+                if self.save_error.is_none() {
+                    logfile::error(format_args!("settings not saved: {e:#}"));
+                }
                 self.save_error = Some(format!("Settings could not be saved: {e:#}"));
                 self.dirty_since = Some(Instant::now());
                 false
@@ -359,6 +366,7 @@ impl App {
             if name.is_empty() { fallback } else { name.as_str() }
         });
         if let Some(name) = missing {
+            logfile::info(format_args!("waiting for {name} to connect"));
             self.waiting_for_device = true;
             self.status = (short(&format!("Waiting for {name} to connect")), AMBER);
             return;
@@ -369,16 +377,26 @@ impl App {
             .then_some(monitor.as_str());
         match Engine::start(&self.settings.microphone, &self.settings.output, monitor, self.params()) {
             Ok(engine) => {
+                logfile::info(format_args!(
+                    "processing started: mic '{}', output '{}', monitor {}",
+                    self.settings.microphone,
+                    self.settings.output,
+                    monitor.map_or("off".into(), |m| format!("'{m}'")),
+                ));
                 self.engine = Some(engine);
                 self.reconnecting = false;
                 self.status = ("Starting…".into(), AMBER);
             }
             // A device that just reappeared can refuse to open for a moment.
             Err(e) if self.reconnecting => {
+                logfile::warn(format_args!("reconnecting: {e:#}"));
                 self.waiting_for_device = true;
                 self.status = (short(&format!("Reconnecting · {e:#}")), AMBER);
             }
-            Err(e) => self.status = (short(&format!("{e:#}")), RED),
+            Err(e) => {
+                logfile::error(format_args!("processing did not start: {e:#}"));
+                self.status = (short(&format!("{e:#}")), RED);
+            }
         }
     }
 
@@ -387,6 +405,7 @@ impl App {
         self.reconnecting = false;
         if let Some(engine) = self.engine.take() {
             engine.stop();
+            logfile::info("processing stopped");
         }
         self.hold = [-60.0; 2];
         self.playing.clear();
@@ -461,6 +480,7 @@ impl App {
 
     fn toggle_startup(&mut self, enabled: bool) {
         if let Err(e) = config::set_startup(enabled) {
+            logfile::error(format_args!("Windows startup not changed: {e:#}"));
             self.settings.start_with_windows = !enabled;
             self.status = (short(&format!("{:#}", e)), RED);
         } else {
@@ -477,6 +497,7 @@ impl App {
     fn poll_engine(&mut self) {
         let err = self.engine.as_ref().and_then(Engine::take_error);
         if let Some(e) = err {
+            logfile::error(format_args!("processing failed: {e}"));
             self.stop_engine(false);
             self.status = (short(&e), RED);
             return;
@@ -485,6 +506,7 @@ impl App {
         // come back and pick up where we left off.
         let lost = self.engine.as_ref().and_then(Engine::take_lost);
         if let Some(lost) = lost {
+            logfile::warn(format_args!("lost {lost}; reconnecting"));
             self.stop_engine(false);
             self.waiting_for_device = true;
             self.reconnecting = true;
@@ -497,6 +519,7 @@ impl App {
         }
         // Stream glitches are transient: surface them briefly, keep running.
         if let Some(w) = self.engine.as_ref().and_then(Engine::take_warning) {
+            logfile::warn(&w);
             self.warn_until = Some((short(&w), Instant::now()));
         }
         if let Some((msg, at)) = &self.warn_until {
@@ -551,12 +574,14 @@ impl App {
                 if let Err(e) = default_mic::set(&cable_mic) {
                     // One role may have changed before the other failed.
                     // Keep the snapshot both for Stop and the next retry.
+                    logfile::warn(format_args!("default mic not set to VB-Cable: {e:#}"));
                     self.warn_until = Some((short(&format!("{e:#}")), Instant::now()));
                     return;
                 }
             }
             (Some(saved), false) => {
                 if let Err(e) = default_mic::restore(&saved, &cable_mic) {
+                    logfile::warn(format_args!("default mic not restored: {e:#}"));
                     self.warn_until = Some((short(&format!("{e:#}")), Instant::now()));
                     return;
                 }
@@ -621,8 +646,14 @@ impl App {
             return;
         }
         match self.updater.install() {
-            Ok(()) => self.run_command(ctx, Command::Quit),
-            Err(e) => self.update_error = Some(short(&format!("{e:#}"))),
+            Ok(()) => {
+                logfile::info("restarting into the downloaded update");
+                self.run_command(ctx, Command::Quit);
+            }
+            Err(e) => {
+                logfile::error(format_args!("update not installed: {e:#}"));
+                self.update_error = Some(short(&format!("{e:#}")));
+            }
         }
     }
 
@@ -677,6 +708,7 @@ impl App {
         let Some(hotkeys) = &mut self.hotkeys else { return };
         let refused = hotkeys.set(bindings);
         if !refused.is_empty() {
+            logfile::warn(format_args!("shortcuts refused by Windows: {}", refused.join(", ")));
             self.hotkey_status = (
                 short(&format!("{} is taken by another app", refused.join(", "))),
                 AMBER,
@@ -773,7 +805,10 @@ impl App {
                 self.dictating = Some(recorder);
                 self.dictation_status = ("Listening…".into(), AMBER);
             }
-            Err(e) => self.dictation_status = (short(&format!("{e:#}")), RED),
+            Err(e) => {
+                logfile::warn(format_args!("dictation did not start: {e:#}"));
+                self.dictation_status = (short(&format!("{e:#}")), RED);
+            }
         }
     }
 
@@ -806,7 +841,10 @@ impl App {
         while let Some(event) = self.dictation.poll() {
             self.dictation_status = match event {
                 dictation::Event::Downloaded(model) => (format!("{} is ready", model.label()), GREEN),
-                dictation::Event::DownloadFailed(e) => (short(&e), RED),
+                dictation::Event::DownloadFailed(e) => {
+                    logfile::warn(format_args!("speech model download failed: {e}"));
+                    (short(&e), RED)
+                }
                 dictation::Event::Transcribed { text, typing_error } => {
                     self.last_dictation = text;
                     match typing_error {
@@ -815,7 +853,10 @@ impl App {
                     }
                 }
                 dictation::Event::Nothing => ("No speech heard".into(), MUTED),
-                dictation::Event::Failed(e) => (short(&e), RED),
+                dictation::Event::Failed(e) => {
+                    logfile::warn(format_args!("speech to text failed: {e}"));
+                    (short(&e), RED)
+                }
             };
         }
     }
@@ -906,6 +947,7 @@ const MAX_DICTATION: Duration = Duration::from_secs(300);
 
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        logfile::info("quitting");
         self.recorder.take();
         self.dictating.take();
         self.stop_engine(false);
@@ -933,12 +975,42 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.capture_hotkey(&ctx);
+        self.draw_release_notes(&ctx);
+
+        // Footer first so it keeps its place at the bottom of a short window.
+        egui::Panel::bottom("footer").show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // Waiting for a device counts as on: Stop cancels the wait.
+                let running = self.running();
+                let btn = egui::Button::new(if running {
+                    RichText::new("Stop OpenMic").color(Color32::BLACK)
+                } else {
+                    RichText::new("Start OpenMic").color(Color32::BLACK)
+                })
+                .fill(if running { RED } else { GREEN });
+                if ui.add(btn).clicked() {
+                    self.toggle_running();
+                }
+                if let Some(error) = &self.save_error {
+                    ui.label(RichText::new("Settings not saved · retrying…").color(RED))
+                        .on_hover_text(error);
+                } else {
+                    ui.label(RichText::new(&self.status.0).color(self.status.1));
+                }
+            });
+            ui.add_space(2.0);
+        });
 
         CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("OpenMic");
                 self.draw_version(ui);
+                if cfg!(debug_assertions) {
+                    ui.label(RichText::new("dev build").small().color(AMBER))
+                        .on_hover_text("Built without --release: slower, and never updates itself");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.draw_update_status(ui);
                 });
@@ -959,40 +1031,20 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             ui.separator();
-            match self.tab {
-                Tab::Mic => self.draw_mic_tab(ui),
-                Tab::Soundboard => {
-                    let height = (ui.available_height() - 60.0).max(320.0);
-                    ScrollArea::vertical()
-                        .id_salt("sound_tab")
-                        .max_height(height)
-                        .show(ui, |ui| self.draw_sound_tab(ui));
-                }
-                Tab::Settings => self.draw_settings_tab(ui),
-            }
-
-            // Footer follows the content; the fixed window is sized to fit.
-            ui.add_space(10.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                // Waiting for a device counts as on: Stop cancels the wait.
-                let running = self.running();
-                let btn = egui::Button::new(if running {
-                    RichText::new("Stop OpenMic").color(Color32::BLACK)
-                } else {
-                    RichText::new("Start OpenMic").color(Color32::BLACK)
+            // The window can be smaller than the content (a short laptop
+            // screen); the tabs scroll, the header and footer stay put.
+            ScrollArea::vertical()
+                .id_salt(match self.tab {
+                    Tab::Mic => "mic_tab",
+                    Tab::Soundboard => "sound_tab",
+                    Tab::Settings => "settings_tab",
                 })
-                .fill(if running { RED } else { GREEN });
-                if ui.add(btn).clicked() {
-                    self.toggle_running();
-                }
-                if let Some(error) = &self.save_error {
-                    ui.label(RichText::new("Settings not saved · retrying…").color(RED))
-                        .on_hover_text(error);
-                } else {
-                    ui.label(RichText::new(&self.status.0).color(self.status.1));
-                }
-            });
+                .auto_shrink([false; 2])
+                .show(ui, |ui| match self.tab {
+                    Tab::Mic => self.draw_mic_tab(ui),
+                    Tab::Soundboard => self.draw_sound_tab(ui),
+                    Tab::Settings => self.draw_settings_tab(ui),
+                });
         });
     }
 }
@@ -1166,6 +1218,107 @@ mod tests {
 
         app.start_capture(Binding::StopClips);
         assert!(app.hotkey_bindings().is_empty(), "keys are freed while recording one");
+    }
+
+    /// Draw the whole window headlessly (as eframe does) and return every
+    /// piece of text with where it landed, plus the screen reader tree.
+    fn render(app: &mut App, size: egui::Vec2) -> (Vec<(String, egui::Rect)>, egui::FullOutput) {
+        use eframe::App as _;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        // A few frames so layouts that measure themselves settle.
+        let mut output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        for _ in 0..3 {
+            output = ctx.run_ui(input(), |ui| app.ui(ui, &mut frame));
+        }
+        fn collect(shape: &egui::Shape, clip: egui::Rect, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let rect = text.visual_bounding_rect().intersect(clip);
+                    if rect.is_positive() {
+                        out.push((text.galley.text().to_owned(), rect));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, clip, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, clipped.clip_rect, &mut texts);
+        }
+        (texts, output)
+    }
+
+    fn visible<'a>(texts: &'a [(String, egui::Rect)], needle: &str) -> Option<&'a egui::Rect> {
+        texts.iter().find(|(text, _)| text.contains(needle)).map(|(_, rect)| rect)
+    }
+
+    /// A 1080p laptop at 150% has about 690 points of height: every tab must
+    /// keep the title and the Start button on screen, at that size and at
+    /// the natural one.
+    #[test]
+    fn every_tab_keeps_the_header_and_footer_on_screen() {
+        for size in [egui::vec2(700.0, 420.0), egui::vec2(760.0, 880.0)] {
+            for tab in [Tab::Mic, Tab::Soundboard, Tab::Settings] {
+                let mut app = App::stopped(Settings::default());
+                app.tab = tab;
+                let (texts, _) = render(&mut app, size);
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                for needle in ["OpenMic", "Start OpenMic", "Settings"] {
+                    let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} missing at {size:?}"));
+                    assert!(screen.contains_rect(*rect), "{needle} off screen at {size:?}: {rect:?}");
+                }
+                let start = visible(&texts, "Start OpenMic").unwrap();
+                assert!(start.bottom() > size.y - 40.0, "the footer sits at the bottom: {start:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn update_states_show_in_the_header() {
+        use crate::update::{Release, Status};
+        let cases = [
+            (Status::Available(Release::sample("v9.0.0")), "v9.0.0 available"),
+            (Status::Downloading(Release::sample("v9.0.0")), "/ 54 MB"),
+            (Status::Ready(Release::sample("v9.0.0")), "Restart to update"),
+            (Status::Checking, "Checking for updates"),
+        ];
+        for (status, needle) in cases {
+            let mut app = App::stopped(Settings::default());
+            app.updater.set_status_for_test(status);
+            let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+            let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} not shown"));
+            assert!(rect.top() < 60.0, "{needle} belongs in the title row: {rect:?}");
+            assert!(visible(&texts, "Clean voice").is_none(), "the tagline gives way to {needle}");
+        }
+    }
+
+    #[test]
+    fn release_notes_open_inside_the_app() {
+        let mut app = App::stopped(Settings::default());
+        app.updater.set_status_for_test(crate::update::Status::Available(crate::update::Release::sample("v9.0.0")));
+        app.show_release_notes = true;
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 880.0));
+        assert!(visible(&texts, "What's new in v9.0.0").is_some());
+        assert!(visible(&texts, "Fixes").is_some());
+        assert!(visible(&texts, "Faster updates, see the docs").is_some(), "inline Markdown is plain text");
+    }
+
+    #[test]
+    fn screen_readers_can_name_the_controls() {
+        let mut app = App::stopped(Settings::default());
+        let (_, output) = render(&mut app, egui::vec2(760.0, 880.0));
+        let tree = output.platform_output.accesskit_update.expect("accessibility tree");
+        let labels: Vec<String> = tree.nodes.iter().filter_map(|(_, node)| node.label().map(str::to_owned)).collect();
+        for control in ["Start OpenMic", "Microphone", "Soundboard", "Settings"] {
+            assert!(labels.iter().any(|l| l.contains(control)), "{control} has no accessible name: {labels:?}");
+        }
     }
 
     #[test]

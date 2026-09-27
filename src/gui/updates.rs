@@ -73,7 +73,7 @@ impl App {
             }
             Status::Available(release) => {
                 if ui.link("What's new").clicked() {
-                    open_url(&release.page);
+                    self.show_release_notes = true;
                 }
                 if ui.button("Update").on_hover_text("Download and verify the new version").clicked() {
                     self.updater.download();
@@ -100,5 +100,97 @@ impl App {
                 ui.weak("Clean voice. Instant sounds. Fully local.");
             }
         }
+    }
+
+    /// The available release's notes, in a window over the app.
+    pub(super) fn draw_release_notes(&mut self, ctx: &egui::Context) {
+        let release = match self.updater.status() {
+            Status::Available(release) | Status::Downloading(release) | Status::Ready(release) => release.clone(),
+            _ => return,
+        };
+        if !self.show_release_notes {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(format!("What's new in {}", release.tag))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .max_height(ctx.content_rect().height() * 0.7)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if release.notes.trim().is_empty() {
+                        ui.weak("This release has no notes.");
+                    } else {
+                        markdown(ui, &release.notes);
+                    }
+                });
+                ui.separator();
+                if ui.link("Open the release page").clicked() {
+                    open_url(&release.page);
+                }
+            });
+        self.show_release_notes = open;
+    }
+}
+
+/// Just enough Markdown for release notes: headings, bullets, paragraphs.
+fn markdown(ui: &mut egui::Ui, text: &str) {
+    for line in text.lines() {
+        let line = line.trim_end();
+        if let Some(heading) = line.trim_start_matches('#').strip_prefix(' ').filter(|_| line.starts_with('#')) {
+            ui.add_space(6.0);
+            ui.label(RichText::new(plain(heading)).strong().size(15.0));
+        } else if let Some(item) = line.trim_start().strip_prefix("- ").or_else(|| line.trim_start().strip_prefix("* ")) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("•");
+                ui.label(plain(item));
+            });
+        } else if line.is_empty() {
+            ui.add_space(4.0);
+        } else {
+            ui.label(plain(line));
+        }
+    }
+}
+
+/// Inline Markdown as plain text: `[text](url)` keeps the text, and
+/// emphasis and code marks are dropped.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        match after.find("](").and_then(|mid| after[mid + 2..].find(')').map(|end| (mid, mid + 2 + end))) {
+            Some((mid, end)) => {
+                out.push_str(&rest[..open]);
+                out.push_str(&after[..mid]);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("**", "").replace('`', "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain;
+
+    #[test]
+    fn inline_markdown_becomes_plain_text() {
+        assert_eq!(plain("Click **Update**, then `Restart`"), "Click Update, then Restart");
+        assert_eq!(
+            plain("Requires the [Visual C++ Redistributable](https://example.test/vc) on Windows"),
+            "Requires the Visual C++ Redistributable on Windows"
+        );
+        assert_eq!(plain("an [unclosed bracket"), "an [unclosed bracket");
+        assert_eq!(plain("[a](x) and [b](y)"), "a and b");
     }
 }

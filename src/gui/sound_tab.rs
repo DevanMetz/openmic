@@ -123,6 +123,7 @@ impl App {
     pub(super) fn poll_recording(&mut self) {
         let error = self.recorder.as_ref().and_then(Recorder::take_error);
         if let Some(error) = error {
+            crate::logfile::error(format_args!("recording stopped: {error}"));
             self.stop_recording();
             self.record_status = (short(&format!("Recording stopped: {error}")), RED);
         } else if self.recorder.as_ref().is_some_and(Recorder::is_full) {
