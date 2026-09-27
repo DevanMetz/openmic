@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows"
 license = "MIT"
