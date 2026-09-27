@@ -55,8 +55,11 @@ pub struct Settings {
     pub check_for_updates: bool,
     /// Show the level meter pinned on top of other windows.
     pub overlay: bool,
-    /// Where the pinned meter was last dragged to (screen points).
-    pub overlay_pos: Option<[f32; 2]>,
+    /// Where the pinned meter was last dragged to, in screen pixels (the
+    /// same on monitors with different scaling).
+    pub overlay_position: Option<[i32; 2]>,
+    /// The pinned meter's width in points; at its narrowest, just the icon.
+    pub overlay_width: f32,
 }
 
 impl Default for Settings {
@@ -94,7 +97,8 @@ impl Default for Settings {
             dictation_hold: true,
             check_for_updates: true,
             overlay: false,
-            overlay_pos: None,
+            overlay_position: None,
+            overlay_width: 200.0,
         }
     }
 }

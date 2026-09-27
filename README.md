@@ -28,7 +28,7 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - Persistent soundboard with per-pad volume, optional overlapping clips, and a soundboard volume; WAV, FLAC, OGG, MP3, AIFF via symphonia
 - Record the raw microphone or the audio playing through a Windows output, then save a WAV file or add the take directly to the soundboard
 - Input and output level meters with dB readouts and peak hold
-- A level meter you can pin to your screen: a small always-on-top window showing what Discord hears, even with OpenMic in the tray (**Pin meter to screen** under **Monitor & Levels**, or the tray menu). Drag it anywhere; double-click it to open OpenMic; hover for **Mute** and unpin
+- A level meter you can pin to your screen: a small always-on-top window showing what Discord hears, even with OpenMic in the tray (**Pin meter to screen** under **Monitor & Levels**, or the tray menu). Click the microphone to mute or unmute; drag the meter anywhere; drag its right edge to resize it, down to just the microphone; double-click it to open OpenMic; hover for **×** to unpin
 - Automatic settings persistence
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back

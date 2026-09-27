@@ -181,6 +181,9 @@ pub struct App {
     show_release_notes: bool,
     /// Peak-hold position of the pinned level meter, dBFS.
     overlay_hold: f32,
+    overlay_placement: overlay::Placement,
+    /// The meter's width when it was pinned (kept constant while shown).
+    overlay_spawn_width: f32,
     update_error: Option<String>,
 }
 
@@ -291,6 +294,8 @@ impl App {
             update_checked_at: None,
             show_release_notes: false,
             overlay_hold: -60.0,
+            overlay_placement: overlay::Placement::default(),
+            overlay_spawn_width: overlay::DEFAULT_WIDTH,
             update_error: None,
         }
     }
