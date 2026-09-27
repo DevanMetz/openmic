@@ -142,6 +142,9 @@ impl App {
                 ui.spinner();
                 ui.weak("Checking for updates…");
             }
+            Status::UpToDate if self.just_updated => {
+                ui.label(RichText::new(format!("Updated to {current}, the latest version")).color(GREEN));
+            }
             Status::UpToDate => {
                 ui.label(RichText::new(format!("{current} is the latest version")).color(MUTED));
             }

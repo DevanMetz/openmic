@@ -324,6 +324,11 @@ pub(crate) fn download_agent(idle_timeout: Duration) -> ureq::Agent {
         .timeout_connect(Some(idle_timeout))
         .timeout_send_request(Some(idle_timeout))
         .timeout_recv_response(Some(idle_timeout))
+        // A pooled connection the server has just closed fails the next
+        // request ("peer disconnected"). Downloads are few and large, so a
+        // fresh connection per request costs nothing.
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
         .build();
     ureq::Agent::with_parts(config, DownloadConnector(idle_timeout), ureq::unversioned::resolver::DefaultResolver::default())
 }

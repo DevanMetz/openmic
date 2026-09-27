@@ -450,27 +450,43 @@ mod tests {
     }
 
     /// Serves `body` for paths ending in ".exe" and `checksum` otherwise.
+    /// Each connection answers one request as keep-alive, then hangs up
+    /// without a reply if another request arrives on it: the stale pooled
+    /// connection that once failed a real update with "peer disconnected".
     fn serve(body: &'static [u8], checksum: String, requests: usize) -> (String, thread::JoinHandle<()>) {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let read_request = |reader: &mut std::io::BufReader<std::net::TcpStream>| {
+            let mut request = String::new();
+            reader.read_line(&mut request).ok()?;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).ok()?;
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            (!request.is_empty()).then_some(request)
+        };
         let server = thread::spawn(move || {
+            let mut open = Vec::new();
             for _ in 0..requests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-                let mut request = String::new();
-                reader.read_line(&mut request).unwrap();
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                }
+                let request = read_request(&mut reader).unwrap();
                 let content = if request.contains(".exe ") { body } else { checksum.as_bytes() };
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", content.len())
-                    .unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", content.len()).unwrap();
                 stream.write_all(content).unwrap();
+                open.push(thread::spawn(move || {
+                    if read_request(&mut reader).is_some() {
+                        drop(stream); // reused: hang up without answering
+                    }
+                }));
+            }
+            drop(listener);
+            for connection in open {
+                let _ = connection.join();
             }
         });
         (base, server)
