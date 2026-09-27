@@ -144,6 +144,8 @@ pub struct App {
     default_mic_sync: DefaultMicSync,
     /// The processing setting under the pointer this frame.
     focus: Option<Focus>,
+    /// The scope slider under the pointer (last frame).
+    slider_focus: Option<Focus>,
     /// Peak-hold positions of the input/output meters, dBFS.
     hold: [f32; 2],
     /// Start was blocked by a device that isn't connected (e.g. a USB mic
@@ -274,6 +276,7 @@ impl App {
             last_device_poll: Instant::now(),
             default_mic_sync: DefaultMicSync::default(),
             focus: None,
+            slider_focus: None,
             hold: [-60.0; 2],
             waiting_for_device: false,
             reconnecting: false,
@@ -1295,6 +1298,30 @@ mod tests {
                 let start = visible(&texts, "Start OpenMic").unwrap();
                 assert!(start.bottom() > size.y - 40.0, "the footer sits at the bottom: {start:?}");
             }
+        }
+    }
+
+    /// The mixer sliders sit to the right of a narrower scope, and still
+    /// fit in the smallest window.
+    #[test]
+    fn the_gain_sliders_sit_beside_the_scope() {
+        for size in [egui::vec2(700.0, 900.0), egui::vec2(760.0, 900.0)] {
+            let mut app = App::stopped(Settings::default());
+            let (texts, _) = render(&mut app, size);
+            let scope = *visible(&texts, "Start OpenMic to see your voice").expect("the scope is drawn");
+            for label in ["Your mic", "To Discord", "Reduction", "+0.0 dB", "100%"] {
+                // Beside the scope (the monitor volume also reads "100%").
+                let rect = texts
+                    .iter()
+                    .filter(|(text, rect)| text == label && rect.top() > scope.top() - 200.0)
+                    .map(|(_, rect)| *rect)
+                    .max_by(|a, b| a.left().total_cmp(&b.left()))
+                    .unwrap_or_else(|| panic!("{label} missing at {size:?}"));
+                let rect = &rect;
+                assert!(rect.left() > scope.right(), "{label} is right of the scope at {size:?}: {rect:?} vs {scope:?}");
+                assert!(rect.right() <= size.x, "{label} fits at {size:?}: {rect:?}");
+            }
+            assert!(visible(&texts, "your mic +").is_none(), "the old value chips are gone");
         }
     }
 

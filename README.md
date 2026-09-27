@@ -76,13 +76,13 @@ If a device is unplugged while processing, OpenMic shows **reconnecting…** and
 
 ## Adjusting
 
-Choose a model and switch filters on or off in **Processing**, or pick a starting point from **Preset**. Type a name in that menu and click **Save current** to keep your own settings as a preset. Use the **Live scope** to tune their settings: drag a control, scroll over it for fine steps, or double-click it to reset that setting. **Reset** in **Processing** restores all processing settings.
+Choose a model and switch filters on or off in **Processing**, or pick a starting point from **Preset**. Type a name in that menu and click **Save current** to keep your own settings as a preset. Use the **Live scope** and the three sliders beside it to tune their settings: drag a control, scroll over it for fine steps, or double-click it to reset that setting. **Reset** in **Processing** restores all processing settings.
 
 | Scope control | Drag changes | Wheel step |
 |---|---|---|
-| Blue line (your mic) or its chip | Input gain | 0.5 dB |
-| Green line (to Discord) or its chip | Output gain | 0.5 dB |
-| **reduction** chip | Noise-reduction strength | 1% |
+| **Your mic** slider or the blue line | Input gain | 0.5 dB |
+| **To Discord** slider or the green line | Output gain | 0.5 dB |
+| **Reduction** slider | Noise-reduction strength | 1% |
 | Dashed amber line (when **Level gate** is on) | Level-gate threshold | 1 dB |
 | Voice chart | Voice-gate threshold: lower it if quiet words get cut off; raise it if noise opens the gate | 1% |
 | Rumble chart | Rumble-filter cutoff; drag left or right | 1 Hz |

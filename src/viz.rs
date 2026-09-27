@@ -3,7 +3,7 @@
 //!
 //! - blue trace (your mic): drag up/down for input gain
 //! - green trace (to Discord): drag up/down for output gain
-//! - "reduction" chip: drag up/down for noise-reduction strength
+//! - sliders beside the scope: input gain, output gain, noise reduction
 //! - dashed amber line: level-gate threshold
 //! - voice chart: drag the dashed line for the voice-gate threshold
 //! - rumble curve: drag left/right for the filter cutoff
@@ -47,9 +47,9 @@ impl Focus {
     fn caption(self) -> &'static str {
         match self {
             Focus::Model => "Blue is your mic, green is what Discord hears; the gap is the noise removed.",
-            Focus::Reduction => "Drag or scroll the reduction chip: lower keeps some room tone, 100% removes all it can.",
-            Focus::InputGain => "Drag or scroll the blue line to change input gain (0.5 dB per notch).",
-            Focus::OutputGain => "Drag or scroll the green line to change what Discord hears (0.5 dB per notch).",
+            Focus::Reduction => "Reduction: lower keeps some room tone, 100% removes all it can (1% per notch).",
+            Focus::InputGain => "Your mic: the slider or the blue line sets input gain (0.5 dB per notch).",
+            Focus::OutputGain => "To Discord: the slider or the green line sets what Discord hears (0.5 dB per notch).",
             Focus::LevelGate => "Drag or scroll the dashed line: anything quieter fades out (1 dB per notch).",
             Focus::VoiceGate => {
                 "Drag or scroll: when violet (voice certainty) is above the line the gate opens (1% per notch)."
@@ -91,6 +91,69 @@ pub fn scope(
         .map_or("Drag the lines or scroll over them to adjust; double-click one to reset it.", Focus::caption);
     ui.weak(caption);
     changed
+}
+
+/// Room the gain sliders take to the right of the scope.
+pub const SLIDERS_WIDTH: f32 = 186.0;
+
+/// Mixer-style sliders beside the scope: your mic (input gain), to Discord
+/// (output gain) and noise reduction. The wheel steps each one and a
+/// double-click resets it. Returns whether a setting changed, and which
+/// one the pointer is on (to highlight it on the scope).
+pub fn gain_sliders(ui: &mut egui::Ui, s: &mut Settings) -> (bool, Option<Focus>) {
+    let mut changed = false;
+    let mut pointed = None;
+    let height = LEVEL_HEIGHT + SMALL_HEIGHT - 44.0;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().slider_width = height;
+        let column = (SLIDERS_WIDTH - 2.0 * 6.0) / 3.0;
+        let controls: [(Focus, &str, Color32); 3] = [
+            (Focus::InputGain, "Your mic", CYAN),
+            (Focus::OutputGain, "To Discord", GREEN),
+            (Focus::Reduction, "Reduction", AMBER),
+        ];
+        for (target, label, color) in controls {
+            let size = Vec2::new(column, height + 40.0);
+            ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.set_width(column);
+                ui.label(egui::RichText::new(label).small().color(color));
+                let slider = match target {
+                    Focus::InputGain => egui::Slider::new(&mut s.input_gain_db, INPUT_GAIN),
+                    Focus::OutputGain => egui::Slider::new(&mut s.output_gain_db, OUTPUT_GAIN),
+                    _ => egui::Slider::new(&mut s.strength, 0.0..=1.0),
+                };
+                let slider = slider.vertical().show_value(false).trailing_fill(true);
+                // Centred in its column under the label.
+                let response = ui
+                    .horizontal(|ui| {
+                        ui.add_space((column - ui.spacing().interact_size.y) / 2.0);
+                        ui.add(slider)
+                    })
+                    .inner;
+                let response = response.on_hover_text("Scroll for fine steps; double-click to reset");
+                changed |= response.changed();
+                // Sliders only sense drags, so read the double-click directly.
+                let double = ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+                if double && response.hovered() {
+                    reset(s, target);
+                    changed = true;
+                }
+                let notches = wheel_notches(ui, response.id, response.hovered() && !response.dragged());
+                changed |= scroll(s, target, notches);
+                if response.hovered() || response.dragged() {
+                    pointed = Some(target);
+                }
+                let value = match target {
+                    Focus::InputGain => format!("{:+.1} dB", s.input_gain_db),
+                    Focus::OutputGain => format!("{:+.1} dB", s.output_gain_db),
+                    _ => format!("{:.0}%", s.strength * 100.0),
+                };
+                ui.label(egui::RichText::new(value).small().monospace());
+            });
+        }
+    });
+    (changed, pointed)
 }
 
 struct Chart {
@@ -292,12 +355,11 @@ fn level_chart(
     let n = frames.len();
     let xs: Vec<f32> = (0..n).map(|i| c.x(i, n)).collect();
 
-    // Legend chips in the header double as drag handles.
+    // Legend: which trace is which (the sliders beside the scope set them).
     let chip_font = FontId::proportional(11.0);
-    let chips: [(Focus, String, Color32); 3] = [
-        (Focus::InputGain, format!("your mic {:+.1} dB", s.input_gain_db), CYAN),
-        (Focus::OutputGain, format!("to Discord {:+.1} dB", s.output_gain_db), GREEN),
-        (Focus::Reduction, format!("reduction {:.0}%", s.strength * 100.0), AMBER),
+    let chips: [(Focus, String, Color32); 2] = [
+        (Focus::InputGain, "your mic".to_owned(), CYAN),
+        (Focus::OutputGain, "to Discord".to_owned(), GREEN),
     ];
     let mut chip_x = rect.left() + 8.0;
     let mid = rect.top() + HEADER / 2.0;
@@ -340,7 +402,7 @@ fn level_chart(
     let hovered_target = body.hover_pos().and_then(hit_test);
     let press = ui.input(|i| i.pointer.press_origin()).or(body.hover_pos());
     let grabbed = drag_target(ui, c.id(), body, press.and_then(hit_test));
-    let mut pointed = grabbed.or(hovered_target);
+    let pointed = grabbed.or(hovered_target);
     let dy = -body.drag_delta().y;
     match grabbed {
         Some(Focus::LevelGate) => {
@@ -369,29 +431,11 @@ fn level_chart(
         *changed = true;
     }
 
-    let mut dragging = body.dragged();
-    for (i, (target, hit, _, _)) in chip_layout.iter().enumerate() {
-        let r = ui.interact(*hit, c.id().with(("chip", i)), Sense::click_and_drag());
-        dragging |= r.dragged();
-        if r.hovered() || r.dragged() {
-            pointed = Some(*target);
-        }
-        let dy = -r.drag_delta().y;
-        match target {
-            Focus::InputGain => *changed |= nudge(&mut s.input_gain_db, dy * db_per_px, INPUT_GAIN),
-            Focus::OutputGain => *changed |= nudge(&mut s.output_gain_db, dy * db_per_px, OUTPUT_GAIN),
-            Focus::Reduction => *changed |= nudge(&mut s.strength, dy * 0.005, 0.0..=1.0),
-            _ => {}
-        }
-        if r.double_clicked() {
-            reset(s, *target);
-            *changed = true;
-        }
-    }
+    let dragging = body.dragged();
     if let Some(target) = pointed {
         ui.ctx().set_cursor_icon(target.cursor());
     }
-    for target in [Focus::InputGain, Focus::OutputGain, Focus::Reduction, Focus::LevelGate] {
+    for target in [Focus::InputGain, Focus::OutputGain, Focus::LevelGate] {
         let notches = wheel_notches(ui, c.id().with(target), pointed == Some(target) && !dragging);
         *changed |= scroll(s, target, notches);
     }
@@ -650,6 +694,62 @@ mod tests {
         assert!(!step_by(&mut threshold, 0.0, 0.01, 0.05..=0.95), "no wheel, no change");
         gain = 3.37;
         assert!(!step_by(&mut gain, 0.25, 0.5, INPUT_GAIN), "a partial notch cannot snap a dragged value");
+    }
+
+    /// Run the sliders for a few frames with the pointer over column
+    /// `column` (0 = your mic), sending `events` on the middle frame.
+    fn slide(s: &mut Settings, column: usize, events: Vec<egui::Event>) -> Option<Focus> {
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(SLIDERS_WIDTH, 260.0));
+        let x = (column as f32 + 0.5) * SLIDERS_WIDTH / 3.0;
+        let at = Pos2::new(x, 120.0);
+        let mut pointed = None;
+        for events in [vec![egui::Event::PointerMoved(at)], events, Vec::new()] {
+            let input = egui::RawInput { screen_rect: Some(area), events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| pointed = gain_sliders(ui, s).1);
+        }
+        pointed
+    }
+
+    #[test]
+    fn scope_sliders_step_with_the_wheel_and_reset_on_double_click() {
+        let wheel = |lines: f32| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: Vec2::new(0.0, lines),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        };
+        let mut s = Settings::default();
+        assert_eq!(slide(&mut s, 0, vec![wheel(2.0)]), Some(Focus::InputGain));
+        assert_eq!(s.input_gain_db, 1.0, "0.5 dB per notch");
+        assert_eq!(slide(&mut s, 1, vec![wheel(-3.0)]), Some(Focus::OutputGain));
+        assert_eq!(s.output_gain_db, -1.5);
+        assert_eq!(slide(&mut s, 2, vec![wheel(-5.0)]), Some(Focus::Reduction));
+        assert!((s.strength - 0.95).abs() < 1e-6, "1% per notch");
+
+        let click = |pressed| egui::Event::PointerButton {
+            pos: Pos2::new(SLIDERS_WIDTH / 6.0, 120.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(SLIDERS_WIDTH, 260.0));
+        s.input_gain_db = 6.0;
+        for events in [
+            vec![egui::Event::PointerMoved(Pos2::new(SLIDERS_WIDTH / 6.0, 120.0))],
+            vec![click(true)],
+            vec![click(false)],
+            vec![click(true)],
+            vec![click(false)],
+            Vec::new(),
+        ] {
+            let input = egui::RawInput { screen_rect: Some(area), events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                gain_sliders(ui, &mut s);
+            });
+        }
+        assert_eq!(s.input_gain_db, 0.0, "a double-click resets to 0 dB");
     }
 
     #[test]

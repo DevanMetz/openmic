@@ -31,7 +31,24 @@ impl App {
             },
             |ui| {
                 let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
-                if viz::scope(ui, &frames, &mut self.settings, self.focus) {
+                // A slider under the pointer highlights what it changes.
+                let focus = self.focus.or(self.slider_focus);
+                let mut changed = false;
+                ui.horizontal_top(|ui| {
+                    let gap = 12.0;
+                    let scope_width = (ui.available_width() - viz::SLIDERS_WIDTH - gap).max(320.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(scope_width);
+                        changed |= viz::scope(ui, &frames, &mut self.settings, focus);
+                    });
+                    ui.add_space(gap - ui.spacing().item_spacing.x);
+                    ui.vertical(|ui| {
+                        let (slid, pointed) = viz::gain_sliders(ui, &mut self.settings);
+                        changed |= slid;
+                        self.slider_focus = pointed;
+                    });
+                });
+                if changed {
                     self.apply_live();
                 }
             },
