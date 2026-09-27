@@ -31,7 +31,7 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - Automatic settings persistence
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back
-- Easy updates: OpenMic checks GitHub for a new release once a day, then downloads it, verifies its SHA-256 checksum and restarts as the new version when you click **Restart to update**
+- Easy updates: OpenMic checks GitHub for a new release once a day, then downloads it, verifies its SHA-256 checksum and restarts as the new version when you click **Restart to update**; click the version number to check any time
 - Native GUI (egui) that follows your system's light or dark theme
 
 ## Download
@@ -105,7 +105,7 @@ Closing the window hides OpenMic to the notification area, where processing and 
 
 ## Updates
 
-OpenMic checks GitHub Releases once a day and shows **vX.Y.Z available** at the top of the window when there's a newer version. On the **Settings** tab, click **Download update**, then **Restart to update**: OpenMic verifies the download against the release's SHA-256 checksum, replaces its executable in place (so shortcuts and **Start with Windows** keep working), and opens again as the new version. Nothing installs until you click, so an update never interrupts a call. Untick **Check for updates daily** to stop the check, or use **Check now**. If OpenMic's folder isn't writable (for example under Program Files), download the new version from the releases page instead.
+OpenMic checks GitHub Releases once a day. To check right away, click the version number next to the title. When there's a newer version, the top of the window shows **vX.Y.Z available**: click **Update**, then **Restart to update**. OpenMic verifies the download against the release's SHA-256 checksum, replaces its executable in place (so shortcuts and **Start with Windows** keep working), and opens again as the new version. Nothing installs until you click, so an update never interrupts a call. Untick **Check for updates daily** on the **Settings** tab to stop the daily check. If OpenMic's folder isn't writable (for example under Program Files), download the new version from the releases page instead.
 
 ## Speech to text
 

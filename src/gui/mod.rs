@@ -5,6 +5,7 @@ mod mic_tab;
 mod routes;
 mod settings_tab;
 mod sound_tab;
+mod updates;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use crate::engine::{list_devices, Engine};
 use crate::hotkeys::{self, Hotkeys};
 use crate::record::{Recorder, Source, Take};
 use crate::tray::Tray;
-use crate::update::{self, Updater};
+use crate::update::Updater;
 use crate::viz::{self, Focus};
 use routes::{cable_input, choose_routes};
 
@@ -168,8 +169,10 @@ pub struct App {
     quitting: bool,
     /// New releases: checked daily, installed when the user asks.
     updater: Updater,
-    /// This launch is a freshly installed update.
-    just_updated: bool,
+    /// When this launch started, if it is a freshly installed update.
+    updated_at: Option<Instant>,
+    /// When the user last clicked the version to check for updates.
+    update_checked_at: Option<Instant>,
     update_error: Option<String>,
 }
 
@@ -184,7 +187,7 @@ impl App {
         just_updated: bool,
     ) -> Self {
         let mut app = Self::stopped(settings);
-        app.just_updated = just_updated;
+        app.updated_at = just_updated.then(Instant::now);
         {
             // Development builds never replace themselves on their own.
             let ctx = ctx.clone();
@@ -276,7 +279,8 @@ impl App {
             hidden: false,
             quitting: false,
             updater: Updater::new(false, || {}),
-            just_updated: false,
+            updated_at: None,
+            update_checked_at: None,
             update_error: None,
         }
     }
@@ -934,19 +938,9 @@ impl eframe::App for App {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.heading("OpenMic");
-                ui.weak(format!("v{}", env!("CARGO_PKG_VERSION")));
+                self.draw_version(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match self.updater.status() {
-                        update::Status::Available(release) | update::Status::Downloading(release)
-                        | update::Status::Ready(release) => {
-                            if ui.link(RichText::new(format!("{} available", release.tag)).color(GREEN)).clicked() {
-                                self.tab = Tab::Settings;
-                            }
-                        }
-                        _ => {
-                            ui.weak("Clean voice. Instant sounds. Fully local.");
-                        }
-                    }
+                    self.draw_update_status(ui);
                 });
             });
             ui.add_space(6.0);
