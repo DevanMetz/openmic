@@ -15,6 +15,6 @@ Run the app to verify UI or device-routing changes. For audio changes, explain t
 
 Builds without `--release` show **dev build** in the title. They process audio at full speed but never update themselves.
 
-Releases are published by pushing a `vX.Y.Z` tag with notes in `docs/releases/vX.Y.Z.md`. The release workflow signs the executable with the `OPENMIC_SIGNING_KEY` secret (see `scripts/sign_release.py`); the matching public key is `RELEASE_KEY` in `src/update.rs`.
+Releases are published by pushing a `vX.Y.Z` tag, with notes in `docs/releases/vX.Y.Z.md`, on a commit whose CI has passed (the release workflow checks, and does not re-run the tests). The release workflow signs the executable with the `OPENMIC_SIGNING_KEY` secret (see `scripts/sign_release.py`); the matching public key is `RELEASE_KEY` in `src/update.rs`.
 
 Keep pull requests focused and explain the user-facing effect and checks run. Do not commit private audio recordings, device-specific settings, credentials, or generated build output. Code is under the [MIT license](LICENSE); vendored RNNoise retains its own license.

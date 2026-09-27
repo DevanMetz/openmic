@@ -7,11 +7,35 @@ on:
 
 permissions:
   contents: write
+  # Read CI results for the tagged commit.
+  checks: read
 
 jobs:
   release:
     runs-on: windows-latest
     steps:
+      # Tests run in CI (the "check" job) on every commit, and releases are
+      # tagged only after it passes. Re-running them here in release mode
+      # recompiled the whole dependency tree and took about 15 minutes, so
+      # require CI's result for this exact commit instead (waiting for a
+      # run still in progress).
+      - name: Require CI to have passed on this commit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $query = "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA/check-runs?check_name=check"
+          for ($i = 0; $i -lt 60; $i++) {
+            $states = @(gh api $query --jq '.check_runs[] | .conclusion // .status')
+            if ($LASTEXITCODE -ne 0) { throw "could not read CI results" }
+            if ($states -contains 'success') { "CI passed on $env:GITHUB_SHA"; exit 0 }
+            $pending = @($states | Where-Object { $_ -in 'queued', 'in_progress', 'waiting', 'pending', 'requested' })
+            if ($states.Count -gt 0 -and $pending.Count -eq 0) { throw "CI did not pass on $env:GITHUB_SHA ($($states -join ', '))" }
+            if ($states.Count -eq 0 -and $i -ge 5) { throw "no CI run found for $env:GITHUB_SHA; push the commit to a branch or PR first" }
+            "waiting for CI on $env:GITHUB_SHA ($($states -join ', '))"
+            Start-Sleep -Seconds 30
+          }
+          throw "timed out waiting for CI on $env:GITHUB_SHA"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -24,7 +48,6 @@ jobs:
         shell: pwsh
         run: |
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-      - run: cargo test --locked --release
       - run: cargo build --locked --release
       # The in-app updater looks for exactly these asset names (src/update.rs).
       - name: Name the binary after the tag
