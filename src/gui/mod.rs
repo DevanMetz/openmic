@@ -2,6 +2,7 @@
 //! module; routing rules live in `routes`.
 
 mod mic_tab;
+mod mic_test;
 mod overlay;
 mod routes;
 mod settings_tab;
@@ -187,6 +188,9 @@ pub struct App {
     /// The meter's width when it was pinned (kept constant while shown).
     overlay_spawn_width: f32,
     overlay_on_top: overlay::OnTop,
+    /// Puts the main window back where it was last time.
+    window_placement: overlay::Placement,
+    mic_test: mic_test::MicTest,
     update_error: Option<String>,
 }
 
@@ -301,6 +305,8 @@ impl App {
             overlay_placement: overlay::Placement::default(),
             overlay_spawn_width: overlay::DEFAULT_WIDTH,
             overlay_on_top: overlay::OnTop::default(),
+            window_placement: overlay::Placement::default(),
+            mic_test: mic_test::MicTest::default(),
             update_error: None,
         }
     }
@@ -659,6 +665,34 @@ impl App {
         }
     }
 
+    /// Put the window where it was last time (once), then remember where
+    /// it's moved to and how big it's made. Positions are screen pixels, so
+    /// they mean the same on monitors with different scaling.
+    fn remember_window(&mut self, ctx: &egui::Context) {
+        let info = ctx.input(|i| i.viewport().clone());
+        if self.hidden || info.minimized == Some(true) {
+            return;
+        }
+        let saved = self.settings.window_position.filter(|&px| on_a_monitor(px));
+        let (place, record) = self.window_placement.step(saved, info.outer_rect, info.native_pixels_per_point);
+        if let Some(pos) = place {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        }
+        let (Some(outer), Some(inner), Some(ppp)) = (info.outer_rect, info.inner_rect, info.native_pixels_per_point)
+        else {
+            return;
+        };
+        if record {
+            let px = [(outer.min.x * ppp).round() as i32, (outer.min.y * ppp).round() as i32];
+            let size = [inner.width().round(), inner.height().round()];
+            if self.settings.window_position != Some(px) || self.settings.window_size != Some(size) {
+                self.settings.window_position = Some(px);
+                self.settings.window_size = Some(size);
+                self.touch();
+            }
+        }
+    }
+
     /// Swap in the downloaded version, start it, and quit this copy.
     fn install_update(&mut self, ctx: &egui::Context) {
         if let Some(why) = self.update_blocker() {
@@ -936,6 +970,7 @@ impl App {
         self.poll_engine();
         self.poll_recording();
         self.poll_dictation();
+        self.poll_mic_test();
         self.updater.tick(self.settings.check_for_updates);
         self.sync_default_mic();
         if (cable_input(&self.outputs).is_none() || self.waiting_for_device)
@@ -980,6 +1015,7 @@ impl eframe::App for App {
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
+        self.remember_window(ctx);
         self.show_overlay(ctx);
         // The live scope, the recorder and the pinned meter animate at ~30
         // fps. Hidden, a slow tick still handles device loss and the default
@@ -1107,6 +1143,23 @@ fn is_modifier(key: egui::Key) -> bool {
         key,
         ShiftLeft | ShiftRight | ControlLeft | ControlRight | AltLeft | AltRight | SuperLeft | SuperRight
     )
+}
+
+/// Whether a window placed at `px` (its top-left corner, screen pixels)
+/// would show on a connected monitor; a monitor unplugged since then would
+/// leave it off screen.
+#[cfg(windows)]
+fn on_a_monitor([x, y]: [i32; 2]) -> bool {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+    // A little inside the corner, where the title bar is.
+    // SAFETY: a pure query on a point.
+    !unsafe { MonitorFromPoint(POINT { x: x + 40, y: y + 20 }, MONITOR_DEFAULTTONULL) }.is_invalid()
+}
+
+#[cfg(not(windows))]
+fn on_a_monitor(_: [i32; 2]) -> bool {
+    true
 }
 
 fn open_url(url: &str) {
@@ -1325,6 +1378,59 @@ mod tests {
             }
             assert!(visible(&texts, "your mic +").is_none(), "the old value chips are gone");
         }
+    }
+
+    #[test]
+    fn the_checklist_ticks_itself_off_and_can_be_hidden() {
+        let mut app = App::stopped(Settings::default());
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "GET SET UP").is_some());
+        assert!(visible(&texts, "0 of 4").is_some(), "nothing is set up yet");
+
+        app.outputs = vec!["CABLE Input (VB-Audio Virtual Cable)".into()];
+        app.inputs = vec!["Yeti".into()];
+        app.settings.microphone = "Yeti".into();
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "2 of 4").is_some(), "VB-Cable and the mic are seen");
+        assert!(visible(&texts, "Input Device to Default").is_some());
+
+        app.settings.setup.discord = true;
+        app.settings.setup.tested = true;
+        assert!(!app.show_checklist(), "all done: it goes away");
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "GET SET UP").is_none());
+
+        app.settings.setup.tested = false;
+        app.settings.setup.dismissed = true;
+        assert!(!app.show_checklist(), "hidden by the user");
+    }
+
+    #[test]
+    fn simple_mode_hides_the_gates_and_advanced_shows_everything() {
+        let mut app = App::stopped(Settings::default());
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "Noise reduction").is_some());
+        assert!(visible(&texts, "Mute mic").is_some() && visible(&texts, "Test my mic").is_some());
+        for hidden in ["Voice gate", "Rumble filter", "RNNoise", "voice gate · threshold"] {
+            assert!(visible(&texts, hidden).is_none(), "{hidden} is Advanced only");
+        }
+        app.settings.advanced = true;
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        for shown in ["Voice gate", "Rumble filter", "RNNoise", "voice gate · threshold", "Test my mic"] {
+            assert!(visible(&texts, shown).is_some(), "{shown} shows in Advanced");
+        }
+    }
+
+    #[test]
+    fn levels_live_in_the_mixer_and_the_monitor_moved_to_routing() {
+        let mut app = App::stopped(Settings::default());
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "MONITOR & LEVELS").is_none(), "the card is gone");
+        let routing = *visible(&texts, "ROUTING").unwrap();
+        let processing = *visible(&texts, "PROCESSING").unwrap();
+        let monitor = *visible(&texts, "Headphone monitor").unwrap();
+        assert!(monitor.top() > routing.top() && monitor.bottom() < processing.top(), "in Routing");
+        assert!(visible(&texts, "Pin meter to screen").is_some());
     }
 
     #[test]

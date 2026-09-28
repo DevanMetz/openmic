@@ -64,7 +64,7 @@ impl Placement {
     /// Given this frame's window position (points) and scale, returns where
     /// to move the window (points) if it still needs placing, and whether its
     /// position and size can now be remembered.
-    fn step(&mut self, saved_px: Option<[i32; 2]>, outer: Option<Rect>, ppp: Option<f32>) -> (Option<Pos2>, bool) {
+    pub(super) fn step(&mut self, saved_px: Option<[i32; 2]>, outer: Option<Rect>, ppp: Option<f32>) -> (Option<Pos2>, bool) {
         let (Some(_), Some(ppp)) = (outer, ppp) else { return (None, false) };
         if !self.placed {
             self.placed = true;

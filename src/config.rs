@@ -60,6 +60,14 @@ pub struct Settings {
     pub overlay_position: Option<[i32; 2]>,
     /// The pinned meter's width in points; at its narrowest, just the icon.
     pub overlay_width: f32,
+    /// Show every processing control and the full scope, not just a
+    /// preset and one noise-reduction slider.
+    pub advanced: bool,
+    /// First-run checklist progress.
+    pub setup: Setup,
+    /// Where the main window was, in screen pixels, and its size in points.
+    pub window_position: Option<[i32; 2]>,
+    pub window_size: Option<[f32; 2]>,
 }
 
 impl Default for Settings {
@@ -99,8 +107,24 @@ impl Default for Settings {
             overlay: false,
             overlay_position: None,
             overlay_width: 200.0,
+            advanced: false,
+            setup: Setup::default(),
+            window_position: None,
+            window_size: None,
         }
     }
+}
+
+/// First-run checklist steps OpenMic can't see for itself, and whether the
+/// checklist was put away.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Setup {
+    /// The user set Discord's input device as the checklist said.
+    pub discord: bool,
+    /// A mic test was played back.
+    pub tested: bool,
+    pub dismissed: bool,
 }
 
 /// One soundboard pad. Older settings files stored a bare path per pad.
@@ -112,11 +136,15 @@ pub struct Pad {
     pub volume: f32,
     /// Global shortcut that plays the pad, e.g. "Ctrl+Alt+1".
     pub hotkey: Option<String>,
+    /// Trim: where the pad starts playing, in seconds...
+    pub start: f32,
+    /// ...and where it stops (the clip's end when `None`).
+    pub end: Option<f32>,
 }
 
 impl Pad {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, volume: 1.0, hotkey: None }
+        Self { path, volume: 1.0, hotkey: None, start: 0.0, end: None }
     }
 }
 
@@ -130,6 +158,10 @@ enum PadRepr {
         volume: f32,
         #[serde(default)]
         hotkey: Option<String>,
+        #[serde(default)]
+        start: f32,
+        #[serde(default)]
+        end: Option<f32>,
     },
 }
 
@@ -141,7 +173,7 @@ impl From<PadRepr> for Pad {
     fn from(repr: PadRepr) -> Self {
         match repr {
             PadRepr::Path(path) => Pad::new(path),
-            PadRepr::Full { path, volume, hotkey } => Pad { path, volume, hotkey },
+            PadRepr::Full { path, volume, hotkey, start, end } => Pad { path, volume, hotkey, start, end },
         }
     }
 }

@@ -16,7 +16,7 @@ pub enum Model {
 }
 
 /// Live per-frame controls shared between the GUI and the processing thread.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     pub model: Model,
     pub strength: f32,

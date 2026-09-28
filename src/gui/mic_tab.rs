@@ -1,5 +1,6 @@
-//! Microphone tab: routing, processing (with presets), monitor and meters,
-//! and the live scope.
+//! Microphone tab: first-run checklist, routing (with the headphone
+//! monitor), processing (Simple or Advanced, with presets and a mic test),
+//! and the live scope with its mixer strip.
 
 use std::time::Duration;
 
@@ -14,54 +15,123 @@ use crate::engine::Engine;
 use crate::viz::{self, Focus};
 use crate::widgets;
 
+/// A first-run checklist step: whether it's done, its title, and what it
+/// asks the user to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Step {
+    Cable,
+    Microphone,
+    Discord,
+    Test,
+}
+
 impl App {
     pub(super) fn draw_mic_tab(&mut self, ui: &mut egui::Ui) {
+        if self.show_checklist() {
+            self.draw_checklist(ui);
+            ui.add_space(8.0);
+        }
         self.draw_routing(ui);
         ui.add_space(8.0);
         self.draw_processing(ui);
         ui.add_space(8.0);
-        self.draw_monitor(ui);
-        ui.add_space(8.0);
+        self.draw_scope(ui);
+        self.update_running_status();
+    }
+
+    // ---- first-run checklist ----------------------------------------------
+
+    /// Which steps are done. VB-Cable and the microphone are checked live;
+    /// Discord's setting can't be seen from here, so the user ticks it.
+    pub(super) fn steps(&self) -> [(Step, bool); 4] {
+        let s = &self.settings;
+        let mic = !s.microphone.is_empty() && self.inputs.contains(&s.microphone);
+        [
+            (Step::Cable, cable_input(&self.outputs).is_some()),
+            (Step::Microphone, mic),
+            (Step::Discord, s.setup.discord),
+            (Step::Test, s.setup.tested),
+        ]
+    }
+
+    pub(super) fn show_checklist(&self) -> bool {
+        let done = self.steps().iter().all(|(_, done)| *done);
+        !done && !self.settings.setup.dismissed
+    }
+
+    fn draw_checklist(&mut self, ui: &mut egui::Ui) {
+        let steps = self.steps();
+        let done = steps.iter().filter(|(_, done)| *done).count();
+        let mut hide = false;
         widgets::card(
             ui,
-            "LIVE SCOPE",
-            CYAN,
+            "GET SET UP",
+            VIOLET,
             |ui| {
-                ui.weak("drag or scroll the lines to adjust");
+                hide = ui.small_button("Hide").on_hover_text("Put the checklist away").clicked();
+                widgets::badge(ui, &format!("{done} of {}", steps.len()), if done == steps.len() { GREEN } else { VIOLET });
             },
             |ui| {
-                let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
-                // A slider under the pointer highlights what it changes.
-                let focus = self.focus.or(self.slider_focus);
-                let mut changed = false;
-                ui.horizontal_top(|ui| {
-                    let gap = 12.0;
-                    let scope_width = (ui.available_width() - viz::SLIDERS_WIDTH - gap).max(320.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(scope_width);
-                        changed |= viz::scope(ui, &frames, &mut self.settings, focus);
+                // The first step not yet done is the one to do now.
+                let current = steps.iter().position(|(_, done)| !done);
+                for (i, (step, done)) in steps.into_iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let (mark, color) = if done { ("✔".to_owned(), GREEN) } else { (format!("{}", i + 1), MUTED) };
+                        ui.add_sized([18.0, 18.0], egui::Label::new(RichText::new(mark).strong().color(color)));
+                        let active = current == Some(i);
+                        let title = RichText::new(step_title(step, self.settings.default_mic));
+                        ui.label(if done { title.weak() } else if active { title.strong() } else { title });
+                        if !done {
+                            self.step_action(ui, step);
+                        }
                     });
-                    ui.add_space(gap - ui.spacing().item_spacing.x);
-                    ui.vertical(|ui| {
-                        let (slid, pointed) = viz::gain_sliders(ui, &mut self.settings);
-                        changed |= slid;
-                        self.slider_focus = pointed;
-                    });
-                });
-                if changed {
-                    self.apply_live();
                 }
             },
         );
+        if hide {
+            self.settings.setup.dismissed = true;
+            self.touch();
+        }
     }
 
-    /// Discord hears OpenMic through VB-Cable; walk the user to a working route.
+    fn step_action(&mut self, ui: &mut egui::Ui, step: Step) {
+        match step {
+            Step::Cable => {
+                if ui.small_button("Get VB-Cable").clicked() {
+                    open_url(VB_CABLE_URL);
+                }
+                ui.weak("run its setup as administrator");
+            }
+            Step::Microphone => {
+                ui.weak("pick it under Routing below");
+            }
+            Step::Discord => {
+                if ui.small_button("Done").on_hover_text("Discord > User Settings > Voice & Video").clicked() {
+                    self.settings.setup.discord = true;
+                    self.touch();
+                }
+            }
+            Step::Test => {
+                if !self.mic_test.busy() && ui.small_button("Test").clicked() {
+                    self.start_mic_test();
+                }
+            }
+        }
+    }
+
+    // ---- routing -------------------------------------------------------------
+
+    /// Discord hears OpenMic through VB-Cable. The checklist covers a missing
+    /// VB-Cable; this covers a wrong output and the default-mic setting.
     fn draw_cable_hint(&mut self, ui: &mut egui::Ui) {
         let cable = cable_input(&self.outputs).cloned();
         let tone = match &cable {
             Some(c) if self.settings.output == *c => GREEN,
             _ => AMBER,
         };
+        if cable.is_none() && self.show_checklist() {
+            return;
+        }
         egui::Frame::new()
             .fill(tone.gamma_multiply(0.08))
             .corner_radius(6)
@@ -120,6 +190,7 @@ impl App {
     fn draw_routing(&mut self, ui: &mut egui::Ui) {
         let cable = cable_input(&self.outputs).is_some();
         let mut refresh = false;
+        let mut reopen = false;
         widgets::card(
             ui,
             "ROUTING",
@@ -144,6 +215,23 @@ impl App {
                         changed |= combo(ui, id, field, pool).changed();
                         ui.end_row();
                     }
+                    // The headphone monitor plays on the monitor output.
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        let toggled = widgets::pill(ui, &mut self.settings.monitor, "Headphone monitor", CYAN)
+                            .on_hover_text("Hear the processed voice yourself (use headphones)")
+                            .changed();
+                        // The monitor device wasn't connected when processing
+                        // started; open it now.
+                        reopen = toggled
+                            && self.settings.monitor
+                            && self.engine.as_ref().is_some_and(|e| !e.has_monitor());
+                        ui.add_space(8.0);
+                        if volume_slider(ui, &mut self.settings.monitor_volume) || toggled {
+                            self.apply_live();
+                        }
+                    });
+                    ui.end_row();
                 });
                 if changed {
                     self.touch();
@@ -158,13 +246,20 @@ impl App {
         if refresh {
             self.refresh_devices(true);
         }
+        if reopen {
+            self.restart_engine();
+        }
     }
+
+    // ---- processing ----------------------------------------------------------
 
     fn draw_processing(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         // Which setting the pointer is on, so the scope can highlight it.
         let mut focus = None;
         let mut reset = false;
+        let advanced = self.settings.advanced;
+        let mut view = advanced;
         widgets::card(
             ui,
             "PROCESSING",
@@ -174,41 +269,65 @@ impl App {
                     .small_button("Reset")
                     .on_hover_text("Restore every processing setting to its default")
                     .clicked();
+                widgets::segmented(ui, &mut view, &[(false, "Simple", ""), (true, "Advanced", "")], GREEN);
             },
             |ui| {
-                ui.horizontal(|ui| {
-                    let (picked, hovered) = widgets::segmented(
-                        ui,
-                        &mut self.settings.model,
-                        &[
-                            (Model::DeepFilter, "DeepFilterNet 3", "best"),
-                            (Model::Rnnoise, "RNNoise", "light"),
-                        ],
-                        GREEN,
-                    );
-                    changed |= picked;
-                    if hovered {
-                        focus = Some(Focus::Model);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        changed |= self.presets_menu(ui);
+                if advanced {
+                    ui.horizontal(|ui| {
+                        let (picked, hovered) = widgets::segmented(
+                            ui,
+                            &mut self.settings.model,
+                            &[
+                                (Model::DeepFilter, "DeepFilterNet 3", "best"),
+                                (Model::Rnnoise, "RNNoise", "light"),
+                            ],
+                            GREEN,
+                        );
+                        changed |= picked;
+                        if hovered {
+                            focus = Some(Focus::Model);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            changed |= self.presets_menu(ui);
+                        });
                     });
-                });
-                ui.add_space(6.0);
+                    ui.add_space(6.0);
+                } else {
+                    // A starting point and one control; the rest is under Advanced.
+                    ui.horizontal(|ui| {
+                        changed |= self.presets_menu(ui);
+                        ui.add_space(12.0);
+                        ui.label("Noise reduction");
+                        let r = ui.add(
+                            egui::Slider::new(&mut self.settings.strength, 0.0..=1.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                        );
+                        let notches = viz::wheel_notches(ui, r.id, r.hovered() && !r.dragged());
+                        changed |= r.changed() | viz::step_by(&mut self.settings.strength, notches, 0.01, 0.0..=1.0);
+                        if r.hovered() || r.dragged() {
+                            focus = Some(Focus::Reduction);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
                 ui.horizontal(|ui| {
                     let s = &mut self.settings;
-                    for (on, text, color, target, tip) in [
-                        (&mut s.voice_gate, "Voice gate", VIOLET, Some(Focus::VoiceGate),
-                            "Silence everything that isn't speech, however loud"),
-                        (&mut s.highpass, "Rumble filter", AMBER, Some(Focus::Rumble),
-                            "Cut low rumble: desk bumps, hum, handling noise"),
-                        (&mut s.gate, "Level gate", AMBER, Some(Focus::LevelGate),
-                            "Fade out anything quieter than a set level"),
-                        (&mut s.bypass, "Bypass", MUTED, None,
-                            "Send your raw microphone, unprocessed"),
-                        (&mut s.mute, "Mute mic", RED, None,
-                            "Silence your voice; the soundboard still plays"),
-                    ] {
+                    let mut pills = vec![];
+                    if advanced {
+                        pills.extend([
+                            (&mut s.voice_gate, "Voice gate", VIOLET, Some(Focus::VoiceGate),
+                                "Silence everything that isn't speech, however loud"),
+                            (&mut s.highpass, "Rumble filter", AMBER, Some(Focus::Rumble),
+                                "Cut low rumble: desk bumps, hum, handling noise"),
+                            (&mut s.gate, "Level gate", AMBER, Some(Focus::LevelGate),
+                                "Fade out anything quieter than a set level"),
+                        ]);
+                    }
+                    pills.extend([
+                        (&mut s.bypass, "Bypass", MUTED, None, "Send your raw microphone, unprocessed"),
+                        (&mut s.mute, "Mute mic", RED, None, "Silence your voice; the soundboard still plays"),
+                    ]);
+                    for (on, text, color, target, tip) in pills {
                         let r = widgets::pill(ui, on, text, color).on_hover_text(tip);
                         if r.hovered() {
                             focus = target.or(focus);
@@ -216,8 +335,14 @@ impl App {
                         changed |= r.changed();
                     }
                 });
+                ui.add_space(6.0);
+                self.draw_mic_test(ui);
             },
         );
+        if view != self.settings.advanced {
+            self.settings.advanced = view;
+            self.touch();
+        }
         if reset {
             let s = &mut self.settings;
             s.apply_processing(&Processing::default());
@@ -230,6 +355,71 @@ impl App {
             self.apply_live();
         }
         self.focus = focus;
+    }
+
+    // ---- scope ---------------------------------------------------------------
+
+    fn draw_scope(&mut self, ui: &mut egui::Ui) {
+        let snapshot = self.engine.as_ref().map(Engine::stats);
+        let mut pinned = self.settings.overlay;
+        let advanced = self.settings.advanced;
+        widgets::card(
+            ui,
+            "LIVE SCOPE",
+            CYAN,
+            |ui| {
+                ui.checkbox(&mut pinned, "Pin meter to screen").on_hover_text(
+                    "A small level meter that stays on top of other windows, even with OpenMic in the tray",
+                );
+            },
+            |ui| {
+                let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
+                // A slider under the pointer highlights what it changes.
+                let focus = self.focus.or(self.slider_focus);
+                let mut changed = false;
+                ui.horizontal_top(|ui| {
+                    let gap = 12.0;
+                    let scope_width = (ui.available_width() - viz::SLIDERS_WIDTH - gap).max(320.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(scope_width);
+                        changed |= viz::scope(ui, &frames, &mut self.settings, focus, advanced);
+                    });
+                    ui.add_space(gap - ui.spacing().item_spacing.x);
+                    ui.vertical(|ui| {
+                        let levels = [snapshot.map(|s| s.in_peak), snapshot.map(|s| s.out_peak)];
+                        let (slid, pointed) =
+                            viz::gain_sliders(ui, &mut self.settings, levels, &mut self.hold, advanced);
+                        changed |= slid;
+                        self.slider_focus = pointed;
+                    });
+                });
+                if changed {
+                    self.apply_live();
+                }
+            },
+        );
+        if pinned != self.settings.overlay {
+            self.settings.overlay = pinned;
+            self.touch();
+        }
+    }
+
+    /// The footer's "Running · voice 42%", unless a warning is showing.
+    fn update_running_status(&mut self) {
+        let Some(stats) = self.engine.as_ref().map(Engine::stats) else { return };
+        let warning_fresh = self
+            .warn_until
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
+        if warning_fresh {
+            return;
+        }
+        let voice = format!("voice {:.0}%", stats.prob * 100.0);
+        self.status = match stats.model {
+            ModelState::DeepFilterLoading => (format!("Loading DeepFilterNet… · {voice}"), AMBER),
+            ModelState::DeepFilterFailed => (format!("DeepFilterNet unavailable, using RNNoise · {voice}"), AMBER),
+            ModelState::DeepFilter | ModelState::Rnnoise => (format!("Running · {voice}"), GREEN),
+        };
     }
 
     /// The preset picker. Returns whether a preset was applied.
@@ -303,78 +493,6 @@ impl App {
             None => false,
         }
     }
-
-    fn draw_monitor(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.engine.as_ref().map(Engine::stats);
-        let mut reopen = false;
-        let mut pinned = self.settings.overlay;
-        widgets::card(
-            ui,
-            "MONITOR & LEVELS",
-            CYAN,
-            |ui| {
-                ui.checkbox(&mut pinned, "Pin meter to screen").on_hover_text(
-                    "A small level meter that stays on top of other windows, even with OpenMic in the tray",
-                );
-            },
-            |ui| {
-                ui.horizontal(|ui| {
-                    let toggled = widgets::pill(
-                        ui,
-                        &mut self.settings.monitor,
-                        "Headphone monitor",
-                        CYAN,
-                    )
-                    .on_hover_text("Hear the processed voice yourself (use headphones)")
-                    .changed();
-                    // The monitor device wasn't connected when processing
-                    // started; open it now.
-                    reopen = toggled
-                        && self.settings.monitor
-                        && self.engine.as_ref().is_some_and(|e| !e.has_monitor());
-                    ui.add_space(8.0);
-                    if volume_slider(ui, &mut self.settings.monitor_volume) || toggled {
-                        self.apply_live();
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let gap = 16.0;
-                    let half = (ui.available_width() - gap - 2.0 * ui.spacing().item_spacing.x) / 2.0;
-                    widgets::level_meter(ui, "Input", snapshot.map(|s| s.in_peak), &mut self.hold[0], half);
-                    ui.add_space(gap);
-                    widgets::level_meter(ui, "Output", snapshot.map(|s| s.out_peak), &mut self.hold[1], half);
-                });
-            },
-        );
-        if pinned != self.settings.overlay {
-            self.settings.overlay = pinned;
-            self.touch();
-        }
-        if reopen {
-            self.restart_engine();
-        }
-        if let Some(stats) = snapshot {
-            let warning_fresh = self
-                .warn_until
-                .as_ref()
-                .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(2));
-            if !warning_fresh {
-                let voice = format!("voice {:.0}%", stats.prob * 100.0);
-                self.status = match stats.model {
-                    ModelState::DeepFilterLoading => {
-                        (format!("Loading DeepFilterNet… · {voice}"), AMBER)
-                    }
-                    ModelState::DeepFilterFailed => {
-                        (format!("DeepFilterNet unavailable, using RNNoise · {voice}"), AMBER)
-                    }
-                    ModelState::DeepFilter | ModelState::Rnnoise => {
-                        (format!("Running · {voice}"), GREEN)
-                    }
-                };
-            }
-        }
-    }
 }
 
 pub(super) fn combo(ui: &mut egui::Ui, id: usize, value: &mut String, pool: &[String]) -> egui::Response {
@@ -392,6 +510,16 @@ pub(super) fn combo(ui: &mut egui::Ui, id: usize, value: &mut String, pool: &[St
         response.mark_changed();
     }
     response
+}
+
+fn step_title(step: Step, default_mic: bool) -> &'static str {
+    match step {
+        Step::Cable => "Install VB-Cable",
+        Step::Microphone => "Choose your microphone",
+        Step::Discord if default_mic => "In Discord, set Voice & Video > Input Device to Default",
+        Step::Discord => "In Discord, set Voice & Video > Input Device to CABLE Output",
+        Step::Test => "Test your mic: hear yourself raw and cleaned",
+    }
 }
 
 #[cfg(test)]

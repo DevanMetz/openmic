@@ -73,19 +73,23 @@ pub fn scope(
     frames: &[ScopeFrame],
     s: &mut Settings,
     panel_focus: Option<Focus>,
+    advanced: bool,
 ) -> bool {
     let mut changed = false;
     let mut pointed = None;
     let width = ui.available_width();
     pointed = level_chart(ui, width, frames, s, panel_focus, &mut changed).or(pointed);
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let spacing = ui.spacing().item_spacing.x;
-        let voice_width = (width - spacing) * 0.64;
-        pointed = voice_chart(ui, voice_width, frames, s, panel_focus, &mut changed).or(pointed);
-        pointed = rumble_chart(ui, width - spacing - voice_width, s, panel_focus, &mut changed)
-            .or(pointed);
-    });
+    // The voice and rumble charts tune the gates and the filter: Advanced only.
+    if advanced {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let voice_width = (width - spacing) * 0.64;
+            pointed = voice_chart(ui, voice_width, frames, s, panel_focus, &mut changed).or(pointed);
+            pointed = rumble_chart(ui, width - spacing - voice_width, s, panel_focus, &mut changed)
+                .or(pointed);
+        });
+    }
     let caption = panel_focus
         .or(pointed)
         .map_or("Drag the lines or scroll over them to adjust; double-click one to reset it.", Focus::caption);
@@ -94,16 +98,53 @@ pub fn scope(
 }
 
 /// Room the gain sliders take to the right of the scope.
-pub const SLIDERS_WIDTH: f32 = 186.0;
+pub const SLIDERS_WIDTH: f32 = 196.0;
+const METER_WIDTH: f32 = 7.0;
+const METER_GAP: f32 = 4.0;
+/// The bottom of the strip's level meters, dBFS.
+const METER_FLOOR: f32 = -60.0;
 
-/// Mixer-style sliders beside the scope: your mic (input gain), to Discord
-/// (output gain) and noise reduction. The wheel steps each one and a
-/// double-click resets it. Returns whether a setting changed, and which
-/// one the pointer is on (to highlight it on the scope).
-pub fn gain_sliders(ui: &mut egui::Ui, s: &mut Settings) -> (bool, Option<Focus>) {
+fn to_meter_db(peak: f32) -> f32 {
+    (20.0 * peak.max(1e-6).log10()).clamp(METER_FLOOR, 0.0)
+}
+
+/// A level meter filling upward: green to -18 dB, amber to -6, red above,
+/// with a peak-hold tick. `db` is `None` when nothing is being processed.
+fn vertical_meter(painter: &egui::Painter, rect: Rect, db: Option<f32>, hold: f32) {
+    let visuals_track = Color32::from_gray(128).gamma_multiply(0.18);
+    painter.rect_filled(rect, 3.0, visuals_track);
+    let Some(db) = db else { return };
+    let y = |d: f32| rect.bottom() - (d - METER_FLOOR) / -METER_FLOOR * rect.height();
+    for (from, to, color) in [(METER_FLOOR, -18.0, GREEN), (-18.0, -6.0, AMBER), (-6.0, 0.0, RED)] {
+        if db > from {
+            let segment = Rect::from_x_y_ranges(rect.x_range(), y(db.min(to))..=y(from));
+            painter.rect_filled(segment, 3.0, color);
+        }
+    }
+    if hold > METER_FLOOR + 1.0 {
+        let at = y(hold);
+        painter.line_segment([Pos2::new(rect.left(), at), Pos2::new(rect.right(), at)], Stroke::new(2.0, Color32::WHITE));
+    }
+}
+
+/// Mixer-style strip beside the scope: your mic (input gain) and to Discord
+/// (output gain), each with its level meter, and noise reduction. The wheel
+/// steps each slider and a double-click resets it. `levels` are the input
+/// and output peaks (linear) while processing; `hold` their peak-hold marks
+/// in dBFS. Returns whether a setting changed, and which one the pointer is
+/// on (to highlight it on the scope).
+pub fn gain_sliders(
+    ui: &mut egui::Ui,
+    s: &mut Settings,
+    levels: [Option<f32>; 2],
+    hold: &mut [f32; 2],
+    advanced: bool,
+) -> (bool, Option<Focus>) {
     let mut changed = false;
     let mut pointed = None;
-    let height = LEVEL_HEIGHT + SMALL_HEIGHT - 44.0;
+    // As tall as the scope beside it.
+    let height = if advanced { LEVEL_HEIGHT + SMALL_HEIGHT - 44.0 } else { LEVEL_HEIGHT - 40.0 };
+    let dt = ui.input(|i| i.stable_dt).min(0.1);
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.spacing_mut().slider_width = height;
@@ -124,11 +165,32 @@ pub fn gain_sliders(ui: &mut egui::Ui, s: &mut Settings) -> (bool, Option<Focus>
                     _ => egui::Slider::new(&mut s.strength, 0.0..=1.0),
                 };
                 let slider = slider.vertical().show_value(false).trailing_fill(true);
-                // Centred in its column under the label.
+                let meter = match target {
+                    Focus::InputGain => Some(0),
+                    Focus::OutputGain => Some(1),
+                    _ => None,
+                };
+                // Centred in its column under the label, with its meter.
+                let thumb = ui.spacing().interact_size.y;
+                let strip = thumb + if meter.is_some() { METER_GAP + METER_WIDTH } else { 0.0 };
                 let response = ui
                     .horizontal(|ui| {
-                        ui.add_space((column - ui.spacing().interact_size.y) / 2.0);
-                        ui.add(slider)
+                        ui.add_space((column - strip) / 2.0);
+                        let response = ui.add(slider);
+                        if let Some(i) = meter {
+                            let db = levels[i].map(to_meter_db);
+                            let now = db.unwrap_or(METER_FLOOR);
+                            hold[i] = if now >= hold[i] { now } else { (hold[i] - 20.0 * dt).max(now) };
+                            ui.add_space(METER_GAP - ui.spacing().item_spacing.x);
+                            let (rect, meter_response) =
+                                ui.allocate_exact_size(Vec2::new(METER_WIDTH, response.rect.height()), Sense::hover());
+                            vertical_meter(ui.painter(), rect, db, hold[i]);
+                            meter_response.on_hover_text(match db {
+                                Some(db) => format!("{} level {db:.0} dBFS", if i == 0 { "Input" } else { "Output" }),
+                                None => "Start OpenMic to see levels".into(),
+                            });
+                        }
+                        response
                     })
                     .inner;
                 let response = response.on_hover_text("Scroll for fine steps; double-click to reset");
@@ -706,7 +768,7 @@ mod tests {
         let mut pointed = None;
         for events in [vec![egui::Event::PointerMoved(at)], events, Vec::new()] {
             let input = egui::RawInput { screen_rect: Some(area), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| pointed = gain_sliders(ui, s).1);
+            let _ = ctx.run_ui(input, |ui| pointed = gain_sliders(ui, s, [Some(0.5), None], &mut [-60.0; 2], true).1);
         }
         pointed
     }
@@ -746,7 +808,7 @@ mod tests {
         ] {
             let input = egui::RawInput { screen_rect: Some(area), events, ..Default::default() };
             let _ = ctx.run_ui(input, |ui| {
-                gain_sliders(ui, &mut s);
+                gain_sliders(ui, &mut s, [None; 2], &mut [-60.0; 2], true);
             });
         }
         assert_eq!(s.input_gain_db, 0.0, "a double-click resets to 0 dB");

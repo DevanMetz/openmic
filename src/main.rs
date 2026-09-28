@@ -14,6 +14,7 @@ mod hotkeys;
 mod icon;
 mod instance;
 mod logfile;
+mod playback;
 mod record;
 mod resample;
 mod tray;
@@ -57,7 +58,7 @@ fn main() -> eframe::Result<()> {
         &title,
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size(initial_size())
+                .with_inner_size(initial_size(settings.window_size))
                 .with_min_inner_size([MIN_SIZE.0, MIN_SIZE.1])
                 .with_resizable(true)
                 .with_icon(Arc::new(icon))
@@ -75,8 +76,9 @@ const MIN_SIZE: (f32, f32) = (700.0, 420.0);
 
 /// The natural size, shortened to fit the screen: at 150% scaling a 1080p
 /// laptop has only about 690 points of height to spare.
-fn initial_size() -> [f32; 2] {
-    let (width, height) = NATURAL_SIZE;
+fn initial_size(saved: Option<[f32; 2]>) -> [f32; 2] {
+    // The size the window had last time, if any.
+    let (width, height) = saved.map_or(NATURAL_SIZE, |[w, h]| (w.max(MIN_SIZE.0), h.max(MIN_SIZE.1)));
     match work_area_height() {
         Some(available) => [width, height.min(available - 40.0).max(MIN_SIZE.1)],
         None => [width, height],

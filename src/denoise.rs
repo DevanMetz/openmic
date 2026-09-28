@@ -158,17 +158,39 @@ impl Cleaner {
         }
     }
 
-    /// Block until DeepFilterNet is adopted, and never skip its frames, so
-    /// offline runs are deterministic.
-    #[cfg(test)]
-    pub fn wait_for_deep_filter(&mut self) {
+    /// For processing a recording rather than a live stream: wait for
+    /// DeepFilterNet to load, and never skip its frames, so the result is
+    /// what the model produces. Returns whether DeepFilterNet is ready.
+    pub fn prepare_offline(&mut self) -> bool {
         self.deep_timeout = Duration::from_secs(10);
         let p = Params::default();
         while self.state(&p) == ModelState::DeepFilterLoading {
             self.deep_filter(&[0.0; FRAME], 1.0);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(self.state(&p), ModelState::DeepFilter, "DeepFilterNet failed to load");
+        self.state(&p) == ModelState::DeepFilter
+    }
+
+    /// [`Self::prepare_offline`], requiring DeepFilterNet.
+    #[cfg(test)]
+    pub fn wait_for_deep_filter(&mut self) {
+        assert!(self.prepare_offline(), "DeepFilterNet failed to load");
+    }
+
+    /// Run a whole recording (mono, DSP rate) through the chain with `p`.
+    pub fn process_recording(samples: &[f32], p: &Params) -> Vec<f32> {
+        let mut cleaner = Self::new();
+        if p.model == Model::DeepFilter {
+            cleaner.prepare_offline();
+        }
+        let mut out = Vec::with_capacity(samples.len() + FRAME);
+        for chunk in samples.chunks(FRAME) {
+            let mut frame = [0.0; FRAME];
+            frame[..chunk.len()].copy_from_slice(chunk);
+            out.extend_from_slice(&cleaner.process(&frame, p).0);
+        }
+        out.truncate(samples.len());
+        out
     }
 }
 
