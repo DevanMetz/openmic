@@ -12,6 +12,23 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+/// A clip's length in seconds from its header, without decoding it (some
+/// formats, like VBR MP3 without a header, don't say).
+pub fn duration(path: &Path) -> Option<f32> {
+    let src = File::open(path).ok()?;
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?;
+    let track = probed.format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
+    let (frames, rate) = (track.codec_params.n_frames?, track.codec_params.sample_rate?);
+    (rate > 0).then(|| frames as f32 / rate as f32)
+}
+
 /// Decode `path` to clipped mono samples at [`dsp::SR`].
 pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
     let src = File::open(path).with_context(|| format!("open {}", path.display()))?;

@@ -25,10 +25,12 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - Global hotkeys for mute, bypass, stopping clips and every soundboard pad; they work while another app (or a game) has focus
 - Speech to text: hold a hotkey, talk, and your words are typed into whatever app has focus. Whisper runs on your CPU (candle, pure Rust); the model downloads once from Hugging Face
 - Runs in the notification area: close the window and OpenMic keeps working, with mute, bypass and start/stop in the tray menu
-- Persistent soundboard with per-pad volume, optional overlapping clips, and a soundboard volume; WAV, FLAC, OGG, MP3, AIFF via symphonia
+- Persistent soundboard with per-pad volume and trim, clip lengths and playback progress on each pad, drag-to-reorder, search, optional overlapping clips, and a soundboard volume; WAV, FLAC, OGG, MP3, AIFF via symphonia
 - Record the raw microphone or the audio playing through a Windows output, then save a WAV file or add the take directly to the soundboard
-- Input and output level meters with dB readouts and peak hold
-- A level meter you can pin to your screen: a small always-on-top window showing what Discord hears, even with OpenMic in the tray (**Pin meter to screen** under **Monitor & Levels**, or the tray menu). Click the microphone to mute or unmute; drag the meter anywhere; drag its right edge to resize it, down to just the microphone; double-click it to open OpenMic; hover for **×** to unpin
+- Input and output level meters with peak hold, beside the gain sliders
+- **Test my mic**: record 5 seconds and hear it raw and cleaned on your headphones
+- A setup checklist for first runs, and Simple or Advanced processing controls
+- A level meter you can pin to your screen: a small always-on-top window showing what Discord hears, even with OpenMic in the tray (**Pin meter to screen** on the **Live scope** card, or the tray menu). Click the microphone to mute or unmute; drag the meter anywhere; drag its right edge to resize it, down to just the microphone; double-click it to open OpenMic; hover for **×** to unpin
 - Automatic settings persistence
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back
@@ -60,11 +62,14 @@ The binary is `target\release\openmic.exe`. No administrator access needed; VB-C
 
 ## Discord setup
 
+The **Get set up** checklist at the top of the **Microphone** tab walks through these steps and ticks each one off; hide it once you're done.
+
 1. Run OpenMic. If VB-Cable isn't installed, click **Get VB-Cable**, run its setup as administrator, and OpenMic switches to it on its own once it appears.
 2. Select your physical microphone.
 3. OpenMic sends your voice to **CABLE Input (VB-Audio Virtual Cable)** automatically on every launch. It never defaults to your speakers, which would play your mic back out loud. Automatic microphone selection skips **CABLE Output** to avoid feeding the processed audio back into itself.
 4. While it runs, OpenMic also makes **CABLE Output** your Windows default microphone, so Discord's **Input Device** can stay on **Default**. Your previous default comes back when processing stops or OpenMic closes; after a crash, OpenMic restores it when processing next stops. Untick **Make CABLE Output my Windows default mic while running** to set Discord's input to **CABLE Output** by hand instead.
 5. In Discord (**User Settings → Voice & Video**), disable Discord/Krisp noise suppression to avoid double processing.
+6. Click **Test my mic** under **Processing**: speak for 5 seconds, then play **Raw** and **Cleaned** to hear what Discord hears. The test plays on your headphone monitor output (or the Windows default output), never into VB-Cable. **Cleaned** uses your current settings, so change a preset or slider and play it again.
 
 The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your voice.
 
@@ -76,7 +81,7 @@ If a device is unplugged while processing, OpenMic shows **reconnecting…** and
 
 ## Adjusting
 
-Choose a model and switch filters on or off in **Processing**, or pick a starting point from **Preset**. Type a name in that menu and click **Save current** to keep your own settings as a preset. Use the **Live scope** and the three sliders beside it to tune their settings: drag a control, scroll over it for fine steps, or double-click it to reset that setting. **Reset** in **Processing** restores all processing settings.
+**Processing** has two views. **Simple** shows a preset, one **Noise reduction** slider, **Bypass** and **Mute mic**. **Advanced** adds the model choice, the voice gate, rumble filter and level gate, and their charts on the live scope. Choose a model and switch filters on or off, or pick a starting point from **Preset**. Type a name in that menu and click **Save current** to keep your own settings as a preset. Use the **Live scope** and the three sliders beside it to tune their settings: drag a control, scroll over it for fine steps, or double-click it to reset that setting. **Reset** in **Processing** restores all processing settings.
 
 | Scope control | Drag changes | Wheel step |
 |---|---|---|
@@ -87,13 +92,13 @@ Choose a model and switch filters on or off in **Processing**, or pick a startin
 | Voice chart | Voice-gate threshold: lower it if quiet words get cut off; raise it if noise opens the gate | 1% |
 | Rumble chart | Rumble-filter cutoff; drag left or right | 1 Hz |
 
-The **Monitor & Levels** section shows live input and output levels in dB, with a peak hold marker. The headphone monitor and soundboard volume sliders also take the mouse wheel in 1% steps. Use headphones before enabling the monitor to prevent feedback.
+Level meters beside the **Your mic** and **To Discord** sliders show the input and output peaks, with a peak hold marker. **Headphone monitor** and its volume are under **Routing**, next to the monitor output; use headphones before enabling it to prevent feedback. The monitor and soundboard volume sliders also take the mouse wheel in 1% steps. OpenMic reopens at the size and place you left it.
 
 Settings are saved automatically using atomic file replacement, so an interrupted write leaves the previous settings intact. If saving fails, the footer shows **Settings not saved · retrying…**; hover over it for details. OpenMic retries while it runs.
 
 ## Soundboard
 
-Open the **Soundboard** tab, click **Add clips**, then click a pad to play it. Click the pad again to restart the clip, or use **Stop clips** to end playback. Right-click a pad to set its own volume or a hotkey. Use the × on a pad to remove it from the board; the audio file stays on disk. **Clip volume** affects the whole soundboard. Turn on **Let clips overlap** to layer pads instead of each one replacing the last (up to 16 at once). Clips are mixed into the same processed output Discord receives, and route changes preserve their playheads. **Mute mic** silences your voice without silencing the soundboard.
+Open the **Soundboard** tab, click **Add clips**, then click a pad to play it. Click the pad again to restart the clip, or use **Stop clips** to end playback. Each pad shows the clip's length and, while it plays, its progress. Drag a pad onto another to reorder the board; with more than nine clips, a search box filters them by name. Right-click a pad to set its own volume, a hotkey, or its trim: drag the start or end on the waveform (or type them) to play only part of the clip. Trimming doesn't change the file. Use the × on a pad to remove it from the board; the audio file stays on disk. **Clip volume** affects the whole soundboard. Turn on **Let clips overlap** to layer pads instead of each one replacing the last (up to 16 at once). Clips are mixed into the same processed output Discord receives, and route changes preserve their playheads. **Mute mic** silences your voice without silencing the soundboard.
 
 To make a clip, choose **Microphone** (the selected raw mic) or **Computer audio** (the Windows default output or another playback device), then click **Record** and **Stop recording**. While it records, a live waveform, level meter and running file size show what's being captured; afterwards the whole take is drawn so you can check it before keeping it. Name the take and choose **Save WAV** or **Add to soundboard**. Takes are written to disk as they record, so there's no time limit beyond the WAV format's 4 GB (about six hours of 48 kHz stereo); a take you discard is deleted. Computer audio records the full mix playing through the chosen output; recording works even when OpenMic processing is stopped.
 

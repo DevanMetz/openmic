@@ -283,6 +283,14 @@ impl Mixer {
         self.voices.iter().map(|v| v.key).collect()
     }
 
+    /// Each playing clip's key and how far through it is (0..1).
+    pub fn progress(&self) -> Vec<(u64, f32)> {
+        self.voices
+            .iter()
+            .map(|v| (v.key, v.pos as f32 / v.samples.len().max(1) as f32))
+            .collect()
+    }
+
     /// Start `clip`. With `overlap` it layers over other pads (the same pad
     /// restarts); without it, it replaces whatever was playing.
     pub fn play(&mut self, clip: Clip, overlap: bool) {

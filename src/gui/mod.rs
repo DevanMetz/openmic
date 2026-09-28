@@ -124,6 +124,14 @@ pub struct App {
     sound_status: Status,
     /// Keys of the clips playing as of this frame.
     playing: Vec<u64>,
+    /// How far through each playing clip is (0..1), by clip key.
+    pad_progress: HashMap<u64, f32>,
+    /// Clip lengths in seconds, read once per file (`None`: unknown).
+    pad_durations: HashMap<PathBuf, Option<f32>>,
+    /// The soundboard's search text.
+    pad_filter: String,
+    /// Waveform peaks of the pad being trimmed.
+    trim_peaks: Option<(PathBuf, Vec<f32>)>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
     clip_cache: HashMap<PathBuf, Arc<Vec<f32>>>,
     record_source: Source,
@@ -267,6 +275,10 @@ impl App {
             status: ("Stopped".into(), MUTED),
             sound_status: ("Ready".into(), Color32::WHITE),
             playing: Vec::new(),
+            pad_progress: HashMap::new(),
+            pad_durations: HashMap::new(),
+            pad_filter: String::new(),
+            trim_peaks: None,
             clip_cache: HashMap::new(),
             record_source: Source::Microphone,
             record_output: String::new(),
@@ -551,7 +563,9 @@ impl App {
                 self.warn_until = None;
             }
         }
-        self.playing = self.engine.as_ref().map(Engine::playing).unwrap_or_default();
+        let progress = self.engine.as_ref().map(Engine::clip_progress).unwrap_or_default();
+        self.playing = progress.iter().map(|(key, _)| *key).collect();
+        self.pad_progress = progress.into_iter().collect();
         if self.playing.is_empty() && self.sound_status.0.starts_with("Playing") {
             self.sound_status = ("Ready".into(), Color32::WHITE);
         }
@@ -943,6 +957,7 @@ impl App {
         match self.clip_samples(&pad.path) {
             Ok(samples) => {
                 let key = clip_key(&pad.path);
+                let samples = trimmed(&samples, pad.start, pad.end);
                 if let Some(engine) = &self.engine {
                     engine.play_sound(Clip::new(key, samples, pad.volume), self.settings.overlap_clips);
                     self.playing = engine.playing();
@@ -1162,6 +1177,19 @@ fn on_a_monitor(_: [i32; 2]) -> bool {
     true
 }
 
+/// The part of a clip between its trim points (seconds; `end` `None` =
+/// the clip's end). Shares the clip when untrimmed.
+pub(super) fn trimmed(samples: &Arc<Vec<f32>>, start: f32, end: Option<f32>) -> Arc<Vec<f32>> {
+    let at = |seconds: f32| ((seconds.max(0.0) * dsp::SR as f32) as usize).min(samples.len());
+    let from = at(start);
+    let to = end.map_or(samples.len(), at).max(from);
+    if from == 0 && to == samples.len() {
+        Arc::clone(samples)
+    } else {
+        Arc::new(samples[from..to].to_vec())
+    }
+}
+
 fn open_url(url: &str) {
     // Explorer hands URLs to the default browser.
     let _ = std::process::Command::new("explorer").arg(url).spawn();
@@ -1378,6 +1406,38 @@ mod tests {
             }
             assert!(visible(&texts, "your mic +").is_none(), "the old value chips are gone");
         }
+    }
+
+    #[test]
+    fn the_window_reopens_where_it_was_and_remembers_moves() {
+        use eframe::App as _;
+        let mut app = App::stopped(Settings { window_position: Some([3900, 150]), ..Settings::default() });
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        // eframe reports the window at 150% scaling, where Windows first put it.
+        let mut frame_at = |app: &mut App, min: egui::Pos2| {
+            let info = egui::ViewportInfo {
+                native_pixels_per_point: Some(1.5),
+                outer_rect: Some(egui::Rect::from_min_size(min, egui::vec2(760.0, 880.0))),
+                inner_rect: Some(egui::Rect::from_min_size(min + egui::vec2(8.0, 30.0), egui::vec2(744.0, 842.0))),
+                ..Default::default()
+            };
+            let mut input = egui::RawInput::default();
+            input.viewports.insert(egui::ViewportId::ROOT, info);
+            ctx.run_ui(input, |ui| app.logic(ui.ctx(), &mut frame)).viewport_output
+        };
+        let first = frame_at(&mut app, egui::pos2(100.0, 100.0));
+        let moved: Vec<_> = first.values().flat_map(|v| v.commands.clone()).collect();
+        if on_a_monitor([3900, 150]) {
+            assert!(moved.contains(&ViewportCommand::OuterPosition(egui::pos2(2600.0, 100.0))), "{moved:?}");
+        } else {
+            assert!(moved.is_empty(), "a position on a monitor that's gone is ignored");
+        }
+        for _ in 0..6 {
+            frame_at(&mut app, egui::pos2(400.0, 300.0));
+        }
+        assert_eq!(app.settings.window_position, Some([600, 450]), "saved in screen pixels");
+        assert_eq!(app.settings.window_size, Some([744.0, 842.0]), "and the size in points");
     }
 
     #[test]

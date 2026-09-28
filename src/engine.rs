@@ -490,6 +490,11 @@ impl Engine {
         self.mixer.lock().playing_keys()
     }
 
+    /// Playing clips with how far through each one is (0..1).
+    pub fn clip_progress(&self) -> Vec<(u64, f32)> {
+        self.mixer.lock().progress()
+    }
+
     /// Playing clips at their playheads (route-switch handoff).
     pub fn take_clips(&self) -> Vec<Clip> {
         self.mixer.lock().take_remaining()
