@@ -1,40 +1,42 @@
 //! The strip: OpenMic collapsed to a thin always-on-top bar for everyday
-//! use. It shows what Discord hears (the microphone: click to mute), the
-//! output level, the preset (click for the next one), your starred pads,
-//! and a button to expand back to the full window. Drag it to move it and
-//! its right edge to resize it; narrower, it drops pads and the preset,
-//! then the bar, down to just the microphone.
+//! use. The microphone shows what Discord hears (green while your voice goes
+//! out, red when muted; click it to mute), then your starred pads, the
+//! preset (click for the next one) and a button to expand back to the full
+//! window. Buttons are as wide as their names, and pads come first: when the
+//! strip is too narrow, the preset goes before any pad does. Drag the strip
+//! to move it and its right edge to resize it, down to just the microphone.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, CursorIcon, Pos2, Rect, ResizeDirection, Sense, Stroke, StrokeKind, Vec2,
+    self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, ResizeDirection, Sense, Stroke, StrokeKind, Vec2,
     ViewportBuilder, ViewportCommand, ViewportId,
 };
 
-use super::{App, Command, AMBER, GREEN, MUTED, RED};
+use super::{App, Command, GREEN, MUTED, RED};
 use crate::config;
 
 pub(super) const HEIGHT: f32 = 34.0;
 pub(super) const DEFAULT_WIDTH: f32 = 200.0;
 /// Just the microphone.
 const MIN_WIDTH: f32 = HEIGHT;
-const MAX_WIDTH: f32 = 960.0;
-/// Narrower than this, the level shows as a line under the microphone.
-const BAR_MIN_WIDTH: f32 = 80.0;
-/// Narrower than this, there's no room for the expand button.
-const EXPAND_MIN_WIDTH: f32 = 110.0;
-/// The level bar's width when the preset and pads share the strip.
-const BAR_WIDTH: f32 = 96.0;
-const PRESET_WIDTH: f32 = 100.0;
-const PAD_WIDTH: f32 = 78.0;
-const GAP: f32 = 6.0;
+const MAX_WIDTH: f32 = 1200.0;
+/// The expand button, and the narrowest strip that has room for it.
+const EXPAND_WIDTH: f32 = 24.0;
+const EXPAND_MIN_WIDTH: f32 = HEIGHT + EXPAND_WIDTH + 10.0;
+const GAP: f32 = 5.0;
+/// Space either side of a button's text.
+const BUTTON_PADDING: f32 = 8.0;
+/// Names longer than this are cut short.
+const MAX_NAME: usize = 18;
 /// The right-edge strip that resizes it.
 const GRIP: f32 = 6.0;
-/// The bottom of the meter, dBFS.
-const FLOOR: f32 = -60.0;
 /// Output above this counts as your voice going out.
 const SPEAKING_DB: f32 = -45.0;
 
-/// What the meter shows.
+fn label_font() -> FontId {
+    FontId::proportional(12.0)
+}
+
+/// What the microphone shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Meter {
     Stopped,
@@ -43,7 +45,7 @@ pub(super) enum Meter {
     Live(f32),
 }
 
-/// What the strip shows besides the meter.
+/// What the strip shows besides the microphone.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Strip {
     pub preset: String,
@@ -60,10 +62,33 @@ pub(super) enum Action {
     PlayPad(usize),
 }
 
-/// A width that fits the meter, the preset and `pads` starred pads.
-pub(super) fn fitting_width(pads: usize) -> f32 {
-    let pads = pads.min(6) as f32;
-    (HEIGHT + BAR_WIDTH + GAP + PRESET_WIDTH + GAP + pads * (PAD_WIDTH + GAP) + 30.0 + GRIP + 4.0).clamp(MIN_WIDTH, MAX_WIDTH)
+/// Where the buttons go between `left` and `right`, given each pad's and
+/// the preset's width: pads in order while they fit, then the preset only
+/// if every pad fit and there's room. Returns each placed pad's (position
+/// in `pads`, x) and the preset's x.
+fn layout(left: f32, right: f32, pads: &[f32], preset: f32) -> (Vec<(usize, f32)>, Option<f32>) {
+    let mut x = left;
+    let mut placed = Vec::new();
+    for (i, &width) in pads.iter().enumerate() {
+        if x + width > right {
+            return (placed, None);
+        }
+        placed.push((i, x));
+        x += width + GAP;
+    }
+    let preset = (x + preset <= right).then_some(x);
+    (placed, preset)
+}
+
+/// How wide a button for `text` is.
+fn button_width(text_width: f32) -> f32 {
+    text_width + 2.0 * BUTTON_PADDING
+}
+
+/// A strip just wide enough for the microphone, every button and expand.
+fn fitting_width(pads: &[f32], preset: f32) -> f32 {
+    let buttons: f32 = pads.iter().map(|w| w + GAP).sum::<f32>() + preset;
+    (HEIGHT + GAP + buttons + GAP + EXPAND_WIDTH + GRIP + 6.0).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
 /// Puts the strip where the user left it, once. Re-sending the
@@ -132,6 +157,20 @@ impl App {
         }
     }
 
+    fn strip_contents(&self) -> Strip {
+        Strip {
+            preset: self.preset_name(),
+            pads: self
+                .settings
+                .sounds
+                .iter()
+                .enumerate()
+                .filter(|(_, pad)| pad.starred)
+                .map(|(i, pad)| (i, super::sound_tab::pad_name(&pad.path), self.playing.contains(&super::clip_key(&pad.path))))
+                .collect(),
+        }
+    }
+
     /// Show the strip while OpenMic is collapsed. Called every tick, so it
     /// keeps working with the main window hidden.
     pub(super) fn show_overlay(&mut self, ctx: &egui::Context) {
@@ -139,13 +178,15 @@ impl App {
             self.overlay_placement = Placement::default();
             return;
         }
+        let strip = self.strip_contents();
         if !self.overlay_placement.placed {
-            let starred = self.settings.sounds.iter().filter(|p| p.starred).count();
-            // Never resized: size it to fit what it shows.
-            if self.settings.overlay_width == DEFAULT_WIDTH {
-                self.settings.overlay_width = fitting_width(starred);
-            }
-            self.overlay_spawn_width = self.settings.overlay_width.clamp(MIN_WIDTH, MAX_WIDTH);
+            // Sized to fit what it shows, unless resized by hand.
+            let width = self.settings.strip_width.unwrap_or_else(|| {
+                let measure = |text: &str| button_width(text_width(ctx, text));
+                let pads: Vec<f32> = strip.pads.iter().map(|(_, name, _)| measure(&truncate(name, MAX_NAME))).collect();
+                fitting_width(&pads, measure(&truncate(&strip.preset, MAX_NAME)))
+            });
+            self.overlay_spawn_width = width.clamp(MIN_WIDTH, MAX_WIDTH);
         }
         // Constant while shown: egui turns any change into a resize or move.
         let builder = ViewportBuilder::default()
@@ -158,19 +199,8 @@ impl App {
             .with_always_on_top()
             .with_taskbar(false);
         let meter = self.meter();
-        let strip = Strip {
-            preset: self.preset_name(),
-            pads: self
-                .settings
-                .sounds
-                .iter()
-                .enumerate()
-                .filter(|(_, pad)| pad.starred)
-                .map(|(i, pad)| (i, super::sound_tab::pad_name(&pad.path), self.playing.contains(&super::clip_key(&pad.path))))
-                .collect(),
-        };
         let saved = self.settings.overlay_position;
-        let (placement, hold) = (&mut self.overlay_placement, &mut self.overlay_hold);
+        let placement = &mut self.overlay_placement;
         let (actions, seen) =
             ctx.show_viewport_immediate(ViewportId::from_hash_of("openmic-level-meter"), builder, |ui, _| {
                 let info = ui.ctx().input(|i| i.viewport().clone());
@@ -178,19 +208,23 @@ impl App {
                 if let Some(pos) = place {
                     ui.ctx().send_viewport_cmd(ViewportCommand::OuterPosition(pos));
                 }
-                let actions = draw(ui, meter, &strip, hold);
+                let actions = draw(ui, meter, &strip);
                 let seen = record
                     .then(|| Some((info.outer_rect?.min, info.native_pixels_per_point?, info.inner_rect?.width())))
                     .flatten();
                 (actions, seen)
             });
 
-        // Remember where it was dragged to and how wide it was made.
+        // Remember where it was dragged to, and a width set by hand.
         if let Some((pos, ppp, width)) = seen {
             let px = [(pos.x * ppp).round() as i32, (pos.y * ppp).round() as i32];
-            if self.settings.overlay_position != Some(px) || (self.settings.overlay_width - width).abs() > 0.5 {
+            if self.settings.overlay_position != Some(px) {
                 self.settings.overlay_position = Some(px);
-                self.settings.overlay_width = width;
+                self.touch();
+            }
+            let resized = (width - self.overlay_spawn_width).abs() > 1.0;
+            if resized && self.settings.strip_width.is_none_or(|w| (w - width).abs() > 0.5) {
+                self.settings.strip_width = Some(width);
                 self.touch();
             }
         }
@@ -279,11 +313,15 @@ fn raise_meter() {
 fn raise_meter() {}
 
 fn to_db(peak: f32) -> f32 {
-    (20.0 * peak.max(1e-6).log10()).clamp(FLOOR, 0.0)
+    (20.0 * peak.max(1e-6).log10()).clamp(-60.0, 0.0)
+}
+
+fn text_width(ctx: &egui::Context, text: &str) -> f32 {
+    ctx.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), label_font(), Color32::WHITE).size().x)
 }
 
 /// Draw the strip filling `ui`, and report clicks.
-pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip, hold: &mut f32) -> Vec<Action> {
+pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip) -> Vec<Action> {
     let mut actions = Vec::new();
     let rect = ui.max_rect();
     let visuals = ui.visuals().clone();
@@ -304,15 +342,9 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip, hold: &mut f3
         actions.push(Action::Expand);
     }
 
-    let db = match meter {
-        Meter::Live(db) => db,
-        _ => FLOOR,
-    };
-    let dt = ui.input(|i| i.stable_dt).min(0.1);
-    *hold = if db >= *hold { db } else { (*hold - 20.0 * dt).max(db) }; // falls 20 dB/s
-
-    // The microphone mutes and unmutes; dragging it still moves the strip.
-    let compact = rect.width() < BAR_MIN_WIDTH;
+    // The microphone: green while your voice goes out, red and slashed when
+    // muted, grey when stopped. Click it to mute or unmute; dragging it
+    // still moves the strip.
     let mic_rect = Rect::from_min_size(rect.min, Vec2::splat(rect.height()));
     let mic = ui.interact(mic_rect, ui.id().with("mic"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     if mic.clicked() {
@@ -321,76 +353,52 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip, hold: &mut f3
     if mic.hovered() {
         ui.painter().rect_filled(mic_rect.shrink(3.0), CornerRadius::same(5), visuals.widgets.hovered.weak_bg_fill);
     }
-    let dot = match meter {
-        Meter::Stopped => MUTED.gamma_multiply(0.6),
-        Meter::Muted => RED,
-        Meter::Live(db) if db > SPEAKING_DB => GREEN,
-        Meter::Live(_) => MUTED,
+    let (color, speaking) = match meter {
+        Meter::Stopped => (MUTED.gamma_multiply(0.6), false),
+        Meter::Muted => (RED, false),
+        Meter::Live(db) if db > SPEAKING_DB => (GREEN, true),
+        Meter::Live(_) => (visuals.text_color(), false),
     };
-    mic_glyph(ui.painter(), mic_rect.center(), dot);
+    if speaking {
+        ui.painter().circle_filled(mic_rect.center(), 14.0, GREEN.gamma_multiply(0.18));
+    }
+    mic_glyph(ui.painter(), mic_rect.center(), color);
     if meter == Meter::Muted {
-        // A slash across the microphone.
         let r = mic_rect.shrink(8.0);
         ui.painter().line_segment([r.left_top(), r.right_bottom()], Stroke::new(2.0, RED));
     }
 
     let mut right = rect.right() - GRIP;
     if rect.width() >= EXPAND_MIN_WIDTH {
-        let expand = Rect::from_center_size(Pos2::new(right - 14.0, rect.center().y), Vec2::new(24.0, 22.0));
+        let expand = Rect::from_center_size(Pos2::new(right - EXPAND_WIDTH / 2.0 - 2.0, rect.center().y), Vec2::new(EXPAND_WIDTH, 22.0));
         if ui.put(expand, egui::Button::new("⛶").small()).on_hover_text("Open the full window").clicked() {
             actions.push(Action::Expand);
         }
         right = expand.left() - GAP;
     }
 
-    if compact {
-        // Too narrow for the bar: the level runs along the bottom edge.
-        if let Meter::Live(db) = meter {
-            let line = Rect::from_min_max(
-                Pos2::new(rect.left() + 3.0, rect.bottom() - 4.0),
-                rect.right_bottom() - Vec2::new(3.0, 1.0),
-            );
-            level_bar(ui.painter(), line, db, *hold, visuals.extreme_bg_color);
+    // Pads first, as wide as their names; the preset after them if there's room.
+    let names: Vec<String> = strip.pads.iter().map(|(_, name, _)| truncate(name, MAX_NAME)).collect();
+    let preset_name = truncate(&strip.preset, MAX_NAME);
+    let measure = |text: &str| button_width(ui.painter().layout_no_wrap(text.to_owned(), label_font(), visuals.text_color()).size().x);
+    let widths: Vec<f32> = names.iter().map(|n| measure(n)).collect();
+    let preset_width = measure(&preset_name);
+    let (placed, preset_x) = layout(mic_rect.right() + GAP, right, &widths, preset_width);
+    let button_rect = |x: f32, width: f32| Rect::from_min_size(Pos2::new(x, rect.center().y - 11.0), Vec2::new(width, 22.0));
+    for (i, x) in placed {
+        let (index, _, playing) = &strip.pads[i];
+        let mut button = egui::Button::new(egui::RichText::new(&names[i]).font(label_font()));
+        if *playing {
+            button = button.fill(GREEN.gamma_multiply(0.35));
         }
-    } else {
-        // The bar fills the strip unless there's room for the preset too.
-        let room = right - mic_rect.right();
-        let with_preset = room >= BAR_WIDTH + GAP + PRESET_WIDTH;
-        let bar_right = if with_preset { mic_rect.right() + BAR_WIDTH } else { right.max(mic_rect.right() + 10.0) };
-        let bar = Rect::from_min_max(
-            Pos2::new(mic_rect.right(), rect.center().y - 5.0),
-            Pos2::new(bar_right, rect.center().y + 5.0),
-        );
-        match meter {
-            Meter::Stopped | Meter::Muted => {
-                let (text, color) = if meter == Meter::Muted { ("Muted", RED) } else { ("Stopped", MUTED) };
-                ui.painter().text(bar.left_center(), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(13.0), color);
-            }
-            Meter::Live(db) => level_bar(ui.painter(), bar, db, *hold, visuals.extreme_bg_color),
+        if ui.put(button_rect(x, widths[i]), button).clicked() {
+            actions.push(Action::PlayPad(*index));
         }
-        if with_preset {
-            let mut x = bar.right() + GAP;
-            let preset = Rect::from_min_size(Pos2::new(x, rect.center().y - 11.0), Vec2::new(PRESET_WIDTH, 22.0));
-            let label = egui::RichText::new(truncate(&strip.preset, 12)).small();
-            if ui.put(preset, egui::Button::new(label)).on_hover_text("Next preset").clicked() {
-                actions.push(Action::NextPreset);
-            }
-            x = preset.right() + GAP;
-            // Starred pads, as many as fit.
-            for (index, name, playing) in &strip.pads {
-                if x + PAD_WIDTH > right {
-                    break;
-                }
-                let pad = Rect::from_min_size(Pos2::new(x, rect.center().y - 11.0), Vec2::new(PAD_WIDTH, 22.0));
-                let mut button = egui::Button::new(egui::RichText::new(truncate(name, 10)).small());
-                if *playing {
-                    button = button.fill(GREEN.gamma_multiply(0.35));
-                }
-                if ui.put(pad, button).clicked() {
-                    actions.push(Action::PlayPad(*index));
-                }
-                x = pad.right() + GAP;
-            }
+    }
+    if let Some(x) = preset_x {
+        let label = egui::RichText::new(&preset_name).font(label_font()).color(visuals.weak_text_color());
+        if ui.put(button_rect(x, preset_width), egui::Button::new(label).frame(false)).on_hover_text("Next preset").clicked() {
+            actions.push(Action::NextPreset);
         }
     }
 
@@ -441,39 +449,23 @@ fn mic_glyph(painter: &egui::Painter, center: Pos2, color: Color32) {
     painter.line_segment([center + Vec2::new(-4.0, 10.5), center + Vec2::new(4.0, 10.5)], stroke);
 }
 
-/// Green up to -18 dB, amber to -6 dB, red above, with a peak-hold tick.
-fn level_bar(painter: &egui::Painter, rect: Rect, db: f32, hold: f32, track: Color32) {
-    painter.rect_filled(rect, CornerRadius::same(5), track);
-    let x = |d: f32| rect.left() + (d - FLOOR) / -FLOOR * rect.width();
-    for (from, to, color) in [(FLOOR, -18.0, GREEN), (-18.0, -6.0, AMBER), (-6.0, 0.0, RED)] {
-        if db > from {
-            let segment = Rect::from_x_y_ranges(x(from)..=x(db.min(to)), rect.y_range());
-            painter.rect_filled(segment, CornerRadius::same(5), color);
-        }
-    }
-    if hold > FLOOR + 1.0 {
-        let at = x(hold);
-        painter.line_segment([Pos2::new(at, rect.top()), Pos2::new(at, rect.bottom())], Stroke::new(2.0, Color32::WHITE));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Settings;
 
-    fn strip(pads: usize) -> Strip {
+    fn strip(names: &[&str]) -> Strip {
         Strip {
             preset: "Balanced".into(),
-            pads: (0..pads).map(|i| (i, format!("pad{i}"), false)).collect(),
+            pads: names.iter().enumerate().map(|(i, n)| (i, n.to_string(), false)).collect(),
         }
     }
 
     /// Draw the strip `width` wide, with the pointer at `pointer` and
-    /// optionally a click there; returns the text shown and the actions.
-    fn run(meter: Meter, strip: &Strip, width: f32, pointer: Option<Pos2>, click: bool) -> (Vec<String>, Vec<Action>) {
+    /// optionally a click there; returns the text shown (with where) and
+    /// the actions.
+    fn run(meter: Meter, strip: &Strip, width: f32, pointer: Option<Pos2>, click: bool) -> (Vec<(String, Rect)>, Vec<Action>) {
         let ctx = egui::Context::default();
-        let mut hold = FLOOR;
         let input = |events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, HEIGHT))),
             events,
@@ -494,12 +486,12 @@ mod tests {
         }
         frames.push(Vec::new());
         for events in frames {
-            let output = ctx.run_ui(input(events), |ui| actions.extend(draw(ui, meter, strip, &mut hold)));
+            let output = ctx.run_ui(input(events), |ui| actions.extend(draw(ui, meter, strip)));
             texts = output
                 .shapes
                 .iter()
                 .filter_map(|c| match &c.shape {
-                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    egui::Shape::Text(t) => Some((t.galley.text().to_owned(), t.visual_bounding_rect())),
                     _ => None,
                 })
                 .collect();
@@ -507,66 +499,108 @@ mod tests {
         (texts, actions)
     }
 
-    #[test]
-    fn the_strip_says_when_it_is_stopped_or_muted() {
-        let s = strip(0);
-        assert!(run(Meter::Stopped, &s, DEFAULT_WIDTH, None, false).0.contains(&"Stopped".to_owned()));
-        assert!(run(Meter::Muted, &s, DEFAULT_WIDTH, None, false).0.contains(&"Muted".to_owned()));
-        let (live, _) = run(Meter::Live(-20.0), &s, DEFAULT_WIDTH, None, false);
-        assert!(!live.iter().any(|t| t == "Stopped" || t == "Muted"), "a live strip shows the bar: {live:?}");
+    fn names(texts: &[(String, Rect)]) -> Vec<&str> {
+        texts.iter().map(|(t, _)| t.as_str()).collect()
     }
 
     #[test]
-    fn clicking_the_microphone_mutes_and_unmutes() {
-        let mic = Pos2::new(HEIGHT / 2.0, HEIGHT / 2.0);
-        assert_eq!(run(Meter::Live(-20.0), &strip(0), DEFAULT_WIDTH, Some(mic), true).1, [Action::ToggleMute]);
-        assert_eq!(run(Meter::Muted, &strip(0), DEFAULT_WIDTH, Some(mic), true).1, [Action::ToggleMute]);
+    fn pads_come_first_and_the_preset_only_if_every_pad_fits() {
+        // Room for everything.
+        let (pads, preset) = layout(0.0, 300.0, &[50.0, 60.0], 70.0);
+        assert_eq!(pads, [(0, 0.0), (1, 50.0 + GAP)]);
+        assert_eq!(preset, Some(110.0 + 2.0 * GAP));
+        // The preset goes first...
+        let (pads, preset) = layout(0.0, 140.0, &[50.0, 60.0], 70.0);
+        assert_eq!((pads.len(), preset), (2, None));
+        // ...then pads that don't fit, in order.
+        let (pads, preset) = layout(0.0, 80.0, &[50.0, 60.0], 70.0);
+        assert_eq!((pads, preset), (vec![(0, 0.0)], None));
+        // No pads: just the preset.
+        assert_eq!(layout(10.0, 100.0, &[], 70.0), (vec![], Some(10.0)));
     }
 
     #[test]
-    fn the_expand_button_opens_the_window_when_there_is_room() {
-        let expand = Pos2::new(DEFAULT_WIDTH - GRIP - 14.0, HEIGHT / 2.0);
-        assert_eq!(run(Meter::Live(-20.0), &strip(0), DEFAULT_WIDTH, Some(expand), true).1, [Action::Expand]);
-        let (texts, _) = run(Meter::Live(-20.0), &strip(0), 90.0, None, false);
-        assert!(!texts.contains(&"⛶".to_owned()), "no room on a narrow strip");
-    }
-
-    #[test]
-    fn a_wide_strip_shows_the_preset_and_starred_pads_that_fit() {
-        let s = strip(3);
-        let width = fitting_width(3);
-        let (texts, _) = run(Meter::Live(-20.0), &s, width, None, false);
-        for label in ["Balanced", "pad0", "pad1", "pad2"] {
-            assert!(texts.contains(&label.to_owned()), "{label} missing: {texts:?}");
+    fn there_is_no_level_meter_or_status_text() {
+        for meter in [Meter::Stopped, Meter::Muted, Meter::Live(-20.0), Meter::Live(-80.0)] {
+            let (texts, _) = run(meter, &strip(&[]), DEFAULT_WIDTH, None, false);
+            let shown = names(&texts);
+            assert!(!shown.iter().any(|t| *t == "Stopped" || *t == "Muted"), "{meter:?}: {shown:?}");
         }
-        // Click the preset, then the second pad.
-        let preset_x = HEIGHT + BAR_WIDTH + GAP + PRESET_WIDTH / 2.0;
-        assert_eq!(run(Meter::Live(-20.0), &s, width, Some(Pos2::new(preset_x, 17.0)), true).1, [Action::NextPreset]);
-        let pad1_x = HEIGHT + BAR_WIDTH + GAP + PRESET_WIDTH + GAP + PAD_WIDTH + GAP + PAD_WIDTH / 2.0;
-        assert_eq!(run(Meter::Live(-20.0), &s, width, Some(Pos2::new(pad1_x, 17.0)), true).1, [Action::PlayPad(1)]);
+    }
 
-        // Narrower: pads drop first, then the preset.
-        let (texts, _) = run(Meter::Live(-20.0), &s, fitting_width(1), None, false);
-        assert!(texts.contains(&"pad0".to_owned()) && !texts.contains(&"pad2".to_owned()), "{texts:?}");
-        let (texts, _) = run(Meter::Live(-20.0), &s, DEFAULT_WIDTH, None, false);
-        assert!(!texts.contains(&"Balanced".to_owned()) && !texts.contains(&"pad0".to_owned()), "{texts:?}");
+    #[test]
+    fn pad_buttons_are_as_wide_as_their_names() {
+        let s = strip(&["hi", "a much longer name"]);
+        let (texts, _) = run(Meter::Live(-20.0), &s, 600.0, None, false);
+        let short = texts.iter().find(|(t, _)| t == "hi").unwrap().1;
+        let long = texts.iter().find(|(t, _)| t == "a much longer name").unwrap().1;
+        assert!(long.width() > 3.0 * short.width());
+        // The second pad starts right after the first one's short button.
+        assert!(long.left() < HEIGHT + GAP + button_width(short.width()) + GAP + BUTTON_PADDING + 4.0, "{short:?} {long:?}");
+        let (texts, _) = run(Meter::Live(-20.0), &strip(&["an extremely long clip name indeed"]), 600.0, None, false);
+        assert!(names(&texts).contains(&"an extremely long…"), "long names are cut: {:?}", names(&texts));
+    }
+
+    #[test]
+    fn a_narrow_strip_keeps_pads_and_drops_the_preset() {
+        let s = strip(&["horn", "rim", "bruh"]);
+        let (texts, _) = run(Meter::Live(-20.0), &s, 600.0, None, false);
+        for label in ["horn", "rim", "bruh", "Balanced"] {
+            assert!(names(&texts).contains(&label), "{label}: {:?}", names(&texts));
+        }
+        // Too narrow for everything: the preset goes before any pad...
+        let (texts, _) = run(Meter::Live(-20.0), &s, 220.0, None, false);
+        let shown = names(&texts);
+        assert!(shown.contains(&"horn") && shown.contains(&"rim") && !shown.contains(&"Balanced"), "{shown:?}");
+        // ...then pads drop from the end.
+        let (texts, _) = run(Meter::Live(-20.0), &s, 130.0, None, false);
+        let shown = names(&texts);
+        assert!(shown.contains(&"horn") && !shown.contains(&"bruh"), "{shown:?}");
+    }
+
+    #[test]
+    fn clicks_mute_play_pads_cycle_presets_and_expand() {
+        let s = strip(&["horn", "rim"]);
+        let mic = Pos2::new(HEIGHT / 2.0, HEIGHT / 2.0);
+        assert_eq!(run(Meter::Live(-20.0), &s, 600.0, Some(mic), true).1, [Action::ToggleMute]);
+        assert_eq!(run(Meter::Muted, &s, 600.0, Some(mic), true).1, [Action::ToggleMute]);
+
+        let (texts, _) = run(Meter::Live(-20.0), &s, 600.0, None, false);
+        let at = |label: &str| texts.iter().find(|(t, _)| t == label).unwrap().1.center();
+        assert_eq!(run(Meter::Live(-20.0), &s, 600.0, Some(at("rim")), true).1, [Action::PlayPad(1)]);
+        assert_eq!(run(Meter::Live(-20.0), &s, 600.0, Some(at("Balanced")), true).1, [Action::NextPreset]);
+        let expand = Pos2::new(600.0 - GRIP - EXPAND_WIDTH / 2.0 - 2.0, HEIGHT / 2.0);
+        assert_eq!(run(Meter::Live(-20.0), &s, 600.0, Some(expand), true).1, [Action::Expand]);
     }
 
     #[test]
     fn a_strip_resized_to_the_icon_still_mutes_and_shows_no_text() {
         for meter in [Meter::Stopped, Meter::Muted, Meter::Live(-20.0)] {
-            let (texts, _) = run(meter, &strip(3), MIN_WIDTH, None, false);
+            let (texts, _) = run(meter, &strip(&["horn"]), MIN_WIDTH, None, false);
             assert!(texts.is_empty(), "{meter:?} at icon size shows only the icon: {texts:?}");
         }
         let center = Pos2::new(MIN_WIDTH / 2.0 - 3.0, HEIGHT / 2.0);
-        assert_eq!(run(Meter::Live(-20.0), &strip(3), MIN_WIDTH, Some(center), true).1, [Action::ToggleMute]);
+        assert_eq!(run(Meter::Live(-20.0), &strip(&["horn"]), MIN_WIDTH, Some(center), true).1, [Action::ToggleMute]);
+    }
+
+    #[test]
+    fn a_fitted_strip_shows_everything_it_holds() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let s = strip(&["airhorn", "rimshot", "bruh"]);
+        let measure = |t: &str| button_width(text_width(&ctx, t));
+        let pads: Vec<f32> = s.pads.iter().map(|(_, n, _)| measure(n)).collect();
+        let width = fitting_width(&pads, measure(&s.preset));
+        let (texts, _) = run(Meter::Live(-20.0), &s, width, None, false);
+        for label in ["airhorn", "rimshot", "bruh", "Balanced", "⛶"] {
+            assert!(names(&texts).contains(&label), "{label} doesn't fit in {width}: {:?}", names(&texts));
+        }
     }
 
     /// Press at `from`, move to `to`, release; returns the window commands
     /// sent and the actions reported.
     fn drag(from: Pos2, to: Pos2) -> (Vec<ViewportCommand>, Vec<Action>) {
         let ctx = egui::Context::default();
-        let mut hold = FLOOR;
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -585,7 +619,7 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let output = ctx.run_ui(input, |ui| actions.extend(draw(ui, Meter::Live(-20.0), &strip(0), &mut hold)));
+            let output = ctx.run_ui(input, |ui| actions.extend(draw(ui, Meter::Live(-20.0), &strip(&[]))));
             commands.extend(output.viewport_output.into_values().flat_map(|v| v.commands));
         }
         (commands, actions)
@@ -639,7 +673,7 @@ mod tests {
     fn peaks_map_to_the_meter_range() {
         assert_eq!(to_db(1.0), 0.0);
         assert!((to_db(0.1) + 20.0).abs() < 1e-4);
-        assert_eq!(to_db(0.0), FLOOR, "silence sits at the floor");
+        assert_eq!(to_db(0.0), -60.0, "silence sits at the floor");
         assert_eq!(to_db(2.0), 0.0, "clipping stays at the top");
         assert_eq!(truncate("airhorn remix", 7), "airhor…");
         assert_eq!(truncate("bruh", 7), "bruh");

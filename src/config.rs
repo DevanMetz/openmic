@@ -59,8 +59,9 @@ pub struct Settings {
     /// Where the pinned meter was last dragged to, in screen pixels (the
     /// same on monitors with different scaling).
     pub overlay_position: Option<[i32; 2]>,
-    /// The pinned meter's width in points; at its narrowest, just the icon.
-    pub overlay_width: f32,
+    /// The strip's width in points if resized by hand (`None`: fit what
+    /// it shows). At its narrowest, just the microphone.
+    pub strip_width: Option<f32>,
     /// Show every processing control and the full scope, not just a
     /// preset and one noise-reduction slider.
     pub advanced: bool,
@@ -107,7 +108,7 @@ impl Default for Settings {
             check_for_updates: true,
             collapsed: false,
             overlay_position: None,
-            overlay_width: 200.0,
+            strip_width: None,
             advanced: false,
             setup: Setup::default(),
             window_position: None,

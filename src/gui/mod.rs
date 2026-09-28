@@ -207,8 +207,6 @@ pub struct App {
     update_checked_at: Option<Instant>,
     /// The "What's new" window is open.
     show_release_notes: bool,
-    /// Peak-hold position of the strip's level meter, dBFS.
-    overlay_hold: f32,
     /// Launched by Windows startup: stay in the tray, even if collapsed,
     /// until the user opens OpenMic.
     strip_suppressed: bool,
@@ -334,7 +332,6 @@ impl App {
             updated_at: None,
             update_checked_at: None,
             show_release_notes: false,
-            overlay_hold: -60.0,
             strip_suppressed: false,
             overlay_placement: overlay::Placement::default(),
             overlay_spawn_width: overlay::DEFAULT_WIDTH,
