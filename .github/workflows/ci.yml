@@ -26,3 +26,22 @@ jobs:
       - run: clang --version
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+
+  # Keeps release-profile build artifacts cached on main for the release
+  # workflow. GitHub only lets a tag's run read caches from that tag or the
+  # default branch, so caches saved by earlier tag builds were never reused
+  # and every release compiled all dependencies from scratch (~15 minutes).
+  release-cache:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+      - name: Put clang on PATH
+        shell: pwsh
+        run: |
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - run: cargo build --locked --release

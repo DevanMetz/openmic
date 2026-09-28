@@ -38,7 +38,12 @@ jobs:
           throw "timed out waiting for CI on $env:GITHUB_SHA"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Restore the release-profile cache CI keeps on main (see ci.yml);
+      # a cache saved here would only be visible to this tag.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: false
       - name: Verify release version
         shell: pwsh
         run: |
