@@ -37,7 +37,7 @@ impl App {
     pub(super) fn draw_update_status(&mut self, ui: &mut egui::Ui) {
         let recent_check = self.update_checked_at.is_some_and(|t| t.elapsed() < RESULT_SHOWN);
         if let Some(error) = self.update_error.clone() {
-            if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+            if ui.small_button("×").on_hover_text("Dismiss").clicked() {
                 self.update_error = None;
             }
             ui.label(RichText::new(short(&error)).color(RED)).on_hover_text(error);
@@ -91,10 +91,10 @@ impl App {
                 ui.label(RichText::new("Couldn't check for updates").color(AMBER)).on_hover_text(e);
             }
             Status::UpToDate if recent_check => {
-                ui.label(RichText::new(format!("✔ {VERSION} is up to date")).color(MUTED));
+                ui.label(RichText::new(format!("{VERSION} is up to date")).color(MUTED));
             }
             _ if self.updated_at.is_some_and(|t| t.elapsed() < UPDATED_SHOWN) => {
-                ui.label(RichText::new(format!("✔ Updated to {VERSION}")).color(GREEN));
+                ui.label(RichText::new(format!("Updated to {VERSION}")).color(GREEN));
             }
             _ => {
                 ui.weak("Clean voice. Instant sounds. Fully local.");

@@ -53,8 +53,9 @@ pub struct Settings {
     pub dictation_hold: bool,
     /// Look for a new OpenMic release on GitHub once a day.
     pub check_for_updates: bool,
-    /// Show the level meter pinned on top of other windows.
-    pub overlay: bool,
+    /// OpenMic is collapsed to the strip (the main window hidden); it
+    /// reopens that way.
+    pub collapsed: bool,
     /// Where the pinned meter was last dragged to, in screen pixels (the
     /// same on monitors with different scaling).
     pub overlay_position: Option<[i32; 2]>,
@@ -104,7 +105,7 @@ impl Default for Settings {
             speech_model: SpeechModel::default(),
             dictation_hold: true,
             check_for_updates: true,
-            overlay: false,
+            collapsed: false,
             overlay_position: None,
             overlay_width: 200.0,
             advanced: false,
@@ -140,11 +141,13 @@ pub struct Pad {
     pub start: f32,
     /// ...and where it stops (the clip's end when `None`).
     pub end: Option<f32>,
+    /// Shown on the collapsed strip.
+    pub starred: bool,
 }
 
 impl Pad {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, volume: 1.0, hotkey: None, start: 0.0, end: None }
+        Self { path, volume: 1.0, hotkey: None, start: 0.0, end: None, starred: false }
     }
 }
 
@@ -162,6 +165,8 @@ enum PadRepr {
         start: f32,
         #[serde(default)]
         end: Option<f32>,
+        #[serde(default)]
+        starred: bool,
     },
 }
 
@@ -173,7 +178,9 @@ impl From<PadRepr> for Pad {
     fn from(repr: PadRepr) -> Self {
         match repr {
             PadRepr::Path(path) => Pad::new(path),
-            PadRepr::Full { path, volume, hotkey, start, end } => Pad { path, volume, hotkey, start, end },
+            PadRepr::Full { path, volume, hotkey, start, end, starred } => {
+                Pad { path, volume, hotkey, start, end, starred }
+            }
         }
     }
 }

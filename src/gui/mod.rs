@@ -37,11 +37,28 @@ pub(crate) const VIOLET: Color32 = Color32::from_rgb(0xa7, 0x8b, 0xfa);
 pub(crate) const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);
 pub(crate) const MUTED: Color32 = Color32::from_rgb(0x94, 0xa3, 0xb8);
 
-#[derive(PartialEq)]
-enum Tab {
-    Mic,
+/// A page of the main window, chosen in the sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Voice,
     Soundboard,
+    Record,
+    Dictation,
     Settings,
+}
+
+impl Page {
+    const ALL: [Page; 5] = [Page::Voice, Page::Soundboard, Page::Record, Page::Dictation, Page::Settings];
+
+    fn title(self) -> &'static str {
+        match self {
+            Page::Voice => "Voice",
+            Page::Soundboard => "Soundboard",
+            Page::Record => "Record",
+            Page::Dictation => "Dictation",
+            Page::Settings => "Settings",
+        }
+    }
 }
 
 type Status = (String, Color32);
@@ -86,8 +103,8 @@ pub enum Command {
     ToggleMute,
     ToggleBypass,
     ToggleRunning,
-    /// Pin or unpin the level meter.
-    ToggleOverlay,
+    /// Collapse the window to the strip, or expand it back.
+    ToggleCollapse,
     StopClips,
     PlayPad(PathBuf),
     /// The speech-to-text shortcut went down...
@@ -118,7 +135,7 @@ pub struct App {
     settings: Settings,
     inputs: Vec<String>,
     outputs: Vec<String>,
-    tab: Tab,
+    page: Page,
     engine: Option<Engine>,
     status: Status,
     sound_status: Status,
@@ -190,8 +207,11 @@ pub struct App {
     update_checked_at: Option<Instant>,
     /// The "What's new" window is open.
     show_release_notes: bool,
-    /// Peak-hold position of the pinned level meter, dBFS.
+    /// Peak-hold position of the strip's level meter, dBFS.
     overlay_hold: f32,
+    /// Launched by Windows startup: stay in the tray, even if collapsed,
+    /// until the user opens OpenMic.
+    strip_suppressed: bool,
     overlay_placement: overlay::Placement,
     /// The meter's width when it was pinned (kept constant while shown).
     overlay_spawn_width: f32,
@@ -244,7 +264,8 @@ impl App {
             Err(e) => app.hotkey_status = (short(&format!("{e:#}")), RED),
         }
         app.hidden = start_hidden;
-        if start_hidden && app.tray.is_none() {
+        app.strip_suppressed = std::env::args().any(|arg| arg == config::MINIMIZED_ARG);
+        if start_hidden && app.tray.is_none() && !app.settings.collapsed {
             // Nowhere to restore it from: show the window after all.
             app.hidden = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
@@ -270,7 +291,7 @@ impl App {
             settings,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            tab: Tab::Mic,
+            page: Page::Voice,
             engine: None,
             status: ("Stopped".into(), MUTED),
             sound_status: ("Ready".into(), Color32::WHITE),
@@ -314,6 +335,7 @@ impl App {
             update_checked_at: None,
             show_release_notes: false,
             overlay_hold: -60.0,
+            strip_suppressed: false,
             overlay_placement: overlay::Placement::default(),
             overlay_spawn_width: overlay::DEFAULT_WIDTH,
             overlay_on_top: overlay::OnTop::default(),
@@ -636,6 +658,12 @@ impl App {
     fn run_command(&mut self, ctx: &egui::Context, command: Command) {
         match command {
             Command::Show => {
+                // Showing the window expands a collapsed OpenMic.
+                if self.settings.collapsed {
+                    self.settings.collapsed = false;
+                    self.touch();
+                }
+                self.strip_suppressed = false;
                 self.hidden = false;
                 ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
@@ -650,9 +678,9 @@ impl App {
                 self.apply_live();
             }
             Command::ToggleRunning => self.toggle_running(),
-            Command::ToggleOverlay => {
-                self.settings.overlay = !self.settings.overlay;
-                self.touch();
+            Command::ToggleCollapse => {
+                let collapse = !self.settings.collapsed;
+                self.set_collapsed(ctx, collapse);
             }
             Command::StopClips => self.stop_clips(),
             Command::PlayPad(path) => {
@@ -733,6 +761,19 @@ impl App {
             Some("Wait for speech to text to finish")
         } else {
             None
+        }
+    }
+
+    /// Swap between the full window and the strip.
+    fn set_collapsed(&mut self, ctx: &egui::Context, collapsed: bool) {
+        if collapsed {
+            self.settings.collapsed = true;
+            self.strip_suppressed = false;
+            self.hidden = true;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.touch();
+        } else {
+            self.run_command(ctx, Command::Show);
         }
     }
 
@@ -998,7 +1039,7 @@ impl App {
         let (muted, bypassed, running) = (self.settings.mute, self.settings.bypass, self.running());
         let listening = self.dictating.is_some();
         if let Some(tray) = &mut self.tray {
-            tray.sync(muted, bypassed, running, listening, self.settings.overlay);
+            tray.sync(muted, bypassed, running, listening, self.settings.collapsed);
         }
 
         if let Some(t) = self.dirty_since
@@ -1036,7 +1077,7 @@ impl eframe::App for App {
         // fps. Hidden, a slow tick still handles device loss and the default
         // mic; tray and hotkey commands wake it immediately.
         let animating = self.engine.is_some() || self.recorder.is_some();
-        let meter_live = self.settings.overlay && self.engine.is_some();
+        let meter_live = self.settings.collapsed && self.engine.is_some();
         let frame_time = match (self.hidden, animating) {
             (true, _) if meter_live => 33,
             (true, _) => 250,
@@ -1050,76 +1091,120 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.capture_hotkey(&ctx);
         self.draw_release_notes(&ctx);
+        self.update_running_status();
 
-        // Footer first so it keeps its place at the bottom of a short window.
-        egui::Panel::bottom("footer").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                // Waiting for a device counts as on: Stop cancels the wait.
-                let running = self.running();
-                let btn = egui::Button::new(if running {
-                    RichText::new("Stop OpenMic").color(Color32::BLACK)
-                } else {
-                    RichText::new("Start OpenMic").color(Color32::BLACK)
-                })
-                .fill(if running { RED } else { GREEN });
-                if ui.add(btn).clicked() {
-                    self.toggle_running();
-                }
-                if let Some(error) = &self.save_error {
-                    ui.label(RichText::new("Settings not saved · retrying…").color(RED))
-                        .on_hover_text(error);
-                } else {
-                    ui.label(RichText::new(&self.status.0).color(self.status.1));
-                }
-            });
-            ui.add_space(2.0);
-        });
+        egui::Panel::left("sidebar")
+            .resizable(false)
+            .exact_size(SIDEBAR_WIDTH)
+            .show(ui, |ui| self.draw_sidebar(ui));
 
         CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("OpenMic");
-                self.draw_version(ui);
-                if cfg!(debug_assertions) {
-                    ui.label(RichText::new("dev build").small().color(AMBER))
-                        .on_hover_text("Built without --release: slower, and never updates itself");
-                }
+                ui.heading(self.page.title());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.draw_update_status(ui);
                 });
             });
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Mic, "Microphone");
-                ui.selectable_value(
-                    &mut self.tab,
-                    Tab::Soundboard,
-                    if self.recorder.is_some() {
-                        "Soundboard · REC"
-                    } else {
-                        "Soundboard"
-                    },
-                );
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-            });
             ui.separator();
-            // The window can be smaller than the content (a short laptop
-            // screen); the tabs scroll, the header and footer stay put.
+            // The window can be shorter than a page (a small laptop
+            // screen): pages scroll, the sidebar stays put.
             ScrollArea::vertical()
-                .id_salt(match self.tab {
-                    Tab::Mic => "mic_tab",
-                    Tab::Soundboard => "sound_tab",
-                    Tab::Settings => "settings_tab",
-                })
+                .id_salt(self.page.title())
                 .auto_shrink([false; 2])
-                .show(ui, |ui| match self.tab {
-                    Tab::Mic => self.draw_mic_tab(ui),
-                    Tab::Soundboard => self.draw_sound_tab(ui),
-                    Tab::Settings => self.draw_settings_tab(ui),
+                .show(ui, |ui| match self.page {
+                    Page::Voice => self.draw_mic_tab(ui),
+                    Page::Soundboard => self.draw_sound_tab(ui),
+                    Page::Record => self.draw_record_page(ui),
+                    Page::Dictation => self.draw_dictation_page(ui),
+                    Page::Settings => self.draw_settings_tab(ui),
                 });
         });
+    }
+}
+
+/// Width of the sidebar, points.
+const SIDEBAR_WIDTH: f32 = 176.0;
+
+impl App {
+    /// Navigation above; below, what matters on every page: whether Discord
+    /// hears you, your level, Mute, Start/Stop and collapsing to the strip.
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("OpenMic").strong().size(17.0));
+            self.draw_version(ui);
+        });
+        if cfg!(debug_assertions) {
+            ui.label(RichText::new("dev build").small().color(AMBER))
+                .on_hover_text("Built without --release: slower, and never updates itself");
+        }
+        ui.add_space(10.0);
+        for page in Page::ALL {
+            let label = match page {
+                Page::Record if self.recorder.is_some() => "Record  ⏺ REC".to_owned(),
+                Page::Dictation if self.dictating.is_some() => "Dictation  • listening".to_owned(),
+                _ => page.title().to_owned(),
+            };
+            let selected = self.page == page;
+            let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
+            let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, text));
+            if response.clicked() {
+                self.page = page;
+            }
+        }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(8.0);
+            self.draw_status_panel(ui);
+        });
+    }
+
+    fn draw_status_panel(&mut self, ui: &mut egui::Ui) {
+        // Laid out bottom-up: the last widget added is the top one.
+        if ui.button("🗕 Collapse to strip").on_hover_text("Swap this window for a thin always-on-top bar").clicked() {
+            let ctx = ui.ctx().clone();
+            self.set_collapsed(&ctx, true);
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let running = self.running();
+            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            let start = egui::Button::new(RichText::new(if running { "Stop" } else { "Start" }).color(Color32::BLACK))
+                .fill(if running { RED } else { GREEN });
+            if ui.add_sized([width, 26.0], start).clicked() {
+                self.toggle_running();
+            }
+            let muted = self.settings.mute;
+            let mute = egui::Button::new(RichText::new(if muted { "Unmute" } else { "Mute" }).color(if muted { Color32::BLACK } else { ui.visuals().text_color() }))
+                .fill(if muted { RED } else { ui.visuals().widgets.inactive.weak_bg_fill });
+            if ui.add_sized([width, 26.0], mute).on_hover_text("Silence your voice; the soundboard still plays").clicked() {
+                self.settings.mute = !muted;
+                self.apply_live();
+            }
+        });
+        ui.add_space(4.0);
+        // What Discord hears.
+        let level = self.engine.as_ref().map(|e| e.stats().out_peak);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+        if let Some(peak) = level {
+            let db = (20.0 * peak.max(1e-6).log10()).clamp(-60.0, 0.0);
+            let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * (db + 60.0) / 60.0, rect.bottom()));
+            let color = if db > -6.0 { RED } else if db > -18.0 { AMBER } else { GREEN };
+            ui.painter().rect_filled(fill, 3.0, color);
+        }
+        ui.add_space(4.0);
+        if let Some(error) = &self.save_error {
+            ui.label(RichText::new("Settings not saved · retrying…").small().color(RED)).on_hover_text(error);
+        }
+        ui.add(egui::Label::new(RichText::new(&self.status.0).small().color(self.status.1)).wrap());
+        let (state, color) = match (self.engine.is_some(), self.settings.mute) {
+            (true, true) => ("Muted", RED),
+            (true, false) => ("Live: Discord hears you", GREEN),
+            (false, _) if self.waiting_for_device => ("Waiting for a device", AMBER),
+            (false, _) => ("Stopped", MUTED),
+        };
+        ui.label(RichText::new(format!("• {state}")).strong().color(color));
     }
 }
 
@@ -1363,23 +1448,26 @@ mod tests {
         texts.iter().find(|(text, _)| text.contains(needle)).map(|(_, rect)| rect)
     }
 
-    /// A 1080p laptop at 150% has about 690 points of height: every tab must
-    /// keep the title and the Start button on screen, at that size and at
-    /// the natural one.
+    /// A 1080p laptop at 150% has about 690 points of height: every page
+    /// must keep the sidebar's navigation and status panel on screen, at
+    /// that size and at the natural one.
     #[test]
-    fn every_tab_keeps_the_header_and_footer_on_screen() {
+    fn every_page_keeps_the_sidebar_and_status_on_screen() {
         for size in [egui::vec2(700.0, 420.0), egui::vec2(760.0, 880.0)] {
-            for tab in [Tab::Mic, Tab::Soundboard, Tab::Settings] {
+            for page in Page::ALL {
                 let mut app = App::stopped(Settings::default());
-                app.tab = tab;
+                app.page = page;
                 let (texts, _) = render(&mut app, size);
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-                for needle in ["OpenMic", "Start OpenMic", "Settings"] {
-                    let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} missing at {size:?}"));
-                    assert!(screen.contains_rect(*rect), "{needle} off screen at {size:?}: {rect:?}");
+                for needle in ["OpenMic", "Voice", "Settings", "• Stopped", "Start", "Mute", "Collapse to strip"] {
+                    let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} missing on {page:?} at {size:?}"));
+                    assert!(screen.contains_rect(*rect), "{needle} off screen on {page:?} at {size:?}: {rect:?}");
+                    assert!(rect.right() < SIDEBAR_WIDTH + 4.0 || needle == "Voice", "{needle} is in the sidebar: {rect:?}");
                 }
-                let start = visible(&texts, "Start OpenMic").unwrap();
-                assert!(start.bottom() > size.y - 40.0, "the footer sits at the bottom: {start:?}");
+                let collapse = visible(&texts, "Collapse to strip").unwrap();
+                assert!(collapse.bottom() > size.y - 40.0, "the status panel sits at the bottom: {collapse:?}");
+                let title = texts.iter().filter(|(t, _)| t == page.title()).map(|(_, r)| r).find(|r| r.left() > SIDEBAR_WIDTH);
+                assert!(title.is_some(), "{page:?} shows its title beside the sidebar");
             }
         }
     }
@@ -1465,6 +1553,46 @@ mod tests {
         assert!(!placed, "the window stays where Windows put it");
     }
 
+    /// egui's built-in fonts lack many symbols (check marks, arrows, most
+    /// emoji), which then draw as empty boxes. Every non-ASCII character in
+    /// the UI code must be one the fonts can draw.
+    #[test]
+    fn every_symbol_in_the_ui_has_a_glyph() {
+        let sources = [
+            ("gui/mod.rs", include_str!("mod.rs")),
+            ("gui/mic_tab.rs", include_str!("mic_tab.rs")),
+            ("gui/mic_test.rs", include_str!("mic_test.rs")),
+            ("gui/overlay.rs", include_str!("overlay.rs")),
+            ("gui/settings_tab.rs", include_str!("settings_tab.rs")),
+            ("gui/sound_tab.rs", include_str!("sound_tab.rs")),
+            ("gui/updates.rs", include_str!("updates.rs")),
+            ("gui/routes.rs", include_str!("routes.rs")),
+            ("widgets.rs", include_str!("../widgets.rs")),
+            ("viz.rs", include_str!("../viz.rs")),
+            ("tray.rs", include_str!("../tray.rs")),
+            // Labels the UI shows for speech models.
+            ("dictation.rs", &include_str!("../dictation.rs")[..include_str!("../dictation.rs").find("// ---- download").unwrap()]),
+        ];
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let mut missing = Vec::new();
+        for (file, source) in sources {
+            for (n, line) in source.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                for ch in code.chars().filter(|c| !c.is_ascii()) {
+                    let drawn = ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), ch));
+                    if !drawn {
+                        missing.push(format!("{file}:{} {ch} (U+{:04X})", n + 1, ch as u32));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "symbols the fonts can't draw:\n{}", missing.join("\n"));
+    }
+
     #[test]
     fn the_checklist_ticks_itself_off_and_can_be_hidden() {
         let mut app = App::stopped(Settings::default());
@@ -1495,7 +1623,7 @@ mod tests {
         let mut app = App::stopped(Settings::default());
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
         assert!(visible(&texts, "Noise reduction").is_some());
-        assert!(visible(&texts, "Mute mic").is_some() && visible(&texts, "Test my mic").is_some());
+        assert!(visible(&texts, "Test my mic").is_some() && visible(&texts, "Headphone monitor").is_some());
         for hidden in ["Voice gate", "Rumble filter", "RNNoise", "voice gate · threshold"] {
             assert!(visible(&texts, hidden).is_none(), "{hidden} is Advanced only");
         }
@@ -1507,15 +1635,26 @@ mod tests {
     }
 
     #[test]
-    fn levels_live_in_the_mixer_and_the_monitor_moved_to_routing() {
-        let mut app = App::stopped(Settings::default());
+    fn routing_lives_in_settings_and_the_voice_page_summarizes_it() {
+        let mut app = App::stopped(Settings { microphone: "Yeti".into(), output: "CABLE Input".into(), ..Settings::default() });
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "MONITOR & LEVELS").is_none(), "the card is gone");
-        let routing = *visible(&texts, "ROUTING").unwrap();
-        let processing = *visible(&texts, "PROCESSING").unwrap();
-        let monitor = *visible(&texts, "Headphone monitor").unwrap();
-        assert!(monitor.top() > routing.top() && monitor.bottom() < processing.top(), "in Routing");
-        assert!(visible(&texts, "Pin meter to screen").is_some());
+        assert!(visible(&texts, "MONITOR & LEVELS").is_none() && visible(&texts, "ROUTING").is_none());
+        assert!(visible(&texts, "Mic: Yeti  ·  Output: CABLE Input").is_some(), "one line saying where your voice goes");
+        assert!(visible(&texts, "Headphone monitor").is_some(), "the monitor is a Voice control");
+
+        app.page = Page::Settings;
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "ROUTING").is_some() && visible(&texts, "HOTKEYS").is_some());
+        assert!(visible(&texts, "SPEECH TO TEXT").is_none(), "dictation has its own page");
+        app.page = Page::Dictation;
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "SPEECH TO TEXT").is_some() && visible(&texts, "Shortcut").is_some());
+        app.page = Page::Record;
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "RECORD A CLIP").is_some());
+        app.page = Page::Soundboard;
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
+        assert!(visible(&texts, "RECORD A CLIP").is_none(), "recording has its own page");
     }
 
     #[test]
@@ -1554,7 +1693,7 @@ mod tests {
         let (_, output) = render(&mut app, egui::vec2(760.0, 880.0));
         let tree = output.platform_output.accesskit_update.expect("accessibility tree");
         let labels: Vec<String> = tree.nodes.iter().filter_map(|(_, node)| node.label().map(str::to_owned)).collect();
-        for control in ["Start OpenMic", "Microphone", "Soundboard", "Settings"] {
+        for control in ["Start", "Mute", "Voice", "Soundboard", "Record", "Dictation", "Settings", "Collapse to strip"] {
             assert!(labels.iter().any(|l| l.contains(control)), "{control} has no accessible name: {labels:?}");
         }
     }

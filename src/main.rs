@@ -42,8 +42,9 @@ fn main() -> eframe::Result<()> {
     ));
     let settings = config::Settings::load();
     // Windows startup launches straight into the notification area.
-    let start_hidden = settings.close_to_tray
-        && std::env::args().any(|arg| arg == config::MINIMIZED_ARG);
+    // (A collapsed OpenMic opens as the strip, with the window hidden.)
+    let start_hidden = (settings.close_to_tray && std::env::args().any(|arg| arg == config::MINIMIZED_ARG))
+        || settings.collapsed;
     let icon = egui::IconData {
         rgba: icon::rgba(64, false),
         width: 64,

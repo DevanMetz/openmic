@@ -9,6 +9,8 @@ use crate::widgets;
 
 impl App {
     pub(super) fn draw_settings_tab(&mut self, ui: &mut egui::Ui) {
+        self.draw_routing(ui);
+        ui.add_space(8.0);
         let hotkeys_ok = self.hotkeys.is_some();
         widgets::card(
             ui,
@@ -64,8 +66,6 @@ impl App {
                 }
             },
         );
-        ui.add_space(8.0);
-        self.draw_speech_card(ui);
         ui.add_space(8.0);
 
         let tray_ok = self.tray.is_some();
@@ -133,6 +133,25 @@ impl App {
         });
     }
 
+    /// Speech to text: the model, how the shortcut works, and the result.
+    pub(super) fn draw_dictation_page(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Shortcut").weak());
+            let waiting = self.capturing.as_ref() == Some(&Binding::Dictate);
+            let current = self.settings.hotkeys.dictate.clone();
+            ui.label(if waiting {
+                RichText::new("Press keys…").color(CYAN)
+            } else {
+                RichText::new(current.as_deref().unwrap_or("Not set")).monospace()
+            });
+            if !waiting && ui.button("Set…").clicked() {
+                self.start_capture(Binding::Dictate);
+            }
+        });
+        ui.add_space(8.0);
+        self.draw_speech_card(ui);
+    }
+
     fn draw_speech_card(&mut self, ui: &mut egui::Ui) {
         widgets::card(
             ui,
@@ -149,7 +168,7 @@ impl App {
                         .show_ui(ui, |ui| {
                             for model in SpeechModel::ALL {
                                 let text = if model.is_downloaded() {
-                                    format!("{} ✔", model.label())
+                                    format!("{} · downloaded", model.label())
                                 } else {
                                     model.label().to_owned()
                                 };

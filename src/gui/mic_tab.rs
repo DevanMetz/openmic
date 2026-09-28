@@ -7,7 +7,7 @@ use std::time::Duration;
 use eframe::egui::{self, ComboBox, RichText};
 
 use super::routes::{cable_input, VB_CABLE_URL};
-use super::{open_url, volume_slider, App, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
+use super::{open_url, volume_slider, App, AMBER, CYAN, GREEN, MUTED, VIOLET};
 use crate::config::{self, Processing};
 use crate::denoise::ModelState;
 use crate::dsp::Model;
@@ -31,12 +31,11 @@ impl App {
             self.draw_checklist(ui);
             ui.add_space(8.0);
         }
-        self.draw_routing(ui);
+        self.draw_route_summary(ui);
         ui.add_space(8.0);
         self.draw_processing(ui);
         ui.add_space(8.0);
         self.draw_scope(ui);
-        self.update_running_status();
     }
 
     // ---- first-run checklist ----------------------------------------------
@@ -76,8 +75,7 @@ impl App {
                 let current = steps.iter().position(|(_, done)| !done);
                 for (i, (step, done)) in steps.into_iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let (mark, color) = if done { ("✔".to_owned(), GREEN) } else { (format!("{}", i + 1), MUTED) };
-                        ui.add_sized([18.0, 18.0], egui::Label::new(RichText::new(mark).strong().color(color)));
+                        step_mark(ui, i + 1, done);
                         let active = current == Some(i);
                         let title = RichText::new(step_title(step, self.settings.default_mic));
                         ui.label(if done { title.weak() } else if active { title.strong() } else { title });
@@ -187,10 +185,9 @@ impl App {
             });
     }
 
-    fn draw_routing(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn draw_routing(&mut self, ui: &mut egui::Ui) {
         let cable = cable_input(&self.outputs).is_some();
         let mut refresh = false;
-        let mut reopen = false;
         widgets::card(
             ui,
             "ROUTING",
@@ -215,23 +212,6 @@ impl App {
                         changed |= combo(ui, id, field, pool).changed();
                         ui.end_row();
                     }
-                    // The headphone monitor plays on the monitor output.
-                    ui.label("");
-                    ui.horizontal(|ui| {
-                        let toggled = widgets::pill(ui, &mut self.settings.monitor, "Headphone monitor", CYAN)
-                            .on_hover_text("Hear the processed voice yourself (use headphones)")
-                            .changed();
-                        // The monitor device wasn't connected when processing
-                        // started; open it now.
-                        reopen = toggled
-                            && self.settings.monitor
-                            && self.engine.as_ref().is_some_and(|e| !e.has_monitor());
-                        ui.add_space(8.0);
-                        if volume_slider(ui, &mut self.settings.monitor_volume) || toggled {
-                            self.apply_live();
-                        }
-                    });
-                    ui.end_row();
                 });
                 if changed {
                     self.touch();
@@ -246,8 +226,28 @@ impl App {
         if refresh {
             self.refresh_devices(true);
         }
-        if reopen {
-            self.restart_engine();
+    }
+
+    /// Where your voice goes, in one line, with any routing problem below.
+    /// The devices themselves are chosen under Settings.
+    fn draw_route_summary(&mut self, ui: &mut egui::Ui) {
+        let s = &self.settings;
+        let mic = if s.microphone.is_empty() { "No microphone" } else { &s.microphone };
+        let output = if s.output.is_empty() { "no output" } else { &s.output };
+        let mut open_settings = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Mic: {mic}  ·  Output: {output}")).weak());
+            open_settings = ui.small_button("Change").on_hover_text("Choose devices under Settings").clicked();
+        });
+        if open_settings {
+            self.page = super::Page::Settings;
+        }
+        // A wrong output or missing VB-Cable needs attention here, not only
+        // under Settings.
+        let cable = cable_input(&self.outputs).cloned();
+        if cable.as_ref().is_none_or(|c| self.settings.output != *c) {
+            ui.add_space(4.0);
+            self.draw_cable_hint(ui);
         }
     }
 
@@ -258,6 +258,7 @@ impl App {
         // Which setting the pointer is on, so the scope can highlight it.
         let mut focus = None;
         let mut reset = false;
+        let mut reopen = false;
         let advanced = self.settings.advanced;
         let mut view = advanced;
         widgets::card(
@@ -323,10 +324,7 @@ impl App {
                                 "Fade out anything quieter than a set level"),
                         ]);
                     }
-                    pills.extend([
-                        (&mut s.bypass, "Bypass", MUTED, None, "Send your raw microphone, unprocessed"),
-                        (&mut s.mute, "Mute mic", RED, None, "Silence your voice; the soundboard still plays"),
-                    ]);
+                    pills.push((&mut s.bypass, "Bypass", MUTED, None, "Send your raw microphone, unprocessed"));
                     for (on, text, color, target, tip) in pills {
                         let r = widgets::pill(ui, on, text, color).on_hover_text(tip);
                         if r.hovered() {
@@ -336,9 +334,24 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let toggled = widgets::pill(ui, &mut self.settings.monitor, "Headphone monitor", CYAN)
+                        .on_hover_text("Hear the processed voice yourself on the monitor output (use headphones)")
+                        .changed();
+                    // The monitor device wasn't connected when processing
+                    // started; open it now.
+                    reopen = toggled && self.settings.monitor && self.engine.as_ref().is_some_and(|e| !e.has_monitor());
+                    if volume_slider(ui, &mut self.settings.monitor_volume) || toggled {
+                        self.apply_live();
+                    }
+                });
+                ui.add_space(6.0);
                 self.draw_mic_test(ui);
             },
         );
+        if reopen {
+            self.restart_engine();
+        }
         if view != self.settings.advanced {
             self.settings.advanced = view;
             self.touch();
@@ -361,16 +374,13 @@ impl App {
 
     fn draw_scope(&mut self, ui: &mut egui::Ui) {
         let snapshot = self.engine.as_ref().map(Engine::stats);
-        let mut pinned = self.settings.overlay;
         let advanced = self.settings.advanced;
         widgets::card(
             ui,
             "LIVE SCOPE",
             CYAN,
             |ui| {
-                ui.checkbox(&mut pinned, "Pin meter to screen").on_hover_text(
-                    "A small level meter that stays on top of other windows, even with OpenMic in the tray",
-                );
+                ui.weak("drag or scroll the lines to adjust");
             },
             |ui| {
                 let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
@@ -398,14 +408,10 @@ impl App {
                 }
             },
         );
-        if pinned != self.settings.overlay {
-            self.settings.overlay = pinned;
-            self.touch();
-        }
     }
 
     /// The footer's "Running · voice 42%", unless a warning is showing.
-    fn update_running_status(&mut self) {
+    pub(super) fn update_running_status(&mut self) {
         let Some(stats) = self.engine.as_ref().map(Engine::stats) else { return };
         let warning_fresh = self
             .warn_until
@@ -510,6 +516,22 @@ pub(super) fn combo(ui: &mut egui::Ui, id: usize, value: &mut String, pool: &[St
         response.mark_changed();
     }
     response
+}
+
+/// A checklist step's marker: its number in a ring, or a check in a
+/// filled circle once done. Drawn, because egui's fonts have no check mark.
+fn step_mark(ui: &mut egui::Ui, number: usize, done: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    let center = rect.center();
+    let painter = ui.painter();
+    if done {
+        painter.circle_filled(center, 8.0, GREEN);
+        let tick = [center + egui::vec2(-4.0, 0.0), center + egui::vec2(-1.0, 3.0), center + egui::vec2(4.5, -3.5)];
+        painter.add(egui::Shape::line(tick.to_vec(), egui::Stroke::new(2.0, egui::Color32::from_gray(18))));
+    } else {
+        painter.circle_stroke(center, 8.0, egui::Stroke::new(1.0, MUTED));
+        painter.text(center, egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::proportional(11.0), MUTED);
+    }
 }
 
 fn step_title(step: Step, default_mic: bool) -> &'static str {

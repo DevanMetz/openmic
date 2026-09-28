@@ -264,7 +264,7 @@ impl App {
                             .add(egui::Button::new(RichText::new("Stop recording").color(Color32::BLACK)).fill(RED))
                             .clicked();
                         let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) * 4.0).sin() as f32;
-                        ui.label(RichText::new("●").color(RED.gamma_multiply(pulse)));
+                        ui.label(RichText::new("⏺").color(RED.gamma_multiply(pulse)));
                         ui.label(RichText::new(clock_time(elapsed)).color(RED).monospace());
                         ui.weak(format!("· {}", file_size(recorder.bytes())));
                     });
@@ -300,7 +300,7 @@ impl App {
                 } else {
                     ui.horizontal(|ui| {
                         start = ui
-                            .add(egui::Button::new(RichText::new("●  Record").color(Color32::BLACK)).fill(RED))
+                            .add(egui::Button::new(RichText::new("⏺  Record").color(Color32::BLACK)).fill(RED))
                             .clicked();
                         ui.weak("Recording stays on this computer.");
                     });
@@ -350,6 +350,10 @@ impl App {
                 self.assign_hotkey(&Binding::Pad(pad.path.clone()), None);
             }
         });
+        let mut starred = pad.starred;
+        if ui.checkbox(&mut starred, "Show on the strip").changed() {
+            self.toggle_star(index);
+        }
         ui.separator();
         self.trim_editor(ui, index);
         ui.separator();
@@ -364,6 +368,13 @@ impl App {
     fn pad_length(&mut self, path: &Path) -> Option<f32> {
         let from_header = *self.pad_durations.entry(path.to_owned()).or_insert_with(|| crate::decode::duration(path));
         from_header.or_else(|| self.clip_cache.get(path).map(|s| s.len() as f32 / crate::dsp::SR as f32))
+    }
+
+    fn toggle_star(&mut self, index: usize) {
+        if let Some(pad) = self.settings.sounds.get_mut(index) {
+            pad.starred = !pad.starred;
+            self.touch();
+        }
     }
 
     /// Move the pad at `from` to `to` (both board positions).
@@ -450,9 +461,15 @@ impl App {
         }
     }
 
+    /// Record a clip from the microphone or computer audio.
+    pub(super) fn draw_record_page(&mut self, ui: &mut egui::Ui) {
+        ui.weak("Record your microphone or what's playing on your computer, then save it or add it to your pads.");
+        ui.add_space(8.0);
+        self.draw_recording(ui);
+    }
+
     pub(super) fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Your soundboard").size(22.0).strong());
-        ui.weak("Click a pad to play it, or record a new clip below.");
+        ui.weak("Click a pad to play it. Star pads to put them on the strip.");
         if self.engine.is_none() && !self.settings.sounds.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -472,9 +489,6 @@ impl App {
             );
         }
         ui.add_space(12.0);
-
-        self.draw_recording(ui);
-        ui.add_space(10.0);
 
         let sounds = self.settings.sounds.clone();
         let mut add_header = false;
@@ -562,11 +576,14 @@ impl App {
                                             progress: self.pad_progress.get(&key).copied(),
                                             length: length.map(|full| trimmed_length(full, pad.start, pad.end)),
                                             hotkey: pad.hotkey.as_deref(),
+                                            starred: pad.starred,
                                             capturing: self.capturing
                                                 == Some(Binding::Pad(pad.path.clone())),
                                         };
-                                        let (play, remove) = clip_pad(ui, i, &pad.path, width, state);
-                                        if play.clicked() {
+                                        let (play, remove, star) = clip_pad(ui, i, &pad.path, width, state);
+                                        if star.clicked() {
+                                            self.toggle_star(i);
+                                        } else if play.clicked() {
                                             self.play_clip(i);
                                         }
                                         if remove.clicked() {
@@ -684,7 +701,7 @@ fn is_silent(peaks: &[f32]) -> bool {
 }
 
 /// A pad's display name: its file name without the extension.
-fn pad_name(path: &Path) -> String {
+pub(super) fn pad_name(path: &Path) -> String {
     path.file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| file_name(path))
@@ -724,6 +741,8 @@ struct PadState<'a> {
     /// How long the pad plays, seconds (after trimming).
     length: Option<f32>,
     hotkey: Option<&'a str>,
+    /// Shown on the collapsed strip.
+    starred: bool,
     /// Waiting for the user to press this pad's new hotkey.
     capturing: bool,
 }
@@ -734,7 +753,7 @@ fn clip_pad(
     path: &Path,
     width: f32,
     state: PadState,
-) -> (egui::Response, egui::Response) {
+) -> (egui::Response, egui::Response, egui::Response) {
     let playing = state.playing;
     let name = pad_name(path);
     let format = path
@@ -755,6 +774,11 @@ fn clip_pad(
         ui.id().with(("sound_play", index)),
         egui::Sense::click_and_drag(),
     );
+    let star_rect = egui::Rect::from_center_size(egui::pos2(play_rect.right() - 13.0, rect.top() + 13.0), egui::vec2(20.0, 20.0));
+    let star_response = ui.interact(star_rect, ui.id().with(("sound_star", index)), egui::Sense::click());
+    star_response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), state.starred, format!("Show {name} on the strip"))
+    });
     // Another pad is being dragged over this one: it will land here.
     let drop_here = play_response.dnd_hover_payload::<usize>().is_some_and(|from| *from != index);
     let remove_response = ui.interact(
@@ -906,6 +930,22 @@ fn clip_pad(
             visuals.weak_text_color()
         },
     );
+    // Starred pads show on the strip; the outline star appears on hover.
+    if state.starred || play_response.hovered() || star_response.hovered() {
+        let color = if state.starred { AMBER } else if star_response.hovered() { visuals.text_color() } else { visuals.weak_text_color() };
+        painter.text(
+            star_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if state.starred { "★" } else { "☆" },
+            egui::FontId::proportional(15.0),
+            color,
+        );
+    }
+    let star_response = star_response.on_hover_text(if state.starred {
+        "On the strip: click to remove"
+    } else {
+        "Show this pad on the strip"
+    });
     let play_response = play_response.on_hover_text(format!(
         "Click to play, drag to reorder, right-click for volume, hotkey and trim\n{}",
         path.display()
@@ -914,7 +954,7 @@ fn clip_pad(
         "Remove {} from the soundboard. The file stays on disk.",
         file_name(path)
     ));
-    (play_response, remove_response)
+    (play_response, remove_response, star_response)
 }
 
 #[cfg(test)]
@@ -939,7 +979,8 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    responses = Some(clip_pad(ui, 0, &path, 240.0, PadState::default()));
+                    let (play, remove, _) = clip_pad(ui, 0, &path, 240.0, PadState::default());
+                    responses = Some((play, remove));
                 },
             );
             responses.unwrap()
@@ -1060,7 +1101,7 @@ mod tests {
         };
         settings.sounds[3].start = 1.0; // 3.5 s trimmed to 2.5 s
         let mut app = App::stopped(settings);
-        app.tab = super::super::Tab::Soundboard;
+        app.page = super::super::Page::Soundboard;
         let ctx = egui::Context::default();
         board(&mut app, &ctx, Vec::new());
         let texts = board(&mut app, &ctx, Vec::new());
@@ -1082,7 +1123,7 @@ mod tests {
             ..Default::default()
         };
         let mut app = App::stopped(settings);
-        app.tab = super::super::Tab::Soundboard;
+        app.page = super::super::Page::Soundboard;
         let ctx = egui::Context::default();
         board(&mut app, &ctx, Vec::new());
         // Where the pads landed: find each title's position.

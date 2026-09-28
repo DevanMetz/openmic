@@ -181,7 +181,7 @@ impl App {
                 self.start_mic_test();
             }
             if self.mic_test.raw.is_some() && !self.mic_test.recording() {
-                for (version, label) in [(Version::Raw, "▶ Raw"), (Version::Cleaned, "▶ Cleaned")] {
+                for (version, label) in [(Version::Raw, "⏵ Raw"), (Version::Cleaned, "⏵ Cleaned")] {
                     let playing = self.mic_test.player.as_ref().is_some_and(|(_, v)| *v == version);
                     if ui.selectable_label(playing, label).clicked() {
                         if playing {
