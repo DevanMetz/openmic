@@ -131,6 +131,7 @@ impl App {
                 self.touch();
             }
         }
+        self.overlay_on_top.tick(std::time::Instant::now(), foreground(), raise_meter);
         for action in actions {
             match action {
                 Action::ToggleMute => self.run_command(ctx, Command::ToggleMute),
@@ -140,6 +141,78 @@ impl App {
         }
     }
 }
+
+/// Keeps the meter above other always-on-top windows. Windows raises the
+/// taskbar again whenever another window comes to the front, so a meter
+/// placed on the taskbar vanished under it when you clicked elsewhere.
+/// Re-assert the meter's place when the foreground window changes, and
+/// every couple of seconds in case something else rose above it.
+#[derive(Debug, Default)]
+pub(super) struct OnTop {
+    foreground: Option<isize>,
+    raised_at: Option<std::time::Instant>,
+}
+
+const RAISE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl OnTop {
+    /// Calls `raise` when the foreground window changed or it's been a while.
+    fn tick(&mut self, now: std::time::Instant, foreground: Option<isize>, raise: impl FnOnce()) {
+        let changed = foreground != self.foreground;
+        let due = self.raised_at.is_none_or(|at| now.duration_since(at) >= RAISE_EVERY);
+        if changed || due {
+            self.foreground = foreground;
+            self.raised_at = Some(now);
+            raise();
+        }
+    }
+}
+
+/// The window in front, as a handle value.
+#[cfg(windows)]
+fn foreground() -> Option<isize> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    // SAFETY: no arguments; returns a handle or null.
+    let window = unsafe { GetForegroundWindow() };
+    (!window.is_invalid()).then_some(window.0 as isize)
+}
+
+#[cfg(not(windows))]
+fn foreground() -> Option<isize> {
+    None
+}
+
+/// Put the meter back at the top of the always-on-top windows, without
+/// taking focus from whatever you're using.
+#[cfg(windows)]
+fn raise_meter() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowThreadProcessId, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSIZE, SetWindowPos,
+    };
+    use windows::core::w;
+    // SAFETY: plain Win32 calls on a window we check belongs to this process.
+    unsafe {
+        let Ok(meter) = FindWindowW(None, w!("OpenMic level")) else { return };
+        let mut pid = 0;
+        GetWindowThreadProcessId(meter, Some(&mut pid));
+        if pid != std::process::id() {
+            return;
+        }
+        let _ = SetWindowPos(
+            meter,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn raise_meter() {}
 
 fn to_db(peak: f32) -> f32 {
     (20.0 * peak.max(1e-6).log10()).clamp(FLOOR, 0.0)
@@ -421,6 +494,20 @@ mod tests {
         assert_eq!(Placement::default().step(None, outer, Some(1.0)), (None, false));
         // No window yet: wait.
         assert_eq!(Placement::default().step(Some([1, 1]), None, Some(1.0)), (None, false));
+    }
+
+    #[test]
+    fn the_meter_is_raised_when_another_window_comes_to_the_front() {
+        let mut on_top = OnTop::default();
+        let start = std::time::Instant::now();
+        let mut raised = 0;
+        let mut tick = |at: std::time::Duration, foreground| on_top.tick(start + at, foreground, || raised += 1);
+        tick(std::time::Duration::ZERO, Some(1));
+        tick(std::time::Duration::from_millis(250), Some(1));
+        tick(std::time::Duration::from_millis(500), Some(2)); // clicked another window
+        tick(std::time::Duration::from_millis(750), Some(2));
+        tick(std::time::Duration::from_millis(2600), Some(2)); // periodic
+        assert_eq!(raised, 3);
     }
 
     #[test]

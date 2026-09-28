@@ -186,6 +186,7 @@ pub struct App {
     overlay_placement: overlay::Placement,
     /// The meter's width when it was pinned (kept constant while shown).
     overlay_spawn_width: f32,
+    overlay_on_top: overlay::OnTop,
     update_error: Option<String>,
 }
 
@@ -299,6 +300,7 @@ impl App {
             overlay_hold: -60.0,
             overlay_placement: overlay::Placement::default(),
             overlay_spawn_width: overlay::DEFAULT_WIDTH,
+            overlay_on_top: overlay::OnTop::default(),
             update_error: None,
         }
     }
