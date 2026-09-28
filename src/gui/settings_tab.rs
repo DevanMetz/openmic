@@ -9,8 +9,6 @@ use crate::widgets;
 
 impl App {
     pub(super) fn draw_settings_tab(&mut self, ui: &mut egui::Ui) {
-        self.draw_routing(ui);
-        ui.add_space(8.0);
         let hotkeys_ok = self.hotkeys.is_some();
         widgets::card(
             ui,

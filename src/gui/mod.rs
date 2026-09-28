@@ -1715,16 +1715,20 @@ mod tests {
     }
 
     #[test]
-    fn routing_lives_in_settings_and_the_voice_page_summarizes_it() {
+    fn routing_is_on_the_voice_page_above_the_settings() {
         let mut app = App::stopped(Settings { microphone: "Yeti".into(), output: "CABLE Input".into(), ..Settings::default() });
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "MONITOR & LEVELS").is_none() && visible(&texts, "ROUTING").is_none());
-        assert!(visible(&texts, "Mic: Yeti  ·  Output: CABLE Input").is_some(), "one line saying where your voice goes");
+        let routing = *visible(&texts, "ROUTING").expect("routing on the Voice page");
+        let rows = *visible(&texts, "YOUR VOICE, STEP BY STEP").unwrap();
+        assert!(routing.top() < rows.top(), "devices first, then what happens to your voice");
+        for label in ["Microphone", "Processed output", "Monitor output"] {
+            assert!(visible(&texts, label).is_some(), "{label} chooser missing");
+        }
         assert!(visible(&texts, "Hear yourself").is_some(), "the monitor is a Voice control");
 
         app.page = Page::Settings;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "ROUTING").is_some() && visible(&texts, "HOTKEYS").is_some());
+        assert!(visible(&texts, "ROUTING").is_none() && visible(&texts, "HOTKEYS").is_some());
         assert!(visible(&texts, "SPEECH TO TEXT").is_none(), "dictation has its own page");
         app.page = Page::Dictation;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));

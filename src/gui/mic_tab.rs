@@ -1,5 +1,6 @@
-//! Voice page: first-run checklist, where your voice goes, presets and the
-//! mic test, and each setting as a row that shows what it does.
+//! Voice page: first-run checklist, routing (which devices your voice
+//! comes from and goes to), presets and the mic test, and each setting as a
+//! row that shows what it does.
 
 use std::time::Duration;
 
@@ -29,7 +30,7 @@ impl App {
             self.draw_checklist(ui);
             ui.add_space(8.0);
         }
-        self.draw_route_summary(ui);
+        self.draw_routing(ui);
         ui.add_space(8.0);
         self.draw_presets(ui);
         ui.add_space(8.0);
@@ -183,7 +184,7 @@ impl App {
             });
     }
 
-    pub(super) fn draw_routing(&mut self, ui: &mut egui::Ui) {
+    fn draw_routing(&mut self, ui: &mut egui::Ui) {
         let cable = cable_input(&self.outputs).is_some();
         let mut refresh = false;
         widgets::card(
@@ -223,31 +224,6 @@ impl App {
         );
         if refresh {
             self.refresh_devices(true);
-        }
-    }
-
-    /// Where your voice goes, in one line, with any routing problem below.
-    /// The devices themselves are chosen under Settings.
-    fn draw_route_summary(&mut self, ui: &mut egui::Ui) {
-        let s = &self.settings;
-        let mic = if s.microphone.is_empty() { "No microphone" } else { &s.microphone };
-        let output = if s.output.is_empty() { "no output" } else { &s.output };
-        let mut open_settings = false;
-        ui.horizontal(|ui| {
-            // Long device names are cut short rather than widening the page.
-            open_settings = ui.small_button("Change").on_hover_text("Choose devices under Settings").clicked();
-            let route = format!("Mic: {mic}  ·  Output: {output}");
-            ui.add(egui::Label::new(RichText::new(&route).weak()).truncate()).on_hover_text(route);
-        });
-        if open_settings {
-            self.page = super::Page::Settings;
-        }
-        // A wrong output or missing VB-Cable needs attention here, not only
-        // under Settings.
-        let cable = cable_input(&self.outputs).cloned();
-        if cable.as_ref().is_none_or(|c| self.settings.output != *c) {
-            ui.add_space(4.0);
-            self.draw_cable_hint(ui);
         }
     }
 

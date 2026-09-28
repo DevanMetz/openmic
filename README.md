@@ -76,7 +76,7 @@ The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your 
 
 ## Devices that connect late
 
-OpenMic keeps saved microphone and monitor choices when they are missing at launch. With **Start processing automatically** enabled, or after you click **Start**, it waits for all selected devices to connect. The processed output returns to VB-Cable at launch whenever it is available. **Stop** cancels the wait; connecting a device afterwards does not restart processing. Use **Refresh** under **Settings → Routing** to replace a missing device with an available one.
+OpenMic keeps saved microphone and monitor choices when they are missing at launch. With **Start processing automatically** enabled, or after you click **Start**, it waits for all selected devices to connect. The processed output returns to VB-Cable at launch whenever it is available. **Stop** cancels the wait; connecting a device afterwards does not restart processing. Use **Refresh** under **Routing** on the **Voice** page to replace a missing device with an available one.
 
 If a device is unplugged while processing, OpenMic shows **reconnecting…** and starts again as soon as it is back; VB-Cable stays your default microphone meanwhile. **Stop** cancels the wait. Use **Refresh** if you want to select a different device or its name has changed. The headphone monitor only needs to be connected while **Headphone monitor** is on.
 
@@ -92,7 +92,7 @@ The **Voice** page lists each setting as a row, in the order your voice passes t
 | **Only my voice** | The voice gate: silent when you're not talking; green shows when your voice gets through. Lower the line if quiet words get cut off, raise it if noise gets through | The line, up or down | 1% |
 | **Quiet cut-off** | The level gate: mutes anything below the dashed line | The line, up or down | 1 dB |
 | **To Discord** | Output gain: how loud Discord hears you | Up or down | 0.5 dB |
-| **Hear yourself** | The headphone monitor, on the monitor output chosen under **Settings → Routing**; use headphones to prevent feedback | Volume, left or right | 1% |
+| **Hear yourself** | The headphone monitor, on the monitor output chosen under **Routing**; use headphones to prevent feedback | Volume, left or right | 1% |
 
 Pick a starting point from the preset chips above the rows (**Balanced**, **Mechanical keyboard**, **Quiet room**, **Noisy room**, **Low CPU**). **+** saves your current settings as a preset; right-click a saved one to delete it. Click the model name under **Remove noise** to switch between DeepFilterNet and RNNoise. **Bypass** sends your raw microphone with none of the settings. OpenMic reopens at the size and place you left it.
 
