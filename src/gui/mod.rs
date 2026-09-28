@@ -1431,13 +1431,38 @@ mod tests {
         if on_a_monitor([3900, 150]) {
             assert!(moved.contains(&ViewportCommand::OuterPosition(egui::pos2(2600.0, 100.0))), "{moved:?}");
         } else {
-            assert!(moved.is_empty(), "a position on a monitor that's gone is ignored");
+            let placed = moved.iter().any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
+            assert!(!placed, "a position on a monitor that's gone is ignored: {moved:?}");
         }
         for _ in 0..6 {
             frame_at(&mut app, egui::pos2(400.0, 300.0));
         }
         assert_eq!(app.settings.window_position, Some([600, 450]), "saved in screen pixels");
         assert_eq!(app.settings.window_size, Some([744.0, 842.0]), "and the size in points");
+    }
+
+    #[test]
+    fn a_saved_position_off_every_monitor_is_ignored() {
+        use eframe::App as _;
+        assert!(!on_a_monitor([-100_000, -100_000]) || !cfg!(windows));
+        let mut app = App::stopped(Settings { window_position: Some([-100_000, -100_000]), ..Settings::default() });
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let info = egui::ViewportInfo {
+            native_pixels_per_point: Some(1.0),
+            outer_rect: Some(egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(760.0, 880.0))),
+            inner_rect: Some(egui::Rect::from_min_size(egui::pos2(58.0, 80.0), egui::vec2(744.0, 842.0))),
+            ..Default::default()
+        };
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(egui::ViewportId::ROOT, info);
+        let output = ctx.run_ui(input, |ui| app.logic(ui.ctx(), &mut frame));
+        let placed = output
+            .viewport_output
+            .values()
+            .flat_map(|v| &v.commands)
+            .any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
+        assert!(!placed, "the window stays where Windows put it");
     }
 
     #[test]
