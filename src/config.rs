@@ -56,6 +56,8 @@ pub struct Settings {
     /// OpenMic is collapsed to the strip (the main window hidden); it
     /// reopens that way.
     pub collapsed: bool,
+    /// The window's minimize button collapses to the strip.
+    pub minimize_to_strip: bool,
     /// Where the pinned meter was last dragged to, in screen pixels (the
     /// same on monitors with different scaling).
     pub overlay_position: Option<[i32; 2]>,
@@ -107,6 +109,7 @@ impl Default for Settings {
             dictation_hold: true,
             check_for_updates: true,
             collapsed: false,
+            minimize_to_strip: true,
             overlay_position: None,
             strip_width: None,
             advanced: false,

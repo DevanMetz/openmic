@@ -216,6 +216,8 @@ pub struct App {
     overlay_on_top: overlay::OnTop,
     /// Puts the main window back where it was last time.
     window_placement: overlay::Placement,
+    /// The window was minimized last frame (to catch the moment it is).
+    was_minimized: bool,
     mic_test: mic_test::MicTest,
     update_error: Option<String>,
 }
@@ -337,6 +339,7 @@ impl App {
             overlay_spawn_width: overlay::DEFAULT_WIDTH,
             overlay_on_top: overlay::OnTop::default(),
             window_placement: overlay::Placement::default(),
+            was_minimized: false,
             mic_test: mic_test::MicTest::default(),
             update_error: None,
         }
@@ -761,6 +764,18 @@ impl App {
         }
     }
 
+    /// The minimize button collapses to the strip. Only the moment the
+    /// window becomes minimized counts: Windows can still report it
+    /// minimized for a frame after the strip expands it again.
+    fn minimize_to_strip(&mut self, ctx: &egui::Context) {
+        let minimized = ctx.input(|i| i.viewport().minimized) == Some(true);
+        let just_minimized = minimized && !self.was_minimized;
+        self.was_minimized = minimized;
+        if just_minimized && !self.hidden && self.settings.minimize_to_strip {
+            self.set_collapsed(ctx, true);
+        }
+    }
+
     /// Swap between the full window and the strip.
     fn set_collapsed(&mut self, ctx: &egui::Context, collapsed: bool) {
         if collapsed {
@@ -1068,6 +1083,7 @@ impl eframe::App for App {
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
+        self.minimize_to_strip(ctx);
         self.remember_window(ctx);
         self.show_overlay(ctx);
         // The live scope, the recorder and the pinned meter animate at ~30
@@ -1588,6 +1604,43 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "symbols the fonts can't draw:\n{}", missing.join("\n"));
+    }
+
+    #[test]
+    fn minimizing_collapses_to_the_strip_once() {
+        use eframe::App as _;
+        let mut app = App::stopped(Settings::default());
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut frame_with = |app: &mut App, minimized: bool| {
+            let info = egui::ViewportInfo { minimized: Some(minimized), ..Default::default() };
+            let mut input = egui::RawInput::default();
+            input.viewports.insert(egui::ViewportId::ROOT, info);
+            let output = ctx.run_ui(input, |ui| app.logic(ui.ctx(), &mut frame));
+            output.viewport_output.into_values().flat_map(|v| v.commands).collect::<Vec<_>>()
+        };
+        frame_with(&mut app, false);
+        let commands = frame_with(&mut app, true);
+        assert!(app.settings.collapsed && app.hidden, "minimize collapsed it");
+        assert!(commands.contains(&ViewportCommand::Visible(false)));
+
+        // Expanding restores the window; a stale "minimized" doesn't re-collapse.
+        app.commands.0.send(Command::Show).unwrap();
+        let commands = frame_with(&mut app, true);
+        assert!(commands.contains(&ViewportCommand::Minimized(false)), "{commands:?}");
+        assert!(!app.settings.collapsed && !app.hidden);
+        frame_with(&mut app, true);
+        assert!(!app.settings.collapsed, "no flip-flop while Windows catches up");
+        frame_with(&mut app, false);
+        frame_with(&mut app, true);
+        assert!(app.settings.collapsed, "minimizing again collapses again");
+
+        // Switched off: minimize is just minimize.
+        app.commands.0.send(Command::Show).unwrap();
+        frame_with(&mut app, false);
+        app.settings.minimize_to_strip = false;
+        frame_with(&mut app, true);
+        assert!(!app.settings.collapsed);
     }
 
     #[test]

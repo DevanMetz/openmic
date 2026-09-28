@@ -105,6 +105,13 @@ impl App {
                 } else {
                     "Closing the window quits OpenMic."
                 });
+                if ui
+                    .checkbox(&mut self.settings.minimize_to_strip, "Minimize to the strip")
+                    .on_hover_text("The window's minimize button collapses OpenMic to the always-on-top strip")
+                    .changed()
+                {
+                    self.touch();
+                }
                 ui.add_space(4.0);
                 self.draw_updates(ui);
             },

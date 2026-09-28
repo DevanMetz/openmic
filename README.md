@@ -31,7 +31,7 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - **Test my mic**: record 5 seconds and hear it raw and cleaned on your headphones
 - A setup checklist for first runs, and Simple or Advanced processing controls
 - A sidebar with Voice, Soundboard, Record, Dictation and Settings pages, and a status panel on every page: whether Discord hears you, your level, **Mute** and **Start/Stop**
-- **Collapse to strip**: swap the window for a thin always-on-top bar with your starred pads, the preset and a button to expand again. The microphone turns green while your voice goes out; click it to mute. Buttons are as wide as their names, and pads come first when space runs out. Drag its right edge to resize it, down to just the microphone. OpenMic reopens the way you left it
+- **Collapse to strip**: swap the window for a thin always-on-top bar with your starred pads, the preset and a button to expand again. The microphone turns green while your voice goes out; click it to mute. Buttons are as wide as their names, and pads come first when space runs out. Drag its right edge to resize it, down to just the microphone. The window's minimize button collapses to the strip too (turn that off under **Settings**). OpenMic reopens the way you left it
 - Automatic settings persistence
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back
