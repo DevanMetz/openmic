@@ -54,7 +54,6 @@ pub struct ScopeFrame {
 /// Live meters and voice probability for the GUI (f32 bit patterns).
 #[derive(Default)]
 pub struct Stats {
-    in_peak: AtomicU32,
     out_peak: AtomicU32,
     prob: AtomicU32,
     model: AtomicU32,
@@ -71,7 +70,6 @@ fn get_f32(atomic: &AtomicU32) -> f32 {
 
 #[derive(Clone, Copy)]
 pub struct StatsSnapshot {
-    pub in_peak: f32,
     pub out_peak: f32,
     pub prob: f32,
     pub model: ModelState,
@@ -511,7 +509,6 @@ impl Engine {
 
     pub fn stats(&self) -> StatsSnapshot {
         StatsSnapshot {
-            in_peak: get_f32(&self.stats.in_peak),
             out_peak: get_f32(&self.stats.out_peak),
             prob: get_f32(&self.stats.prob),
             model: ModelState::from_u32(self.stats.model.load(Ordering::Relaxed)),
@@ -611,7 +608,6 @@ fn process_loop(
                 }
             }
         }
-        set_f32(&stats.in_peak, peak(&x));
 
         let p = **params.load();
         let (mut z, prob) = cleaner.process(&x, &p);

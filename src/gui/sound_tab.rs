@@ -477,7 +477,7 @@ impl App {
                 if self.waiting_for_device {
                     "Waiting for your audio device before clips can play."
                 } else {
-                    "Start OpenMic below before playing clips."
+                    "Start OpenMic (bottom left) to play clips."
                 },
             );
         }
@@ -882,7 +882,7 @@ fn clip_pad(
     } else if let Some(hotkey) = state.hotkey {
         (format!("{format} · {hotkey}"), visuals.weak_text_color())
     } else {
-        (format!("{format} · Play now"), visuals.weak_text_color())
+        (format, visuals.weak_text_color())
     };
     // Playback progress along the bottom of the pad.
     if let (true, Some(progress)) = (playing, state.progress) {
@@ -1105,8 +1105,8 @@ mod tests {
         let ctx = egui::Context::default();
         board(&mut app, &ctx, Vec::new());
         let texts = board(&mut app, &ctx, Vec::new());
-        assert!(texts.iter().any(|t| t == "WAV · 0.5 s · Play now"), "{texts:?}");
-        assert!(texts.iter().any(|t| t == "WAV · 2.5 s · Play now"), "the trimmed length");
+        assert!(texts.iter().any(|t| t == "WAV · 0.5 s"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "WAV · 2.5 s"), "the trimmed length");
         assert!(texts.iter().any(|t| t.starts_with("clip11")));
 
         app.pad_filter = "clip1".into();

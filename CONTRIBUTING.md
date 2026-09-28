@@ -13,6 +13,8 @@ cargo run --release
 
 Run the app to verify UI or device-routing changes. For audio changes, explain the microphone, output device, noise model, and behavior you tested. Add a focused test when changing signal processing or settings. Include a screenshot for visible UI changes.
 
+To see UI changes without launching the app, `cargo test --release -- --ignored snapshot` renders the Voice page and the other pages to PNGs in `target/snapshots/` (a test-only software renderer; needs Python with Pillow).
+
 Builds without `--release` show **dev build** in the title. They process audio at full speed but never update themselves.
 
 Releases are published by pushing a `vX.Y.Z` tag, with notes in `docs/releases/vX.Y.Z.md`, on a commit whose CI has passed (the release workflow checks, and does not re-run the tests). The release workflow signs the executable with the `OPENMIC_SIGNING_KEY` secret (see `scripts/sign_release.py`); the matching public key is `RELEASE_KEY` in `src/update.rs`.

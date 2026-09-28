@@ -64,9 +64,6 @@ pub struct Settings {
     /// The strip's width in points if resized by hand (`None`: fit what
     /// it shows). At its narrowest, just the microphone.
     pub strip_width: Option<f32>,
-    /// Show every processing control and the full scope, not just a
-    /// preset and one noise-reduction slider.
-    pub advanced: bool,
     /// First-run checklist progress.
     pub setup: Setup,
     /// Where the main window was, in screen pixels, and its size in points.
@@ -112,7 +109,6 @@ impl Default for Settings {
             minimize_to_strip: true,
             overlay_position: None,
             strip_width: None,
-            advanced: false,
             setup: Setup::default(),
             window_position: None,
             window_size: None,

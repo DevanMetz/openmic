@@ -1,5 +1,5 @@
-//! Small custom widgets for the main window: cards, toggle pills, a
-//! segmented picker and level meters.
+//! Small custom widgets for the main window: cards, badges, toggle pills,
+//! level meters and waveforms.
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Pos2, Rect,
@@ -130,114 +130,6 @@ pub fn pill(ui: &mut egui::Ui, on: &mut bool, text: &str, color: Color32) -> Res
         text_color,
     );
     response
-}
-
-/// Segmented picker: one pill per option, the selected one filled.
-/// Returns (changed, hovered).
-pub fn segmented<T: PartialEq + Copy>(
-    ui: &mut egui::Ui,
-    value: &mut T,
-    options: &[(T, &str, &str)],
-    color: Color32,
-) -> (bool, bool) {
-    let mut changed = false;
-    let mut hovered = false;
-    let visuals = ui.visuals().clone();
-    let title_font = FontId::proportional(13.0);
-    let sub_font = FontId::proportional(11.0);
-    ui.spacing_mut().item_spacing.x = 0.0;
-    for (i, (option, title, sub)) in options.iter().enumerate() {
-        let selected = *value == *option;
-        let title_w = ui
-            .painter()
-            .layout_no_wrap(title.to_string(), title_font.clone(), color)
-            .size()
-            .x;
-        let sub_w = ui
-            .painter()
-            .layout_no_wrap(sub.to_string(), sub_font.clone(), color)
-            .size()
-            .x;
-        let (rect, mut response) =
-            ui.allocate_exact_size(Vec2::new(title_w + sub_w + 34.0, 28.0), Sense::click());
-        if response.clicked() && !selected {
-            *value = *option;
-            changed = true;
-            response.mark_changed();
-        }
-        let selected = *value == *option;
-        response.widget_info(|| {
-            egui::WidgetInfo::selected(
-                egui::WidgetType::RadioButton,
-                ui.is_enabled(),
-                selected,
-                *title,
-            )
-        });
-        hovered |= response.hovered();
-        let radius = match i {
-            0 => CornerRadius {
-                nw: 8,
-                sw: 8,
-                ne: 0,
-                se: 0,
-            },
-            _ if i + 1 == options.len() => CornerRadius {
-                nw: 0,
-                sw: 0,
-                ne: 8,
-                se: 8,
-            },
-            _ => CornerRadius::ZERO,
-        };
-        let (fill, text_color, sub_color) = if selected {
-            (color, ON_ACCENT, ON_ACCENT.gamma_multiply(0.75))
-        } else if response.hovered() {
-            (
-                color.gamma_multiply(0.15),
-                visuals.text_color(),
-                visuals.weak_text_color(),
-            )
-        } else {
-            (
-                Color32::TRANSPARENT,
-                visuals.text_color(),
-                visuals.weak_text_color(),
-            )
-        };
-        let painter = ui.painter();
-        painter.rect(
-            rect,
-            radius,
-            fill,
-            Stroke::new(1.0, if selected { color } else { outline(&visuals) }),
-            StrokeKind::Inside,
-        );
-        if response.has_focus() {
-            painter.rect_stroke(
-                rect.expand(2.0),
-                radius,
-                visuals.selection.stroke,
-                StrokeKind::Outside,
-            );
-        }
-        let title_pos = Pos2::new(rect.left() + 12.0, rect.center().y);
-        let title_rect = painter.text(
-            title_pos,
-            Align2::LEFT_CENTER,
-            *title,
-            title_font.clone(),
-            text_color,
-        );
-        painter.text(
-            Pos2::new(title_rect.right() + 8.0, rect.center().y + 1.0),
-            Align2::LEFT_CENTER,
-            *sub,
-            sub_font.clone(),
-            sub_color,
-        );
-    }
-    (changed, hovered)
 }
 
 /// Level meter over -60..0 dBFS with green/amber/red zones, a decaying

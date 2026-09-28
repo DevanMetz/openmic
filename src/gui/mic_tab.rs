@@ -1,18 +1,16 @@
-//! Microphone tab: first-run checklist, routing (with the headphone
-//! monitor), processing (Simple or Advanced, with presets and a mic test),
-//! and the live scope with its mixer strip.
+//! Voice page: first-run checklist, where your voice goes, presets and the
+//! mic test, and each setting as a row that shows what it does.
 
 use std::time::Duration;
 
 use eframe::egui::{self, ComboBox, RichText};
 
 use super::routes::{cable_input, VB_CABLE_URL};
-use super::{open_url, volume_slider, App, AMBER, CYAN, GREEN, MUTED, VIOLET};
-use crate::config::{self, Processing};
+use super::{open_url, App, AMBER, CYAN, GREEN, MUTED, VIOLET};
+use crate::config;
 use crate::denoise::ModelState;
-use crate::dsp::Model;
 use crate::engine::Engine;
-use crate::viz::{self, Focus};
+use crate::viz;
 use crate::widgets;
 
 /// A first-run checklist step: whether it's done, its title, and what it
@@ -33,9 +31,9 @@ impl App {
         }
         self.draw_route_summary(ui);
         ui.add_space(8.0);
-        self.draw_processing(ui);
+        self.draw_presets(ui);
         ui.add_space(8.0);
-        self.draw_scope(ui);
+        self.draw_voice_rows(ui);
     }
 
     // ---- first-run checklist ----------------------------------------------
@@ -236,8 +234,10 @@ impl App {
         let output = if s.output.is_empty() { "no output" } else { &s.output };
         let mut open_settings = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Mic: {mic}  ·  Output: {output}")).weak());
+            // Long device names are cut short rather than widening the page.
             open_settings = ui.small_button("Change").on_hover_text("Choose devices under Settings").clicked();
+            let route = format!("Mic: {mic}  ·  Output: {output}");
+            ui.add(egui::Label::new(RichText::new(&route).weak()).truncate()).on_hover_text(route);
         });
         if open_settings {
             self.page = super::Page::Settings;
@@ -251,163 +251,110 @@ impl App {
         }
     }
 
-    // ---- processing ----------------------------------------------------------
+    // ---- voice settings --------------------------------------------------------
 
-    fn draw_processing(&mut self, ui: &mut egui::Ui) {
-        let mut changed = false;
-        // Which setting the pointer is on, so the scope can highlight it.
-        let mut focus = None;
-        let mut reset = false;
-        let mut reopen = false;
-        let advanced = self.settings.advanced;
-        let mut view = advanced;
-        widgets::card(
-            ui,
-            "PROCESSING",
-            GREEN,
-            |ui| {
-                reset = ui
-                    .small_button("Reset")
-                    .on_hover_text("Restore every processing setting to its default")
-                    .clicked();
-                widgets::segmented(ui, &mut view, &[(false, "Simple", ""), (true, "Advanced", "")], GREEN);
-            },
-            |ui| {
-                if advanced {
-                    ui.horizontal(|ui| {
-                        let (picked, hovered) = widgets::segmented(
-                            ui,
-                            &mut self.settings.model,
-                            &[
-                                (Model::DeepFilter, "DeepFilterNet 3", "best"),
-                                (Model::Rnnoise, "RNNoise", "light"),
-                            ],
-                            GREEN,
-                        );
-                        changed |= picked;
-                        if hovered {
-                            focus = Some(Focus::Model);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            changed |= self.presets_menu(ui);
-                        });
-                    });
-                    ui.add_space(6.0);
-                } else {
-                    // A starting point and one control; the rest is under Advanced.
-                    ui.horizontal(|ui| {
-                        changed |= self.presets_menu(ui);
-                        ui.add_space(12.0);
-                        ui.label("Noise reduction");
-                        let r = ui.add(
-                            egui::Slider::new(&mut self.settings.strength, 0.0..=1.0)
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-                        );
-                        let notches = viz::wheel_notches(ui, r.id, r.hovered() && !r.dragged());
-                        changed |= r.changed() | viz::step_by(&mut self.settings.strength, notches, 0.01, 0.0..=1.0);
-                        if r.hovered() || r.dragged() {
-                            focus = Some(Focus::Reduction);
-                        }
-                    });
-                    ui.add_space(6.0);
+    /// Presets as one-click chips, with Bypass and the mic test beside them.
+    fn draw_presets(&mut self, ui: &mut egui::Ui) {
+        let current = self.settings.processing();
+        let builtins = config::builtin_presets();
+        let mut apply = None;
+        let mut delete = None;
+        let mut save = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Preset").weak());
+            for preset in &builtins {
+                if ui.selectable_label(preset.processing == current, &preset.name).clicked() {
+                    apply = Some(preset.processing.clone());
                 }
-                ui.horizontal(|ui| {
-                    let s = &mut self.settings;
-                    let mut pills = vec![];
-                    if advanced {
-                        pills.extend([
-                            (&mut s.voice_gate, "Voice gate", VIOLET, Some(Focus::VoiceGate),
-                                "Silence everything that isn't speech, however loud"),
-                            (&mut s.highpass, "Rumble filter", AMBER, Some(Focus::Rumble),
-                                "Cut low rumble: desk bumps, hum, handling noise"),
-                            (&mut s.gate, "Level gate", AMBER, Some(Focus::LevelGate),
-                                "Fade out anything quieter than a set level"),
-                        ]);
-                    }
-                    pills.push((&mut s.bypass, "Bypass", MUTED, None, "Send your raw microphone, unprocessed"));
-                    for (on, text, color, target, tip) in pills {
-                        let r = widgets::pill(ui, on, text, color).on_hover_text(tip);
-                        if r.hovered() {
-                            focus = target.or(focus);
-                        }
-                        changed |= r.changed();
+            }
+            for (i, preset) in self.settings.presets.iter().enumerate() {
+                let chip = ui.selectable_label(preset.processing == current, &preset.name);
+                if chip.clicked() {
+                    apply = Some(preset.processing.clone());
+                }
+                chip.context_menu(|ui| {
+                    if ui.button("Delete preset").clicked() {
+                        delete = Some(i);
+                        ui.close();
                     }
                 });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let toggled = widgets::pill(ui, &mut self.settings.monitor, "Headphone monitor", CYAN)
-                        .on_hover_text("Hear the processed voice yourself on the monitor output (use headphones)")
-                        .changed();
-                    // The monitor device wasn't connected when processing
-                    // started; open it now.
-                    reopen = toggled && self.settings.monitor && self.engine.as_ref().is_some_and(|e| !e.has_monitor());
-                    if volume_slider(ui, &mut self.settings.monitor_volume) || toggled {
-                        self.apply_live();
-                    }
-                });
-                ui.add_space(6.0);
-                self.draw_mic_test(ui);
-            },
-        );
-        if reopen {
-            self.restart_engine();
-        }
-        if view != self.settings.advanced {
-            self.settings.advanced = view;
+            }
+            ui.menu_button("+", |ui| {
+                ui.label("Save your settings as a preset");
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.preset_name).hint_text("Preset name").desired_width(160.0),
+                );
+                let named = !self.preset_name.trim().is_empty();
+                save = ui.add_enabled(named, egui::Button::new("Save")).clicked()
+                    || (named && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if save {
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text("Save your current settings as a preset (right-click a saved one to delete it)");
+        });
+        if let Some(i) = delete {
+            self.settings.presets.remove(i);
             self.touch();
         }
-        if reset {
-            let s = &mut self.settings;
-            s.apply_processing(&Processing::default());
-            s.bypass = false;
-            s.mute = false;
-            s.monitor_volume = 1.0;
-            changed = true;
+        if save {
+            let name = self.preset_name.trim().to_owned();
+            let preset = config::Preset { name: name.clone(), processing: current };
+            match self.settings.presets.iter_mut().find(|p| p.name.eq_ignore_ascii_case(&name)) {
+                Some(existing) => *existing = preset,
+                None => self.settings.presets.push(preset),
+            }
+            self.preset_name.clear();
+            self.touch();
         }
-        if changed {
+        if let Some(processing) = apply {
+            self.settings.apply_processing(&processing);
             self.apply_live();
         }
-        self.focus = focus;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if widgets::pill(ui, &mut self.settings.bypass, "Bypass", MUTED)
+                .on_hover_text("Send your raw microphone, with none of the settings below")
+                .changed()
+            {
+                self.apply_live();
+            }
+            self.draw_mic_test(ui);
+        });
     }
 
-    // ---- scope ---------------------------------------------------------------
-
-    fn draw_scope(&mut self, ui: &mut egui::Ui) {
-        let snapshot = self.engine.as_ref().map(Engine::stats);
-        let advanced = self.settings.advanced;
+    /// The settings, one row each, in the order your voice passes through them.
+    fn draw_voice_rows(&mut self, ui: &mut egui::Ui) {
+        #[allow(unused_mut)]
+        let mut frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
+        #[cfg(test)]
+        if frames.is_empty() {
+            frames = self.demo_frames.clone();
+        }
+        let bypassed = self.settings.bypass;
+        let mut changed = viz::Changed::default();
         widgets::card(
             ui,
-            "LIVE SCOPE",
+            "YOUR VOICE, STEP BY STEP",
             CYAN,
             |ui| {
-                ui.weak("drag or scroll the lines to adjust");
+                ui.weak("drag in a picture · scroll to fine-tune · double-click to reset");
             },
             |ui| {
-                let frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
-                // A slider under the pointer highlights what it changes.
-                let focus = self.focus.or(self.slider_focus);
-                let mut changed = false;
-                ui.horizontal_top(|ui| {
-                    let gap = 12.0;
-                    let scope_width = (ui.available_width() - viz::SLIDERS_WIDTH - gap).max(320.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(scope_width);
-                        changed |= viz::scope(ui, &frames, &mut self.settings, focus, advanced);
-                    });
-                    ui.add_space(gap - ui.spacing().item_spacing.x);
-                    ui.vertical(|ui| {
-                        let levels = [snapshot.map(|s| s.in_peak), snapshot.map(|s| s.out_peak)];
-                        let (slid, pointed) =
-                            viz::gain_sliders(ui, &mut self.settings, levels, &mut self.hold, advanced);
-                        changed |= slid;
-                        self.slider_focus = pointed;
-                    });
-                });
-                if changed {
-                    self.apply_live();
+                if bypassed {
+                    ui.colored_label(AMBER, "Bypass is on: Discord hears your raw microphone.");
                 }
+                changed = viz::voice_rows(ui, &frames, &mut self.settings, &mut self.strength_before_off);
             },
         );
+        if changed.settings {
+            self.apply_live();
+        }
+        // The monitor device wasn't connected when processing started: open it now.
+        if changed.monitor && self.settings.monitor && self.engine.as_ref().is_some_and(|e| !e.has_monitor()) {
+            self.restart_engine();
+        }
     }
 
     /// The footer's "Running · voice 42%", unless a warning is showing.
@@ -426,78 +373,6 @@ impl App {
             ModelState::DeepFilterFailed => (format!("DeepFilterNet unavailable, using RNNoise · {voice}"), AMBER),
             ModelState::DeepFilter | ModelState::Rnnoise => (format!("Running · {voice}"), GREEN),
         };
-    }
-
-    /// The preset picker. Returns whether a preset was applied.
-    fn presets_menu(&mut self, ui: &mut egui::Ui) -> bool {
-        let current = self.settings.processing();
-        let builtins = config::builtin_presets();
-        let label = builtins
-            .iter()
-            .chain(&self.settings.presets)
-            .find(|p| p.processing == current)
-            .map_or("Custom", |p| p.name.as_str())
-            .to_owned();
-        let mut apply = None;
-        let mut delete = None;
-        let mut save = false;
-        ui.menu_button(format!("Preset: {label}"), |ui| {
-            for preset in &builtins {
-                if ui.button(&preset.name).clicked() {
-                    apply = Some(preset.processing.clone());
-                }
-            }
-            if !self.settings.presets.is_empty() {
-                ui.separator();
-                ui.weak("Saved");
-                for (i, preset) in self.settings.presets.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.button(&preset.name).clicked() {
-                            apply = Some(preset.processing.clone());
-                        }
-                        if ui.small_button("×").on_hover_text("Delete this preset").clicked() {
-                            delete = Some(i);
-                        }
-                    });
-                }
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.preset_name)
-                        .hint_text("Preset name")
-                        .desired_width(140.0),
-                );
-                let named = !self.preset_name.trim().is_empty();
-                save = ui.add_enabled(named, egui::Button::new("Save current")).clicked()
-                    || (named && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-            });
-        })
-        .response
-        .on_hover_text("Apply a starting point, or save your own settings");
-
-        if let Some(i) = delete {
-            self.settings.presets.remove(i);
-            self.touch();
-        }
-        if save {
-            let name = self.preset_name.trim().to_owned();
-            let preset = config::Preset { name: name.clone(), processing: current };
-            match self.settings.presets.iter_mut().find(|p| p.name.eq_ignore_ascii_case(&name)) {
-                Some(existing) => *existing = preset,
-                None => self.settings.presets.push(preset),
-            }
-            self.preset_name.clear();
-            ui.close();
-            self.touch();
-        }
-        match apply {
-            Some(processing) => {
-                self.settings.apply_processing(&processing);
-                true
-            }
-            None => false,
-        }
     }
 }
 

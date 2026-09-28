@@ -6,6 +6,8 @@ mod mic_test;
 mod overlay;
 mod routes;
 mod settings_tab;
+#[cfg(test)]
+mod snapshot;
 mod sound_tab;
 mod updates;
 
@@ -27,7 +29,7 @@ use crate::record::{Recorder, Source, Take};
 use crate::tray::Tray;
 use crate::logfile;
 use crate::update::Updater;
-use crate::viz::{self, Focus};
+use crate::viz;
 use routes::{cable_input, choose_routes};
 
 pub(crate) const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
@@ -168,10 +170,11 @@ pub struct App {
     /// (running, processed output, setting) the Windows default microphone
     /// was last reconciled for.
     default_mic_sync: DefaultMicSync,
-    /// The processing setting under the pointer this frame.
-    focus: Option<Focus>,
-    /// The scope slider under the pointer (last frame).
-    slider_focus: Option<Focus>,
+    /// Noise strength to bring back when Remove noise is switched on again.
+    strength_before_off: f32,
+    /// Stand-in audio history for pictures drawn without an engine (tests).
+    #[cfg(test)]
+    demo_frames: Vec<crate::engine::ScopeFrame>,
     /// Peak-hold positions of the input/output meters, dBFS.
     hold: [f32; 2],
     /// Start was blocked by a device that isn't connected (e.g. a USB mic
@@ -313,8 +316,9 @@ impl App {
             save_error: None,
             last_device_poll: Instant::now(),
             default_mic_sync: DefaultMicSync::default(),
-            focus: None,
-            slider_focus: None,
+            strength_before_off: 1.0,
+            #[cfg(test)]
+            demo_frames: Vec::new(),
             hold: [-60.0; 2],
             waiting_for_device: false,
             reconnecting: false,
@@ -1210,7 +1214,10 @@ impl App {
         if let Some(error) = &self.save_error {
             ui.label(RichText::new("Settings not saved · retrying…").small().color(RED)).on_hover_text(error);
         }
-        ui.add(egui::Label::new(RichText::new(&self.status.0).small().color(self.status.1)).wrap());
+        // Details beyond the state line ("Running · voice 42%", a warning).
+        if self.status.0 != "Stopped" {
+            ui.add(egui::Label::new(RichText::new(&self.status.0).small().color(self.status.1)).wrap());
+        }
         let (state, color) = match (self.engine.is_some(), self.settings.mute) {
             (true, true) => ("Muted", RED),
             (true, false) => ("Live: Discord hears you", GREEN),
@@ -1485,30 +1492,6 @@ mod tests {
         }
     }
 
-    /// The mixer sliders sit to the right of a narrower scope, and still
-    /// fit in the smallest window.
-    #[test]
-    fn the_gain_sliders_sit_beside_the_scope() {
-        for size in [egui::vec2(700.0, 900.0), egui::vec2(760.0, 900.0)] {
-            let mut app = App::stopped(Settings::default());
-            let (texts, _) = render(&mut app, size);
-            let scope = *visible(&texts, "Start OpenMic to see your voice").expect("the scope is drawn");
-            for label in ["Your mic", "To Discord", "Reduction", "+0.0 dB", "100%"] {
-                // Beside the scope (the monitor volume also reads "100%").
-                let rect = texts
-                    .iter()
-                    .filter(|(text, rect)| text == label && rect.top() > scope.top() - 200.0)
-                    .map(|(_, rect)| *rect)
-                    .max_by(|a, b| a.left().total_cmp(&b.left()))
-                    .unwrap_or_else(|| panic!("{label} missing at {size:?}"));
-                let rect = &rect;
-                assert!(rect.left() > scope.right(), "{label} is right of the scope at {size:?}: {rect:?} vs {scope:?}");
-                assert!(rect.right() <= size.x, "{label} fits at {size:?}: {rect:?}");
-            }
-            assert!(visible(&texts, "your mic +").is_none(), "the old value chips are gone");
-        }
-    }
-
     #[test]
     fn the_window_reopens_where_it_was_and_remembers_moves() {
         use eframe::App as _;
@@ -1643,6 +1626,69 @@ mod tests {
         assert!(!app.settings.collapsed);
     }
 
+    /// Every setting is a row (name, a line of explanation, its picture and
+    /// its value), with presets as chips above; nothing needs a mode switch.
+    #[test]
+    fn the_voice_page_shows_every_setting_as_a_row() {
+        for size in [egui::vec2(700.0, 1400.0), egui::vec2(760.0, 1400.0)] {
+            let mut app = App::stopped(Settings::default());
+            let (texts, _) = render(&mut app, size);
+            let rows = [
+                ("Your mic", "How loud you are going in"),
+                ("Remove rumble", "Cuts low thumps and hum"),
+                ("Remove noise", "Keeps your voice, drops the room"),
+                ("Only my voice", "Silent when you're not talking"),
+                ("Quiet cut-off", "Mutes anything below a level"),
+                ("To Discord", "How loud Discord hears you"),
+                ("Hear yourself", "What Discord hears, in your headphones"),
+            ];
+            let mut last_top = 0.0;
+            for (title, explain) in rows {
+                let t = *visible(&texts, title).unwrap_or_else(|| panic!("{title} missing at {size:?}"));
+                let e = *visible(&texts, explain).unwrap_or_else(|| panic!("{title}'s explanation missing"));
+                assert!(t.top() > last_top, "{title} is below the row before it");
+                assert!(e.top() > t.top() && e.top() - t.bottom() < 12.0, "{title}'s explanation sits under it");
+                assert!(e.right() <= size.x, "{title} fits at {size:?}");
+                last_top = t.top();
+            }
+            for chip in ["Balanced", "Mechanical keyboard", "Quiet room", "Noisy room", "Low CPU", "Bypass", "Test my mic", "DeepFilterNet"] {
+                assert!(visible(&texts, chip).is_some(), "{chip} missing at {size:?}");
+            }
+            for gone in ["Simple", "Advanced", "LIVE SCOPE", "PROCESSING", "Noise reduction"] {
+                assert!(visible(&texts, gone).is_none(), "{gone} should be gone");
+            }
+        }
+    }
+
+    #[test]
+    fn preset_chips_apply_a_preset_in_one_click() {
+        use eframe::App as _;
+        let mut app = App::stopped(Settings::default());
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let size = egui::vec2(760.0, 1400.0);
+        let mut run = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+            ctx.run_ui(input, |ui| app.ui(ui, &mut frame))
+        };
+        let output = run(&mut app, vec![]);
+        let chip = output
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Noisy room" => Some(t.visual_bounding_rect().center()),
+                _ => None,
+            })
+            .expect("Noisy room chip");
+        let button = |pressed| egui::Event::PointerButton { pos: chip, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        for events in [vec![egui::Event::PointerMoved(chip)], vec![button(true)], vec![button(false)], vec![]] {
+            run(&mut app, events);
+        }
+        let noisy = crate::config::builtin_presets().into_iter().find(|p| p.name == "Noisy room").unwrap();
+        assert_eq!(app.settings.processing(), noisy.processing);
+        assert!(app.settings.gate, "Noisy room turns the quiet cut-off on");
+    }
+
     #[test]
     fn the_checklist_ticks_itself_off_and_can_be_hidden() {
         let mut app = App::stopped(Settings::default());
@@ -1669,28 +1715,12 @@ mod tests {
     }
 
     #[test]
-    fn simple_mode_hides_the_gates_and_advanced_shows_everything() {
-        let mut app = App::stopped(Settings::default());
-        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "Noise reduction").is_some());
-        assert!(visible(&texts, "Test my mic").is_some() && visible(&texts, "Headphone monitor").is_some());
-        for hidden in ["Voice gate", "Rumble filter", "RNNoise", "voice gate · threshold"] {
-            assert!(visible(&texts, hidden).is_none(), "{hidden} is Advanced only");
-        }
-        app.settings.advanced = true;
-        let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        for shown in ["Voice gate", "Rumble filter", "RNNoise", "voice gate · threshold", "Test my mic"] {
-            assert!(visible(&texts, shown).is_some(), "{shown} shows in Advanced");
-        }
-    }
-
-    #[test]
     fn routing_lives_in_settings_and_the_voice_page_summarizes_it() {
         let mut app = App::stopped(Settings { microphone: "Yeti".into(), output: "CABLE Input".into(), ..Settings::default() });
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
         assert!(visible(&texts, "MONITOR & LEVELS").is_none() && visible(&texts, "ROUTING").is_none());
         assert!(visible(&texts, "Mic: Yeti  ·  Output: CABLE Input").is_some(), "one line saying where your voice goes");
-        assert!(visible(&texts, "Headphone monitor").is_some(), "the monitor is a Voice control");
+        assert!(visible(&texts, "Hear yourself").is_some(), "the monitor is a Voice control");
 
         app.page = Page::Settings;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));

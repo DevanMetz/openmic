@@ -27,9 +27,9 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - Runs in the notification area: close the window and OpenMic keeps working, with mute, bypass and start/stop in the tray menu
 - Persistent soundboard with per-pad volume and trim, clip lengths and playback progress on each pad, drag-to-reorder, search, optional overlapping clips, and a soundboard volume; WAV, FLAC, OGG, MP3, AIFF via symphonia
 - Record the raw microphone or the audio playing through a Windows output, then save a WAV file or add the take directly to the soundboard
-- Input and output level meters with peak hold, beside the gain sliders
+- Each voice setting shown as a row with a one-line explanation and a live picture you drag to adjust
 - **Test my mic**: record 5 seconds and hear it raw and cleaned on your headphones
-- A setup checklist for first runs, and Simple or Advanced processing controls
+- A setup checklist for first runs, and one-click preset chips
 - A sidebar with Voice, Soundboard, Record, Dictation and Settings pages, and a status panel on every page: whether Discord hears you, your level, **Mute** and **Start/Stop**
 - **Collapse to strip**: swap the window for a thin always-on-top bar with your starred pads, the preset and a button to expand again. The microphone turns green while your voice goes out; click it to mute. Buttons are as wide as their names, and pads come first when space runs out. Drag its right edge to resize it, down to just the microphone. The window's minimize button collapses to the strip too (turn that off under **Settings**). OpenMic reopens the way you left it
 - Automatic settings persistence
@@ -82,18 +82,19 @@ If a device is unplugged while processing, OpenMic shows **reconnecting…** and
 
 ## Adjusting
 
-**Processing** has two views. **Simple** shows a preset, one **Noise reduction** slider and **Bypass**. **Advanced** adds the model choice, the voice gate, rumble filter and level gate, and their charts on the live scope. Choose a model and switch filters on or off, or pick a starting point from **Preset**. Type a name in that menu and click **Save current** to keep your own settings as a preset. Use the **Live scope** and the three sliders beside it to tune their settings: drag a control, scroll over it for fine steps, or double-click it to reset that setting. **Reset** in **Processing** restores all processing settings.
+The **Voice** page lists each setting as a row, in the order your voice passes through them. Each row has its name, a short line saying what it does, a live picture of it working, and its value. Drag inside a picture to change the setting, scroll over it for fine steps, and double-click it to reset. A switch turns a setting on or off; rows that are off are dimmed.
 
-| Scope control | Drag changes | Wheel step |
-|---|---|---|
-| **Your mic** slider or the blue line | Input gain | 0.5 dB |
-| **To Discord** slider or the green line | Output gain | 0.5 dB |
-| **Reduction** slider | Noise-reduction strength | 1% |
-| Dashed amber line (when **Level gate** is on) | Level-gate threshold | 1 dB |
-| Voice chart | Voice-gate threshold: lower it if quiet words get cut off; raise it if noise opens the gate | 1% |
-| Rumble chart | Rumble-filter cutoff; drag left or right | 1 Hz |
+| Row | What it does | Drag | Wheel step |
+|---|---|---|---|
+| **Your mic** | Input gain: how loud you are going in | Up or down | 0.5 dB |
+| **Remove rumble** | Cuts low thumps and hum below a pitch | The cutoff, left or right | 1 Hz |
+| **Remove noise** | Keeps your voice and drops the room; the blue shading is what comes in, the green line what Discord hears | Either way, for strength | 1% |
+| **Only my voice** | The voice gate: silent when you're not talking; green shows when your voice gets through. Lower the line if quiet words get cut off, raise it if noise gets through | The line, up or down | 1% |
+| **Quiet cut-off** | The level gate: mutes anything below the dashed line | The line, up or down | 1 dB |
+| **To Discord** | Output gain: how loud Discord hears you | Up or down | 0.5 dB |
+| **Hear yourself** | The headphone monitor, on the monitor output chosen under **Settings → Routing**; use headphones to prevent feedback | Volume, left or right | 1% |
 
-Level meters beside the **Your mic** and **To Discord** sliders show the input and output peaks, with a peak hold marker. **Headphone monitor** and its volume are on the **Voice** page and play on the monitor output chosen under **Settings → Routing**; use headphones before enabling it to prevent feedback. The monitor and soundboard volume sliders also take the mouse wheel in 1% steps. OpenMic reopens at the size and place you left it.
+Pick a starting point from the preset chips above the rows (**Balanced**, **Mechanical keyboard**, **Quiet room**, **Noisy room**, **Low CPU**). **+** saves your current settings as a preset; right-click a saved one to delete it. Click the model name under **Remove noise** to switch between DeepFilterNet and RNNoise. **Bypass** sends your raw microphone with none of the settings. OpenMic reopens at the size and place you left it.
 
 Settings are saved automatically using atomic file replacement, so an interrupted write leaves the previous settings intact. If saving fails, the status panel shows **Settings not saved · retrying…**; hover over it for details. OpenMic retries while it runs.
 
