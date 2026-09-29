@@ -96,16 +96,21 @@ impl Player {
 }
 
 fn resample(samples: &[f32], rate: u32) -> Vec<f32> {
-    if rate == SR {
+    if samples.is_empty() || rate == SR {
         return samples.to_vec();
     }
     let mut resampler = Resampler::new(SR, rate);
-    let mut out = Vec::with_capacity(samples.len() * rate as usize / SR as usize + 64);
+    let expected = (samples.len() as f64 * f64::from(rate) / f64::from(SR)).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(expected);
     let mut buf = [0.0f32; 1024];
-    for chunk in samples.chunks(4096) {
+    // A streaming converter waits for two future samples. At the end of a
+    // finite clip, hold its last value and emit only the intended duration.
+    let padding = [samples[samples.len() - 1]; 2];
+    for chunk in samples.chunks(4096).chain(std::iter::once(padding.as_slice())) {
         resampler.push(chunk);
-        loop {
-            let n = resampler.pull(&mut buf);
+        while out.len() < expected {
+            let room = (expected - out.len()).min(buf.len());
+            let n = resampler.pull(&mut buf[..room]);
             if n == 0 {
                 break;
             }
@@ -174,8 +179,26 @@ mod tests {
     fn resampling_keeps_the_duration() {
         let second = vec![0.1f32; SR as usize];
         let out = resample(&second, 44_100);
-        assert!((out.len() as i64 - 44_100).abs() < 200, "{}", out.len());
+        assert_eq!(out.len(), 44_100);
         assert_eq!(resample(&second, SR).len(), SR as usize);
+    }
+
+    #[test]
+    fn resampling_flushes_the_tail_of_short_previews() {
+        let tail = [0.0, 0.0, 0.5];
+        let doubled = resample(&tail, 96_000);
+        assert_eq!(doubled.len(), 6);
+        assert_eq!(doubled[4], 0.5, "the final input sample reaches the output");
+        assert!(doubled[5] > 0.4);
+        let halved = resample(&tail, 24_000);
+        assert_eq!(halved, [0.0, 0.5]);
+
+        for (rate, expected) in [(8_000, 1), (44_100, 1), (96_000, 2), (192_000, 4)] {
+            let single = resample(&[0.25], rate);
+            assert_eq!(single.len(), expected, "a one-sample clip must not disappear at {rate} Hz");
+            assert_eq!(single[0], 0.25);
+            assert!(resample(&[], rate).is_empty());
+        }
     }
 
     #[test]
