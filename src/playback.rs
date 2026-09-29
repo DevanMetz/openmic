@@ -1,8 +1,9 @@
 //! Play a recording to the user's own headphones or speakers (the mic test),
 //! never into VB-Cable: this audio is for you, not for Discord.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -14,10 +15,23 @@ use crate::resample::Resampler;
 
 /// A clip playing on an output device; stops when dropped.
 pub struct Player {
-    _stream: Stream,
-    pos: Arc<AtomicUsize>,
+    stream: Stream,
+    progress: Arc<PlaybackProgress>,
     len: usize,
     errors: Receiver<String>,
+}
+
+#[derive(Default)]
+struct PlaybackProgress {
+    queued: AtomicUsize,
+    /// When the final sample reaches the device, on its own monotonic clock.
+    ends_at: OnceLock<cpal::StreamInstant>,
+}
+
+impl PlaybackProgress {
+    fn finished(&self, now: cpal::StreamInstant) -> bool {
+        self.ends_at.get().is_some_and(|&end| now >= end)
+    }
 }
 
 /// Whether a device name is VB-Cable (Discord's input), which the mic test
@@ -50,28 +64,28 @@ impl Player {
             buffer_size: cpal::BufferSize::Default,
         };
         let audio = Arc::new(resample(samples, config.sample_rate));
-        let pos = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(PlaybackProgress::default());
         let len = audio.len();
         let (report, errors) = crossbeam_channel::bounded(1);
         let stream = match supported.sample_format() {
-            SampleFormat::F32 => build::<f32>(&device, &config, &audio, &pos, &report),
-            SampleFormat::I16 => build::<i16>(&device, &config, &audio, &pos, &report),
-            SampleFormat::U16 => build::<u16>(&device, &config, &audio, &pos, &report),
-            SampleFormat::I32 => build::<i32>(&device, &config, &audio, &pos, &report),
-            SampleFormat::F64 => build::<f64>(&device, &config, &audio, &pos, &report),
+            SampleFormat::F32 => build::<f32>(&device, &config, &audio, &progress, &report),
+            SampleFormat::I16 => build::<i16>(&device, &config, &audio, &progress, &report),
+            SampleFormat::U16 => build::<u16>(&device, &config, &audio, &progress, &report),
+            SampleFormat::I32 => build::<i32>(&device, &config, &audio, &progress, &report),
+            SampleFormat::F64 => build::<f64>(&device, &config, &audio, &progress, &report),
             other => Err(anyhow!("unsupported output format {other}")),
         }?;
         stream.play().context("start playback")?;
-        Ok(Self { _stream: stream, pos, len, errors })
+        Ok(Self { stream, progress, len, errors })
     }
 
     /// How far through the clip playback is, 0..=1.
     pub fn progress(&self) -> f32 {
-        if self.len == 0 { 1.0 } else { self.pos.load(Ordering::Relaxed) as f32 / self.len as f32 }
+        if self.len == 0 { 1.0 } else { self.progress.queued.load(Ordering::Relaxed) as f32 / self.len as f32 }
     }
 
     pub fn finished(&self) -> bool {
-        self.pos.load(Ordering::Relaxed) >= self.len
+        self.len == 0 || self.progress.finished(self.stream.now())
     }
 
     /// A failed output stream needs another playback attempt; the recording
@@ -110,23 +124,36 @@ fn error_callback(report: Sender<String>) -> impl FnMut(cpal::Error) + Send + 's
     }
 }
 
-fn build<T>(device: &cpal::Device, config: &StreamConfig, audio: &Arc<Vec<f32>>, pos: &Arc<AtomicUsize>, report: &Sender<String>) -> Result<Stream>
+fn output_callback<T>(audio: Arc<Vec<f32>>, channels: usize, rate: u32, progress: Arc<PlaybackProgress>)
+    -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) + Send + 'static
 where
     T: SizedSample + FromSample<f32>,
 {
-    let channels = usize::from(config.channels);
-    let (audio, pos) = (Arc::clone(audio), Arc::clone(pos));
+    move |data, info| {
+        let start = progress.queued.load(Ordering::Relaxed);
+        let mut at = start;
+        for frame in data.chunks_mut(channels) {
+            let s = audio.get(at).copied().unwrap_or(0.0);
+            at = (at + 1).min(audio.len());
+            frame.fill(T::from_sample(s));
+        }
+        if at == audio.len() && progress.ends_at.get().is_none() {
+            // Queued is not yet audible. Include the device's latency and
+            // only the audio frames in this buffer, not its trailing silence.
+            let tail = Duration::from_secs_f64((at - start) as f64 / f64::from(rate));
+            let _ = progress.ends_at.set(info.timestamp().playback + tail);
+        }
+        progress.queued.store(at, Ordering::Relaxed);
+    }
+}
+
+fn build<T>(device: &cpal::Device, config: &StreamConfig, audio: &Arc<Vec<f32>>, progress: &Arc<PlaybackProgress>, report: &Sender<String>) -> Result<Stream>
+where
+    T: SizedSample + FromSample<f32>,
+{
     Ok(device.build_output_stream(
         *config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let mut at = pos.load(Ordering::Relaxed);
-            for frame in data.chunks_mut(channels) {
-                let s = audio.get(at).copied().unwrap_or(0.0);
-                at = (at + 1).min(audio.len());
-                frame.fill(T::from_sample(s));
-            }
-            pos.store(at, Ordering::Relaxed);
-        },
+        output_callback::<T>(Arc::clone(audio), usize::from(config.channels), config.sample_rate, Arc::clone(progress)),
         error_callback(report.clone()),
         None,
     )?)
@@ -168,5 +195,46 @@ mod tests {
         assert!(errors.try_recv().is_err());
         drop(errors);
         callback(ErrorKind::StreamInvalidated.into()); // the UI already stopped playback
+    }
+
+    fn output_time(callback_ms: u64, playback_ms: u64) -> cpal::OutputCallbackInfo {
+        cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp {
+            callback: cpal::StreamInstant::from_millis(callback_ms),
+            playback: cpal::StreamInstant::from_millis(playback_ms),
+        })
+    }
+
+    #[test]
+    fn finishing_waits_until_the_device_plays_the_final_audio_frame() {
+        let progress = Arc::new(PlaybackProgress::default());
+        let mut callback = output_callback::<f32>(Arc::new(vec![0.25; 300]), 2, 1_000, Arc::clone(&progress));
+        let mut buffer = [0.0; 400]; // 200 stereo frames
+        callback(&mut buffer, &output_time(0, 30));
+        assert_eq!(buffer, [0.25; 400]);
+        assert!(!progress.finished(cpal::StreamInstant::from_millis(5000)), "still have audio left to queue");
+
+        callback(&mut buffer, &output_time(200, 230));
+        assert_eq!(progress.queued.load(Ordering::Relaxed), 300);
+        assert_eq!(buffer[..200], [0.25; 200]);
+        assert_eq!(buffer[200..], [0.0; 200]);
+        assert!(!progress.finished(cpal::StreamInstant::from_millis(200)), "queueing the tail must not stop the stream");
+        assert!(!progress.finished(cpal::StreamInstant::from_millis(329)));
+        assert!(progress.finished(cpal::StreamInstant::from_millis(330)), "30 ms device latency plus 100 audio frames at 1 kHz");
+
+        callback(&mut buffer, &output_time(400, 430));
+        assert_eq!(buffer, [0.0; 400]);
+        assert!(progress.finished(cpal::StreamInstant::from_millis(330)), "silent callbacks must not keep extending playback");
+    }
+
+    #[test]
+    fn a_short_preview_is_not_finished_when_its_first_buffer_is_submitted() {
+        let progress = Arc::new(PlaybackProgress::default());
+        let mut callback = output_callback::<f32>(Arc::new(vec![0.5; 48]), 1, 48_000, Arc::clone(&progress));
+        let mut buffer = [1.0; 480];
+        callback(&mut buffer, &output_time(0, 20));
+        assert_eq!(buffer[..48], [0.5; 48]);
+        assert_eq!(buffer[48..], [0.0; 432]);
+        assert!(!progress.finished(cpal::StreamInstant::from_millis(20)));
+        assert!(progress.finished(cpal::StreamInstant::from_millis(21)));
     }
 }
