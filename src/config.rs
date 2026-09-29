@@ -11,6 +11,10 @@ use crate::dsp::{Model, HIGHPASS_HZ, VOICE_THRESHOLD};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// A failed startup load protects the original file until a successful retry.
+    /// This is runtime state, never part of the saved preferences.
+    #[serde(skip)]
+    pub load_error: Option<SettingsLoadError>,
     pub microphone: String,
     pub output: String,
     pub monitor_output: String,
@@ -77,6 +81,7 @@ impl Default for Settings {
     fn default() -> Self {
         let p = Processing::default();
         Self {
+            load_error: None,
             microphone: String::new(),
             output: String::new(),
             monitor_output: String::new(),
@@ -117,6 +122,12 @@ impl Default for Settings {
             window_size: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsLoadError {
+    pub path: PathBuf,
+    pub message: String,
 }
 
 /// First-run checklist steps OpenMic can't see for itself, and whether the
@@ -312,23 +323,44 @@ impl Settings {
 
 impl Settings {
     pub fn load() -> Self {
-        let path = settings_path();
-        let loaded = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Settings>(&text).ok());
-        if let Some(settings) = loaded {
-            return settings;
-        }
+        Self::load_from(&settings_path(), &legacy_settings_paths())
+    }
 
-        for legacy in legacy_settings_paths() {
-            let Some(settings) = fs::read_to_string(&legacy)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
-            else {
-                continue;
+    pub fn retry_load(&self) -> Self {
+        self.retry_from(&settings_path())
+    }
+
+    fn retry_from(&self, path: &Path) -> Self {
+        // Retry the failed source, not unrelated older copies. Moving the bad
+        // file aside must allow a fresh start instead of reviving stale settings.
+        let sources: Vec<_> = self.load_error.iter().map(|error| error.path.clone()).collect();
+        Self::load_from(path, &sources)
+    }
+
+    fn load_from(path: &Path, legacy: &[PathBuf]) -> Self {
+        for source in std::iter::once(path).chain(legacy.iter().map(PathBuf::as_path)) {
+            let result = match fs::read(source) {
+                Ok(bytes) => serde_json::from_slice::<Self>(&bytes).context("Parse settings"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => Err(anyhow::Error::new(error).context("Read settings")),
             };
-            let _ = settings.save();
-            return settings;
+            match result {
+                Ok(settings) => {
+                    if source != path && let Err(error) = settings.save_to(path) {
+                        crate::logfile::warn(format_args!("could not migrate settings to {}: {error:#}", path.display()));
+                    }
+                    return settings;
+                }
+                Err(error) => {
+                    crate::logfile::error(format_args!("settings not loaded from {}: {error:#}", source.display()));
+                    // Do not replace an unreadable file with defaults or an older
+                    // legacy copy. This guard also blocks shutdown/autosave writes.
+                    return Self {
+                        load_error: Some(SettingsLoadError { path: source.to_owned(), message: format!("{error:#}") }),
+                        ..Self::default()
+                    };
+                }
+            }
         }
         Self::default()
     }
@@ -338,6 +370,9 @@ impl Settings {
     }
 
     fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(error) = &self.load_error {
+            anyhow::bail!("Settings were not loaded from {}; retry loading before saving", error.path.display());
+        }
         let text = serde_json::to_string_pretty(self).context("serialize settings")?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         fs::create_dir_all(parent).context("create OpenMic settings directory")?;
@@ -479,6 +514,116 @@ mod tests {
         assert_eq!(settings.processing(), keyboard.processing);
         assert_eq!(settings.voice_threshold, 0.75);
         assert!(settings.close_to_tray, "unrelated settings are untouched");
+    }
+
+    #[test]
+    fn missing_settings_use_defaults_and_valid_legacy_settings_still_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current/settings.json");
+        let legacy = dir.path().join("legacy.json");
+        let fresh = Settings::load_from(&path, std::slice::from_ref(&legacy));
+        assert!(fresh.load_error.is_none() && fresh.auto_start && fresh.sounds.is_empty());
+        assert!(!path.exists(), "a missing file is not a failed load");
+
+        let mut previous = Settings { mute: true, microphone: "USB mic".into(), ..Default::default() };
+        previous.sounds.push(Pad::new("applause.wav".into()));
+        previous.hotkeys.mute = Some("Ctrl+Alt+M".into());
+        previous.saved_default_mic = Some(SavedDefaults { console: "before-console".into(), communications: "before-chat".into() });
+        previous.save_to(&legacy).unwrap();
+        let original = fs::read(&legacy).unwrap();
+        let loaded = Settings::load_from(&path, std::slice::from_ref(&legacy));
+        assert!(loaded.load_error.is_none());
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&previous).unwrap());
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+        let migrated: Settings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(migrated).unwrap(), serde_json::to_value(&previous).unwrap());
+
+        Settings::default().save_to(&legacy).unwrap();
+        assert!(Settings::load_from(&path, &[legacy]).mute, "an existing current file takes precedence over old copies");
+    }
+
+    #[test]
+    fn malformed_settings_block_saving_and_never_fall_back_to_an_old_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let legacy = dir.path().join("legacy.json");
+        Settings::default().save_to(&legacy).unwrap();
+        for bytes in [b"{\"sounds\":[".as_slice(), b"\xff\xfe\x00", b"{\"model\":\"unknown-model\"}"] {
+            fs::write(&path, bytes).unwrap();
+            let mut loaded = Settings::load_from(&path, std::slice::from_ref(&legacy));
+            let error = loaded.load_error.as_ref().unwrap();
+            assert_eq!(error.path, path);
+            assert!(error.message.starts_with("Parse settings:"));
+            loaded.mute = true;
+            assert!(loaded.save_to(&path).is_err(), "later changes cannot overwrite an unreadable source");
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+
+        let failed = Settings::load_from(&path, &[legacy]);
+        fs::write(&path, br#"{"mute":true,"sounds":["clap.wav"],"highpass_hz":120.0}"#).unwrap();
+        assert!(failed.save_to(&path).is_err(), "even a repaired file is protected until it has actually been reloaded");
+        let mut restored = failed.retry_from(&path);
+        assert!(restored.load_error.is_none() && restored.mute);
+        assert_eq!(restored.sounds, [Pad::new("clap.wav".into())]);
+        assert_eq!(restored.highpass_hz, 120.0);
+        restored.mute = false;
+        restored.save_to(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("load_error"));
+        assert!(!Settings::load_from(&path, &[]).mute);
+    }
+
+    #[test]
+    fn failed_legacy_loads_stay_intact_and_retries_do_not_revive_unrelated_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current/settings.json");
+        let legacy = dir.path().join("legacy.json");
+        let older = dir.path().join("older.json");
+        Settings { mute: true, ..Default::default() }.save_to(&older).unwrap();
+        let bytes = b"{ unfinished settings";
+        fs::write(&legacy, bytes).unwrap();
+        let failed = Settings::load_from(&path, &[legacy.clone(), older]);
+        assert_eq!(failed.load_error.as_ref().unwrap().path, legacy);
+        assert!(failed.save_to(&path).is_err());
+        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+        assert!(!path.exists());
+
+        Settings { sound_volume: 0.3, ..Default::default() }.save_to(&legacy).unwrap();
+        let repaired = failed.retry_from(&path);
+        assert!(repaired.load_error.is_none());
+        assert_eq!(repaired.sound_volume, 0.3);
+        assert!(path.exists(), "a repaired legacy file can finish migrating");
+
+        fs::write(&path, bytes).unwrap();
+        let failed = Settings::load_from(&path, std::slice::from_ref(&legacy));
+        let backup = dir.path().join("settings-backup.json");
+        fs::rename(&path, &backup).unwrap();
+        let fresh = failed.retry_from(&path);
+        assert!(fresh.load_error.is_none());
+        assert_eq!(fresh.sound_volume, Settings::default().sound_volume, "moving the failed file aside allows a fresh start");
+        assert_eq!(fs::read(backup).unwrap(), bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_settings_file_is_protected_until_a_successful_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let legacy = dir.path().join("legacy.json");
+        Settings { mute: true, ..Default::default() }.save_to(&path).unwrap();
+        Settings::default().save_to(&legacy).unwrap();
+        let before = fs::read(&path).unwrap();
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let failed = Settings::load_from(&path, &[legacy]);
+        assert!(failed.load_error.as_ref().unwrap().message.starts_with("Read settings:"));
+        assert!(failed.save_to(&path).is_err());
+        drop(held);
+        assert!(failed.save_to(&path).is_err(), "releasing a lock does not authorize defaults to replace the original");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let loaded = failed.retry_from(&path);
+        assert!(loaded.load_error.is_none() && loaded.mute);
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

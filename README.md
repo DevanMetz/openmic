@@ -98,6 +98,8 @@ Pick a starting point from the preset chips above the rows (**Balanced**, **Mech
 
 Settings are saved automatically using atomic file replacement, so an interrupted write leaves the previous settings intact. If saving fails, the status panel shows **Settings not saved · retrying…**; hover over it for details. OpenMic retries while it runs.
 
+If OpenMic cannot read its settings file at startup, it shows a recovery screen and keeps audio stopped. The file is protected from autosave and shutdown writes. Use **Open settings folder** to repair or restore it, or move it to a backup location to start fresh, then click **Retry loading**. A failed load does not silently replace your preferences with defaults or an older copy.
+
 ## Soundboard
 
 Drop one or more audio files onto the main window from any page to add them to the soundboard. OpenMic shows the new pads, skips files already on the board, and reports any files it could not read.

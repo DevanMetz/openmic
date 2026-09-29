@@ -7,6 +7,7 @@ mod mic_test;
 mod overlay;
 mod routes;
 mod settings_tab;
+mod startup;
 #[cfg(test)]
 mod snapshot;
 mod sound_tab;
@@ -260,14 +261,6 @@ impl App {
             let ctx = ctx.clone();
             app.updater = Updater::new(!cfg!(debug_assertions), move || ctx.request_repaint());
         }
-        // Reflect the actual registry state, like the Python app did.
-        app.settings.start_with_windows = config::startup_enabled();
-        if app.settings.start_with_windows {
-            // Refresh the entry: the exe may have moved, and older versions
-            // registered it without the start-hidden flag.
-            let _ = config::set_startup(true);
-        }
-
         app.tray = Tray::new(ctx, app.commands.0.clone()).ok();
         {
             let (commands, ctx) = (app.commands.0.clone(), ctx.clone());
@@ -284,26 +277,39 @@ impl App {
             Ok(hotkeys) => app.hotkeys = Some(hotkeys),
             Err(e) => app.hotkey_status = (short(&format!("{e:#}")), RED),
         }
-        app.hidden = start_hidden;
+        app.hidden = start_hidden && app.settings.load_error.is_none();
         app.strip_suppressed = std::env::args().any(|arg| arg == config::MINIMIZED_ARG);
-        if start_hidden && app.tray.is_none() && !app.settings.collapsed {
-            // Nowhere to restore it from: show the window after all.
+        if start_hidden && (!app.hidden || (app.tray.is_none() && !app.settings.collapsed)) {
+            // Show load errors, or a window with no way back from the tray.
             app.hidden = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         }
 
+        app.initialize_settings();
+        app
+    }
+
+    /// Apply startup side effects only after preferences have loaded successfully.
+    fn initialize_settings(&mut self) {
+        if self.settings.load_error.is_some() { return; }
+        // Reflect the actual registry state, like the Python app did.
+        self.settings.start_with_windows = config::startup_enabled();
+        if self.settings.start_with_windows {
+            // Refresh the entry: the exe may have moved, and older versions
+            // registered it without the start-hidden flag.
+            let _ = config::set_startup(true);
+        }
         let host = cpal_host();
-        app.inputs = list_devices(&host, false);
-        app.outputs = list_devices(&host, true);
+        self.inputs = list_devices(&host, false);
+        self.outputs = list_devices(&host, true);
         // Keep saved devices even if absent: a USB mic can appear after a
         // Windows-startup launch, and must not be silently swapped out. The
         // processed output goes back to VB-Cable on every launch.
-        choose_routes(&mut app.settings, &app.inputs, &app.outputs, true, false);
+        choose_routes(&mut self.settings, &self.inputs, &self.outputs, true, false);
 
-        if app.settings.auto_start {
-            app.start_engine();
+        if self.settings.auto_start {
+            self.start_engine();
         }
-        app
     }
 
     /// App state without a window, tray, hotkeys or devices (also for tests).
@@ -625,6 +631,7 @@ impl App {
     /// it, and put the user's own default back otherwise. Runs only when the
     /// relevant state changes, with throttled retries after a failure.
     fn sync_default_mic(&mut self) {
+        if self.settings.load_error.is_some() { return; }
         // A brief reconnect keeps VB-Cable as the default rather than
         // flipping Discord's input back and forth.
         let running = self.engine.is_some() || self.reconnecting;
@@ -684,6 +691,10 @@ impl App {
     // ---- tray, hotkeys and window ------------------------------------------
 
     fn run_command(&mut self, ctx: &egui::Context, command: Command) {
+        if self.settings.load_error.is_some() && !matches!(command, Command::Show | Command::Quit) {
+            self.run_command(ctx, Command::Show);
+            return;
+        }
         match command {
             Command::Show => {
                 // Showing the window expands a collapsed OpenMic.
@@ -881,7 +892,7 @@ impl App {
     fn handle_close(&mut self, ctx: &egui::Context) {
         let close = ctx.input(|i| i.viewport().close_requested());
         if close && !self.quitting {
-            if self.settings.close_to_tray && self.tray.is_some() && !self.confirm_quit {
+            if self.settings.load_error.is_none() && self.settings.close_to_tray && self.tray.is_some() && !self.confirm_quit {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                 self.hidden = true;
@@ -895,7 +906,7 @@ impl App {
     fn hotkey_bindings(&self) -> Vec<(String, Command)> {
         // While recording a new shortcut, free every key so the press
         // reaches the window instead of triggering an old binding.
-        if self.capturing.is_some() {
+        if self.capturing.is_some() || self.settings.load_error.is_some() {
             return Vec::new();
         }
         let h = &self.settings.hotkeys;
@@ -1080,6 +1091,7 @@ impl App {
             self.run_command(ctx, command);
         }
         self.handle_close(ctx);
+        if self.settings.load_error.is_some() { return; }
         self.poll_engine();
         if self.hidden || self.page != Page::Soundboard { self.close_trim_editor(); }
         self.poll_clip_loads(ctx);
@@ -1134,6 +1146,10 @@ impl eframe::App for App {
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
+        if self.settings.load_error.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+            return;
+        }
         self.minimize_to_strip(ctx);
         self.remember_window(ctx);
         self.show_overlay(ctx);
@@ -1152,6 +1168,10 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.settings.load_error.is_some() {
+            self.draw_settings_recovery(ui);
+            return;
+        }
         let ctx = ui.ctx().clone();
         self.import_dropped_sounds(&ctx);
         self.capture_hotkey(&ctx);
@@ -1713,6 +1733,7 @@ mod tests {
             ("gui/overlay.rs", include_str!("overlay.rs")),
             ("gui/settings_tab.rs", include_str!("settings_tab.rs")),
             ("gui/sound_tab.rs", include_str!("sound_tab.rs")),
+            ("gui/startup.rs", include_str!("startup.rs")),
             ("gui/updates.rs", include_str!("updates.rs")),
             ("gui/routes.rs", include_str!("routes.rs")),
             ("widgets.rs", include_str!("../widgets.rs")),
