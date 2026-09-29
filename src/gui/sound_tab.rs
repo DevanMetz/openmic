@@ -1335,15 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_points_pick_the_part_a_pad_plays() {
-        let samples = Arc::new((0..48_000).map(|i| i as f32).collect::<Vec<_>>());
-        assert!(Arc::ptr_eq(&crate::gui::trimmed(&samples, 0.0, None), &samples), "untrimmed pads share the clip");
-        let part = crate::gui::trimmed(&samples, 0.25, Some(0.5));
-        assert_eq!(part.len(), 12_000);
-        assert_eq!(part[0], 12_000.0);
-        assert!(crate::gui::trimmed(&samples, 2.0, None).is_empty(), "a start past the end plays nothing");
-        assert_eq!(crate::gui::trimmed(&samples, 0.5, Some(0.25)).len(), 0, "an end before the start plays nothing");
-
+    fn trimmed_lengths_and_duration_labels_describe_the_kept_audio() {
         assert_eq!(trimmed_length(4.0, 1.0, Some(3.0)), 2.0);
         assert_eq!(trimmed_length(4.0, 0.0, None), 4.0);
         assert_eq!(clock_seconds(4.25), "4.2 s");

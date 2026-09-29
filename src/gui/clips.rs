@@ -8,7 +8,7 @@ use anyhow::Context;
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, Color32};
 
-use super::{App, CachedClip, AMBER, CYAN, GREEN, MUTED, RED, clip_key, short, trimmed};
+use super::{App, CachedClip, AMBER, CYAN, GREEN, MUTED, RED, clip_key, short};
 use crate::config::Pad;
 use crate::dsp::{self, Clip};
 use crate::engine::Engine;
@@ -211,7 +211,8 @@ impl App {
 
     fn play_decoded_clip(&mut self, pad: &Pad, samples: &Arc<Vec<f32>>) {
         let Some(engine) = &self.engine else { return };
-        engine.play_sound(Clip::new(clip_key(&pad.path), trimmed(samples, pad.start, pad.end), pad.volume), self.settings.overlap_clips);
+        let clip = Clip::new(clip_key(&pad.path), Arc::clone(samples), pad.volume).with_trim(pad.start, pad.end);
+        engine.play_sound(clip, self.settings.overlap_clips);
         self.sound_status = (format!("Playing · {}", pad.display_name()), GREEN);
         self.sync_clip_progress();
     }
@@ -404,7 +405,7 @@ mod tests {
             finish(&mut app, &ctx);
             let playing = app.engine.as_ref().unwrap().take_clips();
             assert_eq!(playing.len(), 1);
-            assert_eq!(playing[0].samples.len(), 36_000);
+            assert_eq!(playing[0].samples().len(), 36_000);
             assert!(app.trim_waveform(&path, &ctx).is_some(), "the same decode also cached the waveform");
         }
     }
@@ -566,7 +567,8 @@ mod tests {
         assert_eq!(app.sound_status.0, "Playing · Clapping");
         let clips = app.engine.as_ref().unwrap().take_clips();
         assert_eq!(clips.len(), 1);
-        assert_eq!(clips[0].samples.len(), 24_000);
+        assert_eq!(clips[0].samples().len(), 24_000);
+        assert_eq!(clips[0].samples().as_ptr(), app.cached_clip(&path).unwrap().samples[12_000..].as_ptr(), "trimmed playback shares the decoded cache");
         assert_eq!(clips[0].gain, 0.3);
         assert_eq!(clips[0].key, clip_key(&path));
         app.play_clip(0, &ctx);

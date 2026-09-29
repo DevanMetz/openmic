@@ -259,7 +259,10 @@ pub const MAX_VOICES: usize = 16;
 pub struct Clip {
     /// Identifies the pad, so a pad restarts rather than stacking on itself.
     pub key: u64,
-    pub samples: std::sync::Arc<Vec<f32>>,
+    samples: std::sync::Arc<Vec<f32>>,
+    /// The selected part of the shared source audio.
+    range: std::ops::Range<usize>,
+    /// Position within the selected range, including while paused.
     pub pos: usize,
     pub paused: bool,
     /// The pad's own volume, on top of the soundboard volume.
@@ -268,7 +271,22 @@ pub struct Clip {
 
 impl Clip {
     pub fn new(key: u64, samples: std::sync::Arc<Vec<f32>>, gain: f32) -> Self {
-        Self { key, samples, pos: 0, paused: false, gain }
+        let end = samples.len();
+        Self { key, samples, range: 0..end, pos: 0, paused: false, gain }
+    }
+
+    /// Select trim points in seconds without copying the cached audio.
+    pub fn with_trim(mut self, start: f32, end: Option<f32>) -> Self {
+        let at = |seconds: f32| ((seconds.max(0.0) * SR as f32) as usize).min(self.samples.len());
+        let from = at(start);
+        self.range = from..end.map_or(self.samples.len(), at).max(from);
+        self.pos = 0;
+        self.paused = false;
+        self
+    }
+
+    pub fn samples(&self) -> &[f32] {
+        &self.samples[self.range.clone()]
     }
 }
 
@@ -289,14 +307,14 @@ impl Mixer {
     pub fn progress(&self) -> Vec<(u64, f32, bool)> {
         self.voices
             .iter()
-            .map(|v| (v.key, v.pos as f32 / v.samples.len().max(1) as f32, v.paused))
+            .map(|v| (v.key, v.pos as f32 / v.samples().len().max(1) as f32, v.paused))
             .collect()
     }
 
     /// Start `clip`. With `overlap` it layers over other pads (the same pad
     /// restarts); without it, it replaces whatever was playing.
     pub fn play(&mut self, clip: Clip, overlap: bool) {
-        if clip.samples.is_empty() {
+        if clip.samples().is_empty() {
             return;
         }
         if overlap {
@@ -344,9 +362,9 @@ impl Mixer {
             return;
         }
         for clip in self.voices.iter_mut().filter(|v| !v.paused) {
-            let end = (clip.pos + frame.len()).min(clip.samples.len());
+            let end = (clip.pos + frame.len()).min(clip.samples().len());
             let g = gain * clip.gain;
-            for (s, src) in frame.iter_mut().zip(&clip.samples[clip.pos..end]) {
+            for (s, src) in frame.iter_mut().zip(&clip.samples()[clip.pos..end]) {
                 *s += src * g;
             }
             clip.pos = end;
@@ -354,7 +372,7 @@ impl Mixer {
         for s in frame {
             *s = s.clamp(-1.0, 1.0);
         }
-        self.voices.retain(|v| v.pos < v.samples.len());
+        self.voices.retain(|v| v.pos < v.samples().len());
     }
 
     /// Playing and paused clips with their playheads (route-switch handoff).
@@ -420,6 +438,61 @@ mod tests {
 
     fn clip(key: u64, samples: Vec<f32>) -> Clip {
         Clip::new(key, std::sync::Arc::new(samples), 1.0)
+    }
+
+    #[test]
+    fn trim_points_select_shared_audio_and_clamp_to_the_source() {
+        let source = std::sync::Arc::new((0..SR).map(|i| i as f32).collect::<Vec<_>>());
+        for (start, end, range) in [
+            (0.0, None, 0..48_000),
+            (0.25, Some(0.5), 12_000..24_000),
+            (0.5, None, 24_000..48_000),
+            (-2.0, Some(2.0), 0..48_000),
+            (2.0, None, 48_000..48_000),
+            (0.5, Some(0.25), 24_000..24_000),
+            (0.0, Some(-1.0), 0..0),
+            (f32::NAN, Some(f32::INFINITY), 0..48_000),
+        ] {
+            let clip = Clip::new(7, std::sync::Arc::clone(&source), 0.5).with_trim(start, end);
+            assert_eq!(clip.samples(), &source[range.clone()]);
+            assert_eq!(clip.samples().as_ptr(), source[range.clone()].as_ptr(), "even a trimmed clip shares its source buffer");
+            let mut mixer = Mixer::default();
+            mixer.play(clip, false);
+            assert_eq!(mixer.playing_keys().is_empty(), range.is_empty());
+        }
+        let empty = Clip::new(7, std::sync::Arc::new(Vec::new()), 1.0).with_trim(0.25, Some(0.5));
+        assert!(empty.samples().is_empty());
+    }
+
+    #[test]
+    fn trimmed_playback_preserves_boundaries_progress_and_paused_route_handoffs() {
+        let mut samples = vec![0.9; 12_000];
+        for level in [0.1, 0.2, 0.3, 0.4] { samples.extend(vec![level; 6_000]); }
+        samples.extend(vec![-0.9; 12_000]);
+        let source = std::sync::Arc::new(samples);
+        let mut mixer = Mixer::default();
+        mixer.play(Clip::new(7, std::sync::Arc::clone(&source), 0.5).with_trim(0.25, Some(0.75)), false);
+        let mut first = vec![0.0; 6_000];
+        mixer.mix(&mut first, 1.0);
+        assert_eq!(first, vec![0.05; 6_000], "skip the prefix and apply per-pad gain");
+        assert_eq!(mixer.progress(), [(7, 0.25, false)], "progress is relative to the selected duration");
+        mixer.toggle_pause(7, false);
+        let mut routed = Mixer::default();
+        routed.resume(mixer.take_remaining());
+        assert_eq!(routed.progress(), [(7, 0.25, true)]);
+        let mut paused = [0.01; 32];
+        routed.mix(&mut paused, 1.0);
+        assert_eq!(paused, [0.01; 32]);
+        // The cache can release its copy while a playing clip keeps the source alive.
+        drop(source);
+        routed.toggle_pause(7, false);
+        let mut rest = vec![0.0; 18_001];
+        routed.mix(&mut rest, 1.0);
+        assert_eq!(&rest[..6_000], &vec![0.1; 6_000]);
+        assert_eq!(&rest[6_000..12_000], &vec![0.15; 6_000]);
+        assert_eq!(&rest[12_000..18_000], &vec![0.2; 6_000]);
+        assert_eq!(rest[18_000], 0.0, "do not leak audio past the trim end");
+        assert!(routed.progress().is_empty());
     }
 
     // Ported from test_soundboard.py mixing section.

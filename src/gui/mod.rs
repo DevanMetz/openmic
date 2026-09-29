@@ -1328,19 +1328,6 @@ fn on_a_monitor(_: [i32; 2]) -> bool {
     true
 }
 
-/// The part of a clip between its trim points (seconds; `end` `None` =
-/// the clip's end). Shares the clip when untrimmed.
-pub(super) fn trimmed(samples: &Arc<Vec<f32>>, start: f32, end: Option<f32>) -> Arc<Vec<f32>> {
-    let at = |seconds: f32| ((seconds.max(0.0) * dsp::SR as f32) as usize).min(samples.len());
-    let from = at(start);
-    let to = end.map_or(samples.len(), at).max(from);
-    if from == 0 && to == samples.len() {
-        Arc::clone(samples)
-    } else {
-        Arc::new(samples[from..to].to_vec())
-    }
-}
-
 fn open_url(url: &str) {
     // Explorer hands URLs to the default browser.
     let _ = std::process::Command::new("explorer").arg(url).spawn();
