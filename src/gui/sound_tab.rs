@@ -87,6 +87,12 @@ impl App {
         else {
             return;
         };
+        self.import_sounds(paths);
+    }
+
+    /// Both the file picker and native file drops validate and cache clips
+    /// before adding pads. Existing pads keep their names, trims and hotkeys.
+    fn import_sounds(&mut self, paths: Vec<PathBuf>) {
         let mut invalid = Vec::new();
         let mut added = 0;
         for path in paths {
@@ -102,17 +108,32 @@ impl App {
                 Err(_) => invalid.push(file_name(&path)),
             }
         }
-        if !invalid.is_empty() {
-            self.sound_status = (format!("Could not read: {}", invalid.join(", ")), RED);
-        } else if added > 0 {
-            self.sound_status = (
-                format!("Added {added} clip{}", if added == 1 { "" } else { "s" }),
-                GREEN,
-            );
-        }
+        let added_message = format!("Added {added} clip{}", if added == 1 { "" } else { "s" });
+        self.sound_status = match (added, invalid.is_empty()) {
+            (0, false) => (format!("Could not read: {}", invalid.join(", ")), RED),
+            (_, false) => (format!("{added_message} · Could not read: {}", invalid.join(", ")), AMBER),
+            (0, true) => ("These clips are already on the soundboard".into(), MUTED),
+            (_, true) => (added_message, GREEN),
+        };
         if added > 0 {
+            self.pad_filter.clear();
             self.touch();
         }
+    }
+
+    pub(super) fn import_dropped_sounds(&mut self, ctx: &egui::Context) {
+        let paths: Vec<_> = ctx.input_mut(|input| std::mem::take(&mut input.raw.dropped_files))
+            .into_iter()
+            .map(|file| file.path().to_owned())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.finish_pad_rename(true);
+        self.capturing = None;
+        self.page = super::Page::Soundboard;
+        self.pad_filter.clear();
+        self.import_sounds(paths);
     }
 
     fn remove_clip(&mut self, index: usize) {
@@ -535,7 +556,7 @@ impl App {
     }
 
     pub(super) fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
-        ui.weak("Click a pad to play, pause or resume. Use Add to strip to pin it.");
+        ui.weak("Drop audio files to add clips. Click a pad to play, pause or resume.");
         if self.engine.is_none() && !self.settings.sounds.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -588,7 +609,7 @@ impl App {
                             ui.add_space(22.0);
                             ui.vertical_centered(|ui| {
                                 ui.label(RichText::new("No clips yet").size(17.0).strong());
-                                ui.weak("Add a few sounds, then click a pad to play one.");
+                                ui.weak("Drop audio files here, or choose a few below.");
                                 ui.add_space(10.0);
                                 add_empty = ui
                                     .add(
@@ -1220,6 +1241,79 @@ mod tests {
             egui::Shape::Text(t) if t.galley.text() == name => Some(t.visual_bounding_rect().center()),
             _ => None,
         }).unwrap_or_else(|| panic!("{name} not drawn"))
+    }
+
+    #[test]
+    fn dropped_files_add_valid_pads_once_and_report_unreadable_files() {
+        use eframe::App as _;
+
+        #[derive(Debug)]
+        struct Dropped(PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &Path { &self.0 }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|error| error.to_string())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = wav(dir.path(), "existing.wav", 0.1);
+        let first = wav(dir.path(), "first.wav", 0.2);
+        let second = wav(dir.path(), "second.wav", 0.3);
+        let invalid = dir.path().join("unreadable.wav");
+        std::fs::write(&invalid, b"not an audio file").unwrap();
+        let mut pad = Pad::new(existing.clone());
+        pad.starred = true;
+        pad.volume = 0.5;
+        pad.hotkey = Some("Ctrl+Alt+1".into());
+        let mut app = App::stopped(crate::config::Settings { sounds: vec![pad.clone()], ..Default::default() });
+        app.page = super::super::Page::Settings;
+        app.pad_filter = "old search".into();
+        app.begin_pad_rename(&pad);
+        app.renaming_pad.as_mut().unwrap().text = "Keep this name".into();
+
+        let ctx = egui::Context::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
+                dropped_files: [&first, &invalid, &existing, &first, &second].into_iter()
+                    .map(|path| Arc::new(Dropped(path.clone())) as egui::DroppedFileHandle)
+                    .collect(),
+                ..Default::default()
+            },
+            |ui| app.ui(ui, &mut frame),
+        );
+
+        pad.name = Some("Keep this name".into());
+        assert_eq!(app.settings.sounds, [pad, Pad::new(first.clone()), Pad::new(second.clone())]);
+        assert!(app.page == super::super::Page::Soundboard);
+        assert!(app.pad_filter.is_empty() && app.renaming_pad.is_none());
+        assert!(app.dirty_since.is_some());
+        assert_eq!(app.sound_status, ("Added 2 clips · Could not read: unreadable.wav".into(), AMBER));
+        assert!(ctx.input(|input| input.raw.dropped_files.is_empty()), "consume drops once, even if egui repeats a layout pass");
+        let texts = board(&mut app, &ctx, Vec::new());
+        assert!(texts.iter().any(|text| text == "first") && texts.iter().any(|text| text == "second"));
+        assert_eq!(app.settings.sounds.len(), 3);
+        assert!(existing.exists() && first.exists() && second.exists() && invalid.exists());
+    }
+
+    #[test]
+    fn duplicate_or_unreadable_imports_leave_the_board_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav(dir.path(), "existing.wav", 0.1);
+        let pad = Pad::new(path.clone());
+        let mut app = App::stopped(crate::config::Settings { sounds: vec![pad.clone()], ..Default::default() });
+
+        app.import_sounds(vec![path.clone(), path]);
+        assert_eq!(app.settings.sounds.as_slice(), std::slice::from_ref(&pad));
+        assert!(app.dirty_since.is_none());
+        assert_eq!(app.sound_status, ("These clips are already on the soundboard".into(), MUTED));
+
+        app.import_sounds(vec![dir.path().join("missing.wav")]);
+        assert_eq!(app.settings.sounds, [pad]);
+        assert!(app.dirty_since.is_none());
+        assert_eq!(app.sound_status, ("Could not read: missing.wav".into(), RED));
     }
 
     #[test]

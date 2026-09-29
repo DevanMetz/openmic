@@ -1135,6 +1135,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.import_dropped_sounds(&ctx);
         self.capture_hotkey(&ctx);
         self.draw_release_notes(&ctx);
         self.update_running_status();
