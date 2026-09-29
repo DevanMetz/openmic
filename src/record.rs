@@ -423,7 +423,10 @@ impl WavWriter {
     /// boundary. Returns how many samples were written.
     fn write(&mut self, samples: &[f32]) -> Result<usize> {
         let frame_bytes = u64::from(self.channels) * 2;
-        let room = (MAX_DATA_BYTES - self.data_bytes) / frame_bytes * frame_bytes;
+        // Chunks can split a frame. Align the final total, not the room left
+        // in each chunk, so the last write completes those partial frames.
+        let limit = MAX_DATA_BYTES / frame_bytes * frame_bytes;
+        let room = limit.saturating_sub(self.data_bytes);
         let count = samples.len().min((room / 2) as usize);
         let mut bytes = [0u8; 8192];
         for chunk in samples[..count].chunks(4096) {
@@ -698,13 +701,22 @@ mod tests {
 
     #[test]
     fn writer_stops_on_a_frame_at_the_size_limit() {
-        let path = take_path();
-        let mut wav = WavWriter::create(&path, 48_000, 2).unwrap();
-        wav.data_bytes = MAX_DATA_BYTES - MAX_DATA_BYTES % 4 - 4; // room for one frame
-        assert_eq!(wav.write(&[0.0; 8]).unwrap(), 2);
-        assert_eq!(wav.write(&[0.0; 8]).unwrap(), 0);
-        drop(wav);
-        let _ = fs::remove_file(path);
+        let directory = tempfile::tempdir().unwrap();
+        for channels in [1, 2, 3, 5, 6, 8] {
+            let path = directory.path().join(format!("{channels}-channels.wav"));
+            let mut wav = WavWriter::create(&path, 48_000, channels).unwrap();
+            let frame_bytes = u64::from(channels) * 2;
+            let aligned_limit = MAX_DATA_BYTES / frame_bytes * frame_bytes;
+            // Start near 4 GB without a multi-gigabyte test file. The real
+            // writer's 8192-sample chunks can split multichannel frames.
+            wav.data_bytes = aligned_limit - 10_000 * frame_bytes;
+            let chunk = [0.25; 8192];
+            while wav.write(&chunk).unwrap() == chunk.len() {}
+            assert_eq!(wav.data_bytes, aligned_limit, "{channels} channels must end on a complete frame");
+            assert_eq!(wav.write(&chunk).unwrap(), 0);
+            drop(wav);
+            fs::remove_file(path).unwrap();
+        }
     }
 
     #[test]
