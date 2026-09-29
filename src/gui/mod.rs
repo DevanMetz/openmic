@@ -213,6 +213,8 @@ pub struct App {
     hidden: bool,
     /// Quit was chosen: let the window close instead of hiding it.
     quitting: bool,
+    /// A quit request would discard an active recording or unsaved take.
+    confirm_quit: bool,
     /// New releases: checked daily, installed when the user asks.
     updater: Updater,
     /// When this launch started, if it is a freshly installed update.
@@ -347,6 +349,7 @@ impl App {
             last_dictation: String::new(),
             hidden: false,
             quitting: false,
+            confirm_quit: false,
             updater: Updater::new(false, || {}),
             updated_at: None,
             update_checked_at: None,
@@ -714,10 +717,61 @@ impl App {
                     self.stop_dictation();
                 }
             }
-            Command::Quit => {
-                self.quitting = true;
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
+            Command::Quit => self.request_quit(ctx),
+        }
+    }
+
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.quitting {
+            return;
+        }
+        if self.recorder.is_some() || self.take.is_some() {
+            self.confirm_quit = true;
+            self.finish_pad_rename(true);
+            self.capturing = None;
+            self.page = Page::Record;
+            self.run_command(ctx, Command::Show);
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        } else {
+            self.quit(ctx);
+        }
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.confirm_quit = false;
+        self.quitting = true;
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn draw_quit_confirmation(&mut self, ctx: &egui::Context) {
+        if !self.confirm_quit {
+            return;
+        }
+        if self.recorder.is_none() && self.take.is_none() {
+            self.quit(ctx);
+            return;
+        }
+        let active = self.recorder.is_some();
+        let dialog = egui::Modal::new(egui::Id::new("quit-recording")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Quit without saving?");
+            ui.label(if active {
+                "Recording is still running. Quitting will discard this take."
+            } else {
+                "Your recording has not been saved. Quitting will discard it."
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(if active { "Keep recording" } else { "Back to recording" }).clicked() {
+                    self.confirm_quit = false;
+                }
+                if ui.button(RichText::new("Discard and quit").color(RED)).clicked() {
+                    self.quit(ctx);
+                }
+            });
+        });
+        if dialog.should_close() {
+            self.confirm_quit = false;
         }
     }
 
@@ -808,10 +862,14 @@ impl App {
     /// Closing the window hides it to the tray, unless quitting.
     fn handle_close(&mut self, ctx: &egui::Context) {
         let close = ctx.input(|i| i.viewport().close_requested());
-        if close && !self.quitting && self.settings.close_to_tray && self.tray.is_some() {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-            self.hidden = true;
+        if close && !self.quitting {
+            if self.settings.close_to_tray && self.tray.is_some() && !self.confirm_quit {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                self.hidden = true;
+            } else {
+                self.request_quit(ctx);
+            }
         }
     }
 
@@ -1204,6 +1262,7 @@ impl eframe::App for App {
                     Page::Settings => self.draw_settings_tab(ui),
                 });
         });
+        self.draw_quit_confirmation(&ctx);
     }
 }
 
@@ -1379,6 +1438,100 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn quit_and_window_close_preserve_active_and_unsaved_recordings() {
+        for active in [true, false] {
+            for window_close in [true, false] {
+                let ctx = egui::Context::default();
+                let mut app = App::stopped(Settings { close_to_tray: false, collapsed: true, ..Settings::default() });
+                let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+                if active {
+                    app.recorder = Some(recorder);
+                } else {
+                    app.take = recorder.finish().unwrap();
+                }
+                app.hidden = true;
+                let mut input = egui::RawInput::default();
+                if window_close {
+                    input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+                }
+                let output = ctx.run_ui(input, |ui| {
+                    if window_close {
+                        app.handle_close(ui.ctx());
+                    } else {
+                        app.run_command(ui.ctx(), Command::Quit);
+                    }
+                });
+                let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+                assert!(commands.contains(&ViewportCommand::CancelClose));
+                assert!(!commands.contains(&ViewportCommand::Close));
+                assert!(app.confirm_quit && !app.quitting);
+                assert!(!app.hidden && !app.settings.collapsed, "a hidden quit request must reveal the choice");
+                assert_eq!(app.page, Page::Record);
+                assert_eq!(app.recorder.is_some(), active, "asking to quit must not stop capture");
+                let take = if active { app.recorder.take().unwrap().finish().unwrap().unwrap() } else { app.take.take().unwrap() };
+                assert_eq!(take.samples().unwrap().len(), 240, "no audio was discarded");
+            }
+        }
+    }
+
+    #[test]
+    fn quit_confirmation_can_return_to_the_take_or_explicitly_discard_it() {
+        use eframe::App as _;
+        for (active, choice) in [
+            (false, "Back to recording"), (true, "Keep recording"),
+            (false, "Discard and quit"), (true, "Discard and quit"),
+            (false, "Escape"), (true, "Escape"),
+        ] {
+            let mut app = App::stopped(Settings::default());
+            let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+            if active {
+                app.recorder = Some(recorder);
+            } else {
+                app.take = recorder.finish().unwrap();
+            }
+            let ctx = egui::Context::default();
+            app.run_command(&ctx, Command::Quit);
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut draw = |app: &mut App, events| {
+                ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 420.0))),
+                    events,
+                    ..Default::default()
+                }, |ui| app.ui(ui, &mut frame))
+            };
+            draw(&mut app, Vec::new());
+            let output = draw(&mut app, Vec::new());
+            let output = if choice == "Escape" {
+                draw(&mut app, vec![egui::Event::Key {
+                    key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                }])
+            } else {
+                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == choice => Some(text.visual_bounding_rect().center()),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("{choice} must be visible"));
+                let mut click = |pressed| draw(&mut app, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                ]);
+                click(true);
+                click(false)
+            };
+            let discard = choice == "Discard and quit";
+            assert!(!app.confirm_quit);
+            assert_eq!(app.quitting, discard);
+            assert_eq!(output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::Close), discard);
+            assert_eq!(app.recorder.is_some(), active, "capture continues until actual exit");
+            let take = if active { app.recorder.take().unwrap().finish().unwrap().unwrap() } else { app.take.take().unwrap() };
+            assert_eq!(take.samples().unwrap().len(), 240, "the take remains intact until actual exit");
+        }
+
+        let mut app = App::stopped(Settings::default());
+        app.run_command(&egui::Context::default(), Command::Quit);
+        assert!(app.quitting && !app.confirm_quit, "nothing to lose: quit immediately");
     }
 
     #[test]

@@ -116,6 +116,8 @@ If writing a recording fails, OpenMic stops and reports the error. When possible
 
 Saving a take replaces an existing WAV only after the new file is complete, including when saving to another drive. If saving fails, your previous WAV stays intact and the take remains available to retry.
 
+If you quit with a recording running or a take still unsaved, OpenMic asks whether to return to it or discard it and quit. Closing to the notification area keeps the recording available without asking.
+
 ## Hotkeys and the notification area
 
 Set shortcuts for **Mute mic**, **Bypass processing**, **Stop all clips** and **Speech to text** on the **Settings** page, and for each pad from its right-click menu. Click **Set…**, then press the combination; Esc cancels. Shortcuts need Ctrl or Alt so they can't swallow ordinary typing, except the spare keys F13–F24 that macro pads and stream decks send. A shortcut given to a new action is taken from its old one. If another app already owns a combination, the Settings page says so.

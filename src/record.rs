@@ -107,6 +107,23 @@ impl PeakTracker {
 }
 
 impl Recorder {
+    /// Synthetic capture for lifecycle and UI tests; never opens an audio device.
+    #[cfg(test)]
+    pub(crate) fn from_samples_for_test(samples: &[f32]) -> Self {
+        let path = take_path();
+        let mut wav = WavWriter::create(&path, 48_000, 2).unwrap();
+        wav.write(samples).unwrap();
+        let data_bytes = wav.finish().unwrap();
+        let mut peaks = PeakTracker::new(48_000, 2);
+        peaks.push(samples);
+        Self {
+            stream: None, writer: Some(thread::spawn(move || Ok(data_bytes))), path: Some(path),
+            stop: Arc::default(), peaks: Arc::new(Mutex::new(peaks)), bytes: Arc::new(AtomicU64::new(data_bytes)),
+            sample_rate: 48_000, channels: 2, started: Instant::now(),
+            full: Arc::default(), skipped: Arc::default(), error: Arc::default(),
+        }
+    }
+
     /// An empty `device_name` means the Windows default device for that source.
     pub fn start(source: Source, device_name: &str) -> Result<Self> {
         #[cfg(not(windows))]
@@ -585,11 +602,7 @@ mod tests {
     use super::*;
 
     fn written_take(samples: &[f32]) -> Take {
-        let path = take_path();
-        let mut wav = WavWriter::create(&path, 48_000, 2).unwrap();
-        wav.write(samples).unwrap();
-        let bytes = wav.finish().unwrap();
-        Take { path, sample_rate: 48_000, frames: bytes / 4, peaks: Vec::new(), warning: None }
+        Recorder::from_samples_for_test(samples).finish().unwrap().unwrap()
     }
 
     #[test]

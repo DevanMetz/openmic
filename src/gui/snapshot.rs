@@ -123,10 +123,11 @@ pub(super) fn snapshot(app: &mut App, name: &str, size: egui::Vec2, ppp: f32, da
     let mut frame = eframe::Frame::_new_kittest();
     let mut textures: HashMap<TextureId, ColorImage> = HashMap::new();
     let mut output = None;
-    // A few frames, so layouts that measure themselves settle.
-    for _ in 0..4 {
+    // Let measured layouts and popup fade-in animations settle.
+    for step in 0..4 {
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
+            time: Some(f64::from(step) * 0.2),
             ..Default::default()
         };
         input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
@@ -205,6 +206,26 @@ fn snapshot_voice_page() {
         app.settings.setup.tested = true;
         app.demo_frames = demo_frames();
         let path = snapshot(&mut app, &format!("voice-{theme}"), egui::vec2(760.0, 880.0), 1.5, dark);
+        println!("SNAPSHOT {}", path.display());
+    }
+}
+
+#[test]
+#[ignore]
+fn snapshot_quit_recording() {
+    for active in [true, false] {
+        let mut app = App::stopped(Settings::default());
+        let recorder = crate::record::Recorder::from_samples_for_test(&vec![0.25; 48_000]);
+        if active {
+            app.recorder = Some(recorder);
+            app.record_status = ("Recording…".into(), super::RED);
+        } else {
+            app.take = recorder.finish().unwrap();
+            app.record_status = ("Take ready".into(), super::GREEN);
+        }
+        app.run_command(&egui::Context::default(), super::Command::Quit);
+        let name = if active { "quit-active-recording" } else { "quit-unsaved-recording" };
+        let path = snapshot(&mut app, name, egui::vec2(700.0, 420.0), 1.25, true);
         println!("SNAPSHOT {}", path.display());
     }
 }
