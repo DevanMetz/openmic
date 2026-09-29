@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
@@ -31,6 +32,14 @@ pub fn duration(path: &Path) -> Option<f32> {
 
 /// Decode `path` to clipped mono samples at [`dsp::SR`].
 pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
+    load_clip_cancellable(path, &AtomicBool::new(false))
+}
+
+/// Background imports can stop between packets without blocking the UI.
+pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("clip import cancelled");
+    }
     let src = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -54,6 +63,9 @@ pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
     let mut mono: Vec<f32> = Vec::new();
     let mut rate = 0u32;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("clip import cancelled");
+        }
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(e))
@@ -85,7 +97,11 @@ pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
         bail!("audio file is empty");
     }
 
-    Ok(resample_linear(&mono, rate, crate::dsp::SR))
+    let samples = resample_linear(&mono, rate, crate::dsp::SR);
+    if cancel.load(Ordering::Relaxed) {
+        bail!("clip import cancelled");
+    }
+    Ok(samples)
 }
 
 fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) {
@@ -236,6 +252,14 @@ mod tests {
         write_wav(&path, &[], 24000, 2);
         assert!(load_clip(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_cancelled_import_stops_before_opening_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("never-opened.wav");
+        let error = load_clip_cancellable(&path, &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(error.to_string(), "clip import cancelled");
     }
 
     #[test]

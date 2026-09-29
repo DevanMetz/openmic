@@ -1,12 +1,16 @@
 //! Soundboard tab: recording clips, the pads (with per-pad volume and
 //! hotkeys), and playback.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
+use anyhow::Context;
+use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea};
 
 use super::{
-    clip_key, clock_time, file_name, short, volume_slider, App, Binding, AMBER, CYAN, GREEN,
+    clip_key, clock_time, file_name, short, volume_slider, App, Binding, CachedClip, AMBER, CYAN, GREEN,
     MUTED, RED, VIOLET,
 };
 use crate::config::Pad;
@@ -17,6 +21,23 @@ pub(super) struct PadRename {
     path: PathBuf,
     text: String,
     focus: bool,
+}
+
+#[derive(Default)]
+pub(super) struct ClipImport {
+    /// The first path belongs to the current job until its result is collected.
+    files: VecDeque<PathBuf>,
+    job: Option<Receiver<anyhow::Result<CachedClip>>>,
+    cancel: Arc<AtomicBool>,
+    total: usize,
+    added: usize,
+    invalid: Vec<String>,
+}
+
+impl Drop for ClipImport {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl App {
@@ -76,7 +97,7 @@ impl App {
         }
     }
 
-    fn add_sounds(&mut self) {
+    fn add_sounds(&mut self, ctx: &egui::Context) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter(
                 "Audio files",
@@ -87,37 +108,89 @@ impl App {
         else {
             return;
         };
-        self.import_sounds(paths);
+        self.import_sounds(paths, ctx);
     }
 
     /// Both the file picker and native file drops validate and cache clips
     /// before adding pads. Existing pads keep their names, trims and hotkeys.
-    fn import_sounds(&mut self, paths: Vec<PathBuf>) {
-        let mut invalid = Vec::new();
-        let mut added = 0;
+    fn import_sounds(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let import = self.clip_import.get_or_insert_with(ClipImport::default);
         for path in paths {
-            if self.settings.sounds.iter().any(|p| p.path == path) {
+            if self.settings.sounds.iter().any(|p| p.path == path) || import.files.contains(&path) {
                 continue;
             }
-            // Decoding up front checks the file and warms the cache.
-            match self.clip_samples(&path) {
-                Ok(_) => {
-                    self.settings.sounds.push(Pad::new(path));
-                    added += 1;
+            import.files.push_back(path);
+            import.total += 1;
+        }
+        self.poll_clip_import(ctx);
+    }
+
+    pub(super) fn poll_clip_import(&mut self, ctx: &egui::Context) {
+        let Some(mut import) = self.clip_import.take() else { return };
+        let result = import.job.as_ref().and_then(|job| match job.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!("clip decoder stopped unexpectedly"))),
+        });
+        if let Some(result) = result {
+            import.job = None;
+            let path = import.files.pop_front().expect("an import job has a path");
+            match result {
+                Ok(clip) => {
+                    self.cache_clip(path.clone(), clip);
+                    if !self.settings.sounds.iter().any(|pad| pad.path == path) {
+                        self.settings.sounds.push(Pad::new(path));
+                        self.pad_filter.clear();
+                        self.touch();
+                        import.added += 1;
+                    }
                 }
-                Err(_) => invalid.push(file_name(&path)),
+                Err(error) => {
+                    crate::logfile::error(format_args!("could not import {}: {error:#}", path.display()));
+                    import.invalid.push(file_name(&path));
+                }
             }
         }
-        let added_message = format!("Added {added} clip{}", if added == 1 { "" } else { "s" });
-        self.sound_status = match (added, invalid.is_empty()) {
-            (0, false) => (format!("Could not read: {}", invalid.join(", ")), RED),
-            (_, false) => (format!("{added_message} · Could not read: {}", invalid.join(", ")), AMBER),
+
+        while import.job.is_none() && let Some(path) = import.files.front().cloned() {
+            let (done, job) = crossbeam_channel::bounded(1);
+            let cancel = Arc::clone(&import.cancel);
+            let wake = ctx.clone();
+            let file = path.clone();
+            let spawned = std::thread::Builder::new().name("openmic-clip-import".into()).spawn(move || {
+                let result = (|| {
+                    let metadata = std::fs::metadata(&file).context("read clip metadata")?;
+                    let samples = crate::decode::load_clip_cancellable(&file, &cancel)?;
+                    Ok(CachedClip { samples: Arc::new(samples), bytes: metadata.len(), modified: metadata.modified().ok() })
+                })();
+                let _ = done.send(result);
+                wake.request_repaint();
+            });
+            match spawned {
+                Ok(_) => import.job = Some(job),
+                Err(error) => {
+                    crate::logfile::error(format_args!("could not start clip import: {error}"));
+                    import.files.pop_front();
+                    import.invalid.push(file_name(&path));
+                }
+            }
+        }
+        if import.job.is_some() {
+            self.clip_import = Some(import);
+            return;
+        }
+        let added_message = format!("Added {} clip{}", import.added, if import.added == 1 { "" } else { "s" });
+        self.sound_status = match (import.added, import.invalid.is_empty()) {
+            (0, false) => (format!("Could not read: {}", import.invalid.join(", ")), RED),
+            (_, false) => (format!("{added_message} · Could not read: {}", import.invalid.join(", ")), AMBER),
             (0, true) => ("These clips are already on the soundboard".into(), MUTED),
             (_, true) => (added_message, GREEN),
         };
-        if added > 0 {
-            self.pad_filter.clear();
-            self.touch();
+    }
+
+    fn cancel_clip_import(&mut self) {
+        if self.clip_import.take().is_some() {
+            self.sound_status = ("Import cancelled · clips already added are kept".into(), AMBER);
         }
     }
 
@@ -133,7 +206,7 @@ impl App {
         self.capturing = None;
         self.page = super::Page::Soundboard;
         self.pad_filter.clear();
-        self.import_sounds(paths);
+        self.import_sounds(paths, ctx);
     }
 
     fn remove_clip(&mut self, index: usize) {
@@ -559,6 +632,20 @@ impl App {
 
     pub(super) fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
         ui.weak("Drop audio files to add clips. Click a pad to play, pause or resume.");
+        if let Some(import) = &self.clip_import {
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Adding clips · {} of {}", import.total - import.files.len(), import.total));
+                cancel = ui.button("Cancel import").clicked();
+            });
+            if let Some(path) = import.files.front() {
+                ui.add(egui::Label::new(RichText::new(file_name(path)).weak()).truncate());
+            }
+            if cancel {
+                self.cancel_clip_import();
+            }
+        }
         if self.engine.is_none() && !self.settings.sounds.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -701,7 +788,7 @@ impl App {
             },
         );
         if add_header || add_empty {
-            self.add_sounds();
+            self.add_sounds(ui.ctx());
         }
         if let Some(index) = remove_index {
             self.remove_clip(index);
@@ -1245,6 +1332,15 @@ mod tests {
         }).unwrap_or_else(|| panic!("{name} not drawn"))
     }
 
+    fn finish_import(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.clip_import.is_some() {
+            app.poll_clip_import(ctx);
+            assert!(std::time::Instant::now() < deadline, "clip import did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn dropped_files_add_valid_pads_once_and_report_unreadable_files() {
         use eframe::App as _;
@@ -1287,6 +1383,7 @@ mod tests {
             |ui| app.ui(ui, &mut frame),
         );
 
+        finish_import(&mut app, &ctx);
         pad.name = Some("Keep this name".into());
         assert_eq!(app.settings.sounds, [pad, Pad::new(first.clone()), Pad::new(second.clone())]);
         assert!(app.page == super::super::Page::Soundboard);
@@ -1306,16 +1403,119 @@ mod tests {
         let path = wav(dir.path(), "existing.wav", 0.1);
         let pad = Pad::new(path.clone());
         let mut app = App::stopped(crate::config::Settings { sounds: vec![pad.clone()], ..Default::default() });
+        let ctx = egui::Context::default();
 
-        app.import_sounds(vec![path.clone(), path]);
+        app.import_sounds(vec![path.clone(), path], &ctx);
         assert_eq!(app.settings.sounds.as_slice(), std::slice::from_ref(&pad));
         assert!(app.dirty_since.is_none());
         assert_eq!(app.sound_status, ("These clips are already on the soundboard".into(), MUTED));
 
-        app.import_sounds(vec![dir.path().join("missing.wav")]);
+        app.import_sounds(vec![dir.path().join("missing.wav")], &ctx);
+        finish_import(&mut app, &ctx);
         assert_eq!(app.settings.sounds, [pad]);
         assert!(app.dirty_since.is_none());
         assert_eq!(app.sound_status, ("Could not read: missing.wav".into(), RED));
+    }
+
+    #[test]
+    fn pending_imports_keep_controls_responsive_and_accept_more_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = wav(dir.path(), "first.wav", 0.1);
+        let second = wav(dir.path(), "second.wav", 0.2);
+        let third = wav(dir.path(), "third.wav", 0.3);
+        let mut app = App::stopped(crate::config::Settings::default());
+        let ctx = egui::Context::default();
+        let (done, job) = crossbeam_channel::bounded(1);
+        app.clip_import = Some(ClipImport {
+            files: [first.clone(), second.clone()].into(), job: Some(job), total: 2,
+            added: 0, invalid: Vec::new(), cancel: Arc::default(),
+        });
+
+        app.import_sounds(vec![first.clone(), second.clone(), third.clone(), third.clone()], &ctx);
+        assert!(app.settings.sounds.is_empty(), "a pending decoder must not be waited on by the UI");
+        assert_eq!(app.clip_import.as_ref().unwrap().total, 3, "deduplicate both current and queued files");
+        app.run_command(&ctx, super::super::Command::ToggleMute);
+        assert!(app.settings.mute, "global microphone controls keep working during an import");
+
+        let metadata = std::fs::metadata(&first).unwrap();
+        let samples = Arc::new(crate::decode::load_clip(&first).unwrap());
+        assert!(done.send(Ok(CachedClip { samples: Arc::clone(&samples), bytes: metadata.len(), modified: metadata.modified().ok() })).is_ok());
+        app.poll_clip_import(&ctx);
+        assert_eq!(app.settings.sounds, [Pad::new(first.clone())], "completed clips become available before the whole batch ends");
+        assert!(Arc::ptr_eq(&app.clip_samples(&first).unwrap(), &samples), "completed imports warm the playback cache");
+        finish_import(&mut app, &ctx);
+        assert_eq!(app.settings.sounds, [first, second, third].map(Pad::new));
+        assert_eq!(app.sound_status, ("Added 3 clips".into(), GREEN));
+    }
+
+    #[test]
+    fn cancelling_import_keeps_finished_pads_and_discards_late_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = wav(dir.path(), "saved.wav", 0.1);
+        let pending = wav(dir.path(), "pending.wav", 0.2);
+        let pad = Pad::new(saved);
+        let mut app = App::stopped(crate::config::Settings { sounds: vec![pad.clone()], ..Default::default() });
+        app.page = super::super::Page::Soundboard;
+        let ctx = egui::Context::default();
+        let (done, job) = crossbeam_channel::bounded(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.clip_import = Some(ClipImport {
+            files: [pending.clone()].into(), job: Some(job), total: 2, added: 1,
+            cancel: Arc::clone(&cancel), invalid: Vec::new(),
+        });
+        assert!(app.update_blocker().is_some());
+        board(&mut app, &ctx, Vec::new());
+        let pos = pad_title_position(&mut app, &ctx, "Cancel import");
+        for pressed in [true, false] {
+            board(&mut app, &ctx, vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+            ]);
+        }
+
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.clip_import.is_none() && app.update_blocker().is_none());
+        assert_eq!(app.settings.sounds, [pad]);
+        assert!(done.send(Err(anyhow::anyhow!("late result"))).is_err());
+        app.poll_clip_import(&ctx);
+        assert!(app.sound_status.0.starts_with("Import cancelled"));
+
+        app.import_sounds(vec![pending], &ctx);
+        finish_import(&mut app, &ctx);
+        assert_eq!(app.settings.sounds.len(), 2, "a cancelled file can be imported again");
+    }
+
+    #[test]
+    fn a_failed_import_worker_does_not_stall_the_rest_of_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = wav(dir.path(), "good.wav", 0.1);
+        let mut app = App::stopped(crate::config::Settings::default());
+        let ctx = egui::Context::default();
+        let (done, job) = crossbeam_channel::bounded(1);
+        app.clip_import = Some(ClipImport {
+            files: [dir.path().join("failed.wav"), good.clone()].into(), job: Some(job), total: 2,
+            added: 0, invalid: Vec::new(), cancel: Arc::default(),
+        });
+        drop(done);
+        finish_import(&mut app, &ctx);
+        assert_eq!(app.settings.sounds, [Pad::new(good)]);
+        assert_eq!(app.sound_status, ("Added 1 clip · Could not read: failed.wav".into(), AMBER));
+        assert!(app.update_blocker().is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn snapshot_clip_import() {
+        let mut app = App::stopped(crate::config::Settings::default());
+        app.page = super::super::Page::Soundboard;
+        app.clip_import = Some(ClipImport {
+            files: [PathBuf::from("Field recording - extended audience applause.wav"), PathBuf::from("airhorn.wav")].into(),
+            total: 2, job: None, added: 0, invalid: Vec::new(), cancel: Arc::default(),
+        });
+        for (height, name) in [(720.0, "soundboard-import"), (420.0, "soundboard-import-short")] {
+            let path = super::super::snapshot::snapshot(&mut app, name, egui::vec2(700.0, height), 1.25, true);
+            println!("SNAPSHOT {}", path.display());
+        }
     }
 
     #[test]

@@ -162,6 +162,8 @@ pub struct App {
     trim_peaks: Option<(PathBuf, Vec<f32>)>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
     clip_cache: HashMap<PathBuf, CachedClip>,
+    /// Files being imported in the background, one decoder at a time.
+    clip_import: Option<sound_tab::ClipImport>,
     record_source: Source,
     record_output: String,
     recorder: Option<Recorder>,
@@ -314,6 +316,7 @@ impl App {
             renaming_pad: None,
             trim_peaks: None,
             clip_cache: HashMap::new(),
+            clip_import: None,
             record_source: Source::Microphone,
             record_output: String::new(),
             recorder: None,
@@ -770,6 +773,8 @@ impl App {
             Some("Save or discard your recording first")
         } else if self.dictating.is_some() || self.dictation.busy() {
             Some("Wait for speech to text to finish")
+        } else if self.clip_import.is_some() {
+            Some("Wait for clip imports to finish or cancel them")
         } else {
             None
         }
@@ -1018,17 +1023,22 @@ impl App {
         self.forget_clip(path);
         let metadata = metadata.with_context(|| format!("read {}", path.display()))?;
         let samples = Arc::new(crate::decode::load_clip(path)?);
-        // Keep the cache to about ten minutes of audio (~110 MB).
-        let cached: usize = self.clip_cache.values().map(|clip| clip.samples.len()).sum();
-        if cached + samples.len() > dsp::SR as usize * 600 {
-            self.clip_cache.clear();
-        }
-        self.clip_cache.insert(path.to_owned(), CachedClip {
+        self.cache_clip(path.to_owned(), CachedClip {
             samples: Arc::clone(&samples),
             bytes: metadata.len(),
             modified: metadata.modified().ok(),
         });
         Ok(samples)
+    }
+
+    fn cache_clip(&mut self, path: PathBuf, clip: CachedClip) {
+        self.forget_clip(&path);
+        // Keep the cache to about ten minutes of audio (~110 MB).
+        let cached: usize = self.clip_cache.values().map(|clip| clip.samples.len()).sum();
+        if cached + clip.samples.len() > dsp::SR as usize * 600 {
+            self.clip_cache.clear();
+        }
+        self.clip_cache.insert(path, clip);
     }
 
     fn forget_clip(&mut self, path: &Path) {
@@ -1096,6 +1106,7 @@ impl App {
         self.poll_recording();
         self.poll_dictation();
         self.poll_mic_test();
+        self.poll_clip_import(ctx);
         self.updater.tick(self.settings.check_for_updates);
         self.sync_default_mic();
         if (cable_input(&self.outputs).is_none() || self.waiting_for_device)
@@ -1129,6 +1140,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         logfile::info("quitting");
         self.finish_pad_rename(true);
+        self.clip_import.take();
         self.recorder.take();
         self.dictating.take();
         self.stop_engine(false);
