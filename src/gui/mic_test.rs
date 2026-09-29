@@ -181,12 +181,27 @@ impl App {
                 Err(TryRecvError::Empty) => {}
             }
         }
-        if self.mic_test.player.as_ref().is_some_and(|(player, _)| player.finished()) {
-            self.mic_test.player = None;
-            self.mic_test.status = Some(("Tune the settings and listen again".into(), MUTED));
-            if !self.settings.setup.tested {
-                self.settings.setup.tested = true;
-                self.touch();
+        let error = self.mic_test.player.as_ref().and_then(|(player, _)| player.take_error());
+        if let Some(error) = error {
+            self.finish_test_playback(Err(error));
+        } else if self.mic_test.player.as_ref().is_some_and(|(player, _)| player.finished()) {
+            self.finish_test_playback(Ok(()));
+        }
+    }
+
+    fn finish_test_playback(&mut self, result: Result<(), String>) {
+        self.mic_test.player = None;
+        match result {
+            Ok(()) => {
+                self.mic_test.status = Some(("Tune the settings and listen again".into(), MUTED));
+                if !self.settings.setup.tested {
+                    self.settings.setup.tested = true;
+                    self.touch();
+                }
+            }
+            Err(error) => {
+                crate::logfile::error(format_args!("mic test playback stopped: {error}"));
+                self.mic_test.status = Some((short(&format!("Playback stopped: {error}")), RED));
             }
         }
     }
@@ -322,5 +337,26 @@ mod tests {
         assert_eq!(samples.as_slice(), &[0.25; 480]);
         assert_eq!(*cleaned_params, params);
         assert!(!app.settings.setup.tested, "cancelling is not a successful listen");
+    }
+
+    #[test]
+    fn failed_playback_preserves_the_preview_for_retry_without_completing_setup() {
+        let mut app = App::stopped(Settings::default());
+        let raw = Arc::new(vec![0.1; 480]);
+        let cleaned = Arc::new(vec![0.05; 480]);
+        app.mic_test.raw = Some(Arc::clone(&raw));
+        app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params()));
+
+        app.finish_test_playback(Err("Headphones disconnected".into()));
+
+        assert!(!app.mic_test.busy());
+        assert!(!app.settings.setup.tested && app.dirty_since.is_none());
+        assert_eq!(app.mic_test.status, Some(("Playback stopped: Headphones disconnected".into(), RED)));
+        assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+        assert!(Arc::ptr_eq(&app.mic_test.cleaned.as_ref().unwrap().0, &cleaned));
+
+        app.finish_test_playback(Ok(()));
+        assert!(app.settings.setup.tested && app.dirty_since.is_some(), "a successful retry completes the checklist");
+        assert_eq!(app.mic_test.status.as_ref().unwrap().1, MUTED);
     }
 }

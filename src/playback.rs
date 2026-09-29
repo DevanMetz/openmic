@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::dsp::SR;
 use crate::resample::Resampler;
@@ -16,6 +17,7 @@ pub struct Player {
     _stream: Stream,
     pos: Arc<AtomicUsize>,
     len: usize,
+    errors: Receiver<String>,
 }
 
 /// Whether a device name is VB-Cable (Discord's input), which the mic test
@@ -50,16 +52,17 @@ impl Player {
         let audio = Arc::new(resample(samples, config.sample_rate));
         let pos = Arc::new(AtomicUsize::new(0));
         let len = audio.len();
+        let (report, errors) = crossbeam_channel::bounded(1);
         let stream = match supported.sample_format() {
-            SampleFormat::F32 => build::<f32>(&device, &config, &audio, &pos),
-            SampleFormat::I16 => build::<i16>(&device, &config, &audio, &pos),
-            SampleFormat::U16 => build::<u16>(&device, &config, &audio, &pos),
-            SampleFormat::I32 => build::<i32>(&device, &config, &audio, &pos),
-            SampleFormat::F64 => build::<f64>(&device, &config, &audio, &pos),
+            SampleFormat::F32 => build::<f32>(&device, &config, &audio, &pos, &report),
+            SampleFormat::I16 => build::<i16>(&device, &config, &audio, &pos, &report),
+            SampleFormat::U16 => build::<u16>(&device, &config, &audio, &pos, &report),
+            SampleFormat::I32 => build::<i32>(&device, &config, &audio, &pos, &report),
+            SampleFormat::F64 => build::<f64>(&device, &config, &audio, &pos, &report),
             other => Err(anyhow!("unsupported output format {other}")),
         }?;
         stream.play().context("start playback")?;
-        Ok(Self { _stream: stream, pos, len })
+        Ok(Self { _stream: stream, pos, len, errors })
     }
 
     /// How far through the clip playback is, 0..=1.
@@ -69,6 +72,12 @@ impl Player {
 
     pub fn finished(&self) -> bool {
         self.pos.load(Ordering::Relaxed) >= self.len
+    }
+
+    /// A failed output stream needs another playback attempt; the recording
+    /// itself remains available. Transient buffer glitches are ignored.
+    pub fn take_error(&self) -> Option<String> {
+        self.errors.try_recv().ok()
     }
 }
 
@@ -92,7 +101,16 @@ fn resample(samples: &[f32], rate: u32) -> Vec<f32> {
     out
 }
 
-fn build<T>(device: &cpal::Device, config: &StreamConfig, audio: &Arc<Vec<f32>>, pos: &Arc<AtomicUsize>) -> Result<Stream>
+fn error_callback(report: Sender<String>) -> impl FnMut(cpal::Error) + Send + 'static {
+    move |error| {
+        if !crate::engine::is_transient(&error) {
+            // Keep the first failure and never block an audio callback.
+            let _ = report.try_send(error.to_string());
+        }
+    }
+}
+
+fn build<T>(device: &cpal::Device, config: &StreamConfig, audio: &Arc<Vec<f32>>, pos: &Arc<AtomicUsize>, report: &Sender<String>) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32>,
 {
@@ -109,7 +127,7 @@ where
             }
             pos.store(at, Ordering::Relaxed);
         },
-        |_| {},
+        error_callback(report.clone()),
         None,
     )?)
 }
@@ -131,5 +149,24 @@ mod tests {
         let out = resample(&second, 44_100);
         assert!((out.len() as i64 - 44_100).abs() < 200, "{}", out.len());
         assert_eq!(resample(&second, SR).len(), SR as usize);
+    }
+
+    #[test]
+    fn playback_reports_a_lost_device_but_survives_transient_glitches() {
+        use cpal::ErrorKind;
+
+        let (report, errors) = crossbeam_channel::bounded(1);
+        let mut callback = error_callback(report);
+        for kind in [ErrorKind::Xrun, ErrorKind::RealtimeDenied, ErrorKind::DeviceChanged] {
+            callback(kind.into());
+        }
+        assert!(errors.try_recv().is_err());
+        callback(ErrorKind::DeviceNotAvailable.into());
+        callback(ErrorKind::StreamInvalidated.into());
+        let expected: cpal::Error = ErrorKind::DeviceNotAvailable.into();
+        assert_eq!(errors.try_recv().unwrap(), expected.to_string(), "preserve the first failure without waiting for the UI");
+        assert!(errors.try_recv().is_err());
+        drop(errors);
+        callback(ErrorKind::StreamInvalidated.into()); // the UI already stopped playback
     }
 }
