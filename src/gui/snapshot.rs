@@ -220,7 +220,7 @@ fn snapshot_quit_recording() {
             app.recorder = Some(recorder);
             app.record_status = ("Recording…".into(), super::RED);
         } else {
-            app.take = recorder.finish().unwrap();
+            app.take = recorder.finish().unwrap().map(std::sync::Arc::new);
             app.record_status = ("Take ready".into(), super::GREEN);
         }
         app.run_command(&egui::Context::default(), super::Command::Quit);

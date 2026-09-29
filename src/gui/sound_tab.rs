@@ -40,6 +40,16 @@ impl Drop for ClipImport {
     }
 }
 
+pub(super) struct RecordingSave {
+    job: Receiver<anyhow::Result<PathBuf>>,
+    add_to_board: bool,
+}
+
+enum RecordingDestination {
+    Wav(PathBuf),
+    Soundboard(String),
+}
+
 impl App {
     pub(super) fn begin_pad_rename(&mut self, pad: &Pad) {
         self.finish_pad_rename(true);
@@ -271,7 +281,7 @@ impl App {
                         Some(warning) => (format!("Partial take ready · {duration} · {}", short(warning)), AMBER),
                         None => (format!("Take ready · {duration}"), GREEN),
                     };
-                    self.take = Some(take);
+                    self.take = Some(Arc::new(take));
                     status
                 }
                 Ok(None) => ("No audio was captured. Try again while sound is playing.".into(), AMBER),
@@ -281,6 +291,7 @@ impl App {
     }
 
     pub(super) fn poll_recording(&mut self) {
+        self.poll_recording_save();
         let error = self.recorder.as_ref().and_then(Recorder::error);
         if let Some(error) = error {
             crate::logfile::error(format_args!("recording stopped: {error}"));
@@ -296,8 +307,10 @@ impl App {
         }
     }
 
-    fn save_recording(&mut self) {
-        let Some(take) = &self.take else { return };
+    fn save_recording(&mut self, ctx: &egui::Context) {
+        if self.take.is_none() || self.recording_save.is_some() {
+            return;
+        }
         let default_name = format!("{}.wav", record::safe_stem(&self.record_name));
         let Some(path) = rfd::FileDialog::new()
             .add_filter("WAV audio", &["wav"])
@@ -314,31 +327,69 @@ impl App {
             self.record_status = ("Choose a .wav filename".into(), AMBER);
             return;
         }
-        match take.save_wav(&path) {
-            Ok(()) => {
-                self.take = None;
-                self.record_status = (format!("Saved {}", file_name(&path)), GREEN);
+        self.start_recording_save(RecordingDestination::Wav(path), ctx);
+    }
+
+    fn start_recording_save(&mut self, destination: RecordingDestination, ctx: &egui::Context) {
+        if self.recording_save.is_some() {
+            return;
+        }
+        let Some(take) = self.take.clone() else { return };
+        let add_to_board = matches!(destination, RecordingDestination::Soundboard(_));
+        let (done, job) = crossbeam_channel::bounded(1);
+        let wake = ctx.clone();
+        let spawned = std::thread::Builder::new().name("openmic-save-recording".into()).spawn(move || {
+            let result = match destination {
+                RecordingDestination::Wav(path) => take.save_wav(&path).map(|()| path),
+                RecordingDestination::Soundboard(name) => take.add_to_library(&name),
+            };
+            let _ = done.send(result);
+            wake.request_repaint();
+        });
+        match spawned {
+            Ok(_) => {
+                self.recording_save = Some(RecordingSave { job, add_to_board });
+                self.record_status = ("Saving recording…".into(), CYAN);
             }
-            Err(err) => self.record_status = (short(&format!("{err:#}")), RED),
+            Err(error) => self.record_status = (short(&format!("Could not start saving: {error}")), RED),
         }
     }
 
-    fn add_recording(&mut self) {
-        let Some(take) = &self.take else { return };
-        match take.add_to_library(&self.record_name) {
+    fn poll_recording_save(&mut self) {
+        let Some(save) = &self.recording_save else { return };
+        let result = match save.job.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("Recording save stopped unexpectedly; try again")),
+        };
+        let add_to_board = save.add_to_board;
+        self.recording_save = None;
+        match result {
             Ok(path) => {
-                self.record_status = (format!("Added {} to your pads", file_name(&path)), GREEN);
-                self.settings.sounds.push(Pad::new(path));
+                if add_to_board {
+                    self.record_status = (format!("Added {} to your pads", file_name(&path)), GREEN);
+                    if !self.settings.sounds.iter().any(|pad| pad.path == path) {
+                        self.settings.sounds.push(Pad::new(path));
+                        self.touch();
+                    }
+                    self.pad_filter.clear();
+                } else {
+                    self.record_status = (format!("Saved {}", file_name(&path)), GREEN);
+                }
                 self.take = None;
-                self.touch();
             }
-            Err(err) => self.record_status = (short(&format!("{err:#}")), RED),
+            Err(error) => {
+                self.confirm_quit = false;
+                crate::logfile::error(format_args!("recording was not saved: {error:#}"));
+                self.record_status = (short(&format!("{error:#}")), RED);
+            }
         }
     }
 
     fn draw_recording(&mut self, ui: &mut egui::Ui) {
         let active = self.recorder.is_some();
         let take_ready = self.take.is_some();
+        let saving = self.recording_save.is_some();
         let outputs = self.outputs.clone();
         let mut start = false;
         let mut stop = false;
@@ -354,6 +405,8 @@ impl App {
                     ui,
                     if active {
                         "Recording"
+                    } else if saving {
+                        "Saving"
                     } else if take_ready {
                         "Take ready"
                     } else {
@@ -451,13 +504,18 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label("Name");
-                        ui.add(egui::TextEdit::singleline(&mut self.record_name).desired_width(260.0));
+                        ui.add_enabled(!saving, egui::TextEdit::singleline(&mut self.record_name).desired_width(260.0));
                         ui.weak(clock_time(take.duration()));
                     });
                     ui.horizontal(|ui| {
-                        add = ui.button("Add to soundboard").clicked();
-                        save = ui.button("Save WAV…").clicked();
-                        discard = ui.small_button("Discard take").clicked();
+                        ui.add_enabled_ui(!saving, |ui| {
+                            add = ui.button("Add to soundboard").clicked();
+                            save = ui.button("Save WAV…").clicked();
+                            discard = ui.small_button("Discard take").clicked();
+                        });
+                        if saving {
+                            ui.spinner();
+                        }
                     });
                 } else {
                     ui.horizontal(|ui| {
@@ -478,10 +536,10 @@ impl App {
             self.stop_recording();
         }
         if add {
-            self.add_recording();
+            self.start_recording_save(RecordingDestination::Soundboard(self.record_name.clone()), ui.ctx());
         }
         if save {
-            self.save_recording();
+            self.save_recording(ui.ctx());
         }
         if discard {
             self.take = None;
@@ -1340,6 +1398,143 @@ mod tests {
             app.poll_clip_import(ctx);
             assert!(std::time::Instant::now() < deadline, "clip import did not finish");
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn finish_recording_save(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.recording_save.is_some() {
+            app.poll_recording();
+            assert!(std::time::Instant::now() < deadline, "recording save did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn failed_background_recording_saves_keep_the_take_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked.wav");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut app = App::stopped(crate::config::Settings::default());
+        let take = Arc::new(Recorder::from_samples_for_test(&[0.25; 480]).finish().unwrap().unwrap());
+        app.take = Some(Arc::clone(&take));
+        let ctx = egui::Context::default();
+        app.start_recording_save(RecordingDestination::Wav(blocked.clone()), &ctx);
+        app.run_command(&ctx, super::super::Command::Quit);
+        assert!(app.confirm_quit && !app.quitting);
+        finish_recording_save(&mut app);
+        assert!(!app.confirm_quit && !app.quitting, "a failed save cancels the pending quit");
+        assert!(Arc::ptr_eq(app.take.as_ref().unwrap(), &take));
+        assert_eq!(take.samples().unwrap().len(), 240);
+        assert!(blocked.is_dir());
+        assert_eq!(app.record_status.1, RED);
+
+        let saved = dir.path().join("saved.wav");
+        let duplicate = dir.path().join("duplicate.wav");
+        app.start_recording_save(RecordingDestination::Wav(saved.clone()), &ctx);
+        app.start_recording_save(RecordingDestination::Wav(duplicate.clone()), &ctx);
+        assert!(app.recording_save.is_some());
+        app.run_command(&ctx, super::super::Command::ToggleMute);
+        assert!(app.settings.mute, "microphone controls remain available while saving");
+        finish_recording_save(&mut app);
+        assert!(app.take.is_none() && app.settings.sounds.is_empty());
+        assert_eq!(crate::decode::load_clip(&saved).unwrap().len(), 240);
+        assert!(!duplicate.exists(), "one save per take at a time");
+        assert_eq!(app.record_status, ("Saved saved.wav".into(), GREEN));
+    }
+
+    #[test]
+    fn recording_pads_are_added_only_after_the_background_save_succeeds() {
+        let mut app = App::stopped(crate::config::Settings::default());
+        app.take = Recorder::from_samples_for_test(&[0.25; 480]).finish().unwrap().map(Arc::new);
+        app.pad_filter = "old search".into();
+        app.start_recording_save(RecordingDestination::Soundboard("Background save test".into()), &egui::Context::default());
+        assert!(app.recording_save.is_some() && app.settings.sounds.is_empty());
+        finish_recording_save(&mut app);
+        assert!(app.take.is_none());
+        assert_eq!(app.settings.sounds.len(), 1);
+        let path = &app.settings.sounds[0].path;
+        assert_eq!(crate::decode::load_clip(path).unwrap().len(), 240);
+        assert!(app.pad_filter.is_empty() && app.dirty_since.is_some());
+        assert!(app.record_status.0.starts_with("Added "));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pending_recording_saves_protect_the_take_and_wait_before_quitting() {
+        for outcome in ["saved", "failed", "disconnected", "keep open"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("saved.wav");
+            let mut app = App::stopped(crate::config::Settings::default());
+            app.page = super::super::Page::Record;
+            let take = Arc::new(Recorder::from_samples_for_test(&[0.25; 480]).finish().unwrap().unwrap());
+            app.take = Some(Arc::clone(&take));
+            let (done, job) = crossbeam_channel::bounded(1);
+            app.recording_save = Some(RecordingSave { job, add_to_board: false });
+            let ctx = egui::Context::default();
+            let click = |app: &mut App, label| {
+                board(app, &ctx, Vec::new());
+                let pos = pad_title_position(app, &ctx, label);
+                for pressed in [true, false] {
+                    board(app, &ctx, vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                    ]);
+                }
+            };
+            click(&mut app, "Discard take");
+            assert!(app.take.is_some(), "discard is disabled while the worker uses the take");
+            app.poll_recording();
+            assert!(app.recording_save.is_some(), "polling never waits for disk I/O");
+            assert!(app.update_blocker().unwrap().contains("saving"));
+            app.run_command(&ctx, super::super::Command::Quit);
+            board(&mut app, &ctx, Vec::new());
+            let texts = board(&mut app, &ctx, Vec::new());
+            assert!(texts.iter().any(|t| t == "Saving before quitting…"));
+            assert!(!texts.iter().any(|t| t == "Discard and quit"));
+            assert!(!app.quitting);
+            if outcome == "keep open" {
+                click(&mut app, "Keep OpenMic open");
+                assert!(!app.confirm_quit);
+            }
+            match outcome {
+                "saved" | "keep open" => {
+                    take.save_wav(&path).unwrap();
+                    done.send(Ok(path)).unwrap();
+                }
+                "failed" => done.send(Err(anyhow::anyhow!("drive disconnected"))).unwrap(),
+                _ => drop(done),
+            }
+            app.poll_recording();
+            board(&mut app, &ctx, Vec::new());
+            assert!(app.recording_save.is_none());
+            assert_eq!(app.quitting, outcome == "saved");
+            if matches!(outcome, "failed" | "disconnected") {
+                assert_eq!(app.record_status.1, RED);
+                assert!(!app.confirm_quit);
+                assert_eq!(app.take.as_ref().unwrap().samples().unwrap().len(), 240);
+            } else {
+                assert!(app.take.is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes background-save screenshots; needs Python with Pillow"]
+    fn snapshot_recording_save() {
+        let mut app = App::stopped(crate::config::Settings::default());
+        app.page = super::super::Page::Record;
+        app.take = Recorder::from_samples_for_test(&vec![0.25; 96_000]).finish().unwrap().map(Arc::new);
+        let (_done, job) = crossbeam_channel::bounded(1);
+        app.recording_save = Some(RecordingSave { job, add_to_board: false });
+        app.record_status = ("Saving recording…".into(), CYAN);
+        for quitting in [false, true] {
+            if quitting {
+                app.run_command(&egui::Context::default(), super::super::Command::Quit);
+            }
+            let name = if quitting { "record-save-before-quit" } else { "record-saving" };
+            let path = super::super::snapshot::snapshot(&mut app, name, egui::vec2(700.0, 420.0), 1.25, true);
+            println!("SNAPSHOT {}", path.display());
         }
     }
 

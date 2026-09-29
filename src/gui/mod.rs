@@ -167,7 +167,9 @@ pub struct App {
     record_source: Source,
     record_output: String,
     recorder: Option<Recorder>,
-    take: Option<Take>,
+    take: Option<Arc<Take>>,
+    /// A take being saved without blocking microphone controls.
+    recording_save: Option<sound_tab::RecordingSave>,
     record_name: String,
     record_status: Status,
     /// Peak-hold position of the recording level meter, dBFS.
@@ -323,6 +325,7 @@ impl App {
             record_output: String::new(),
             recorder: None,
             take: None,
+            recording_save: None,
             record_name: "Mic recording".into(),
             record_status: ("Ready to record".into(), MUTED),
             record_hold: -60.0,
@@ -752,20 +755,25 @@ impl App {
             return;
         }
         let active = self.recorder.is_some();
+        let saving = self.recording_save.is_some();
         let dialog = egui::Modal::new(egui::Id::new("quit-recording")).show(ctx, |ui| {
             ui.set_width(340.0);
-            ui.heading("Quit without saving?");
-            ui.label(if active {
+            ui.heading(if saving { "Saving before quitting…" } else { "Quit without saving?" });
+            ui.label(if saving {
+                "Your recording is being saved. OpenMic will close when it finishes."
+            } else if active {
                 "Recording is still running. Quitting will discard this take."
             } else {
                 "Your recording has not been saved. Quitting will discard it."
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button(if active { "Keep recording" } else { "Back to recording" }).clicked() {
+                if ui.button(if saving { "Keep OpenMic open" } else if active { "Keep recording" } else { "Back to recording" }).clicked() {
                     self.confirm_quit = false;
                 }
-                if ui.button(RichText::new("Discard and quit").color(RED)).clicked() {
+                if saving {
+                    ui.spinner();
+                } else if ui.button(RichText::new("Discard and quit").color(RED)).clicked() {
                     self.quit(ctx);
                 }
             });
@@ -823,7 +831,9 @@ impl App {
 
     /// Work a restart would lose.
     fn update_blocker(&self) -> Option<&'static str> {
-        if self.recorder.is_some() || self.take.is_some() {
+        if self.recording_save.is_some() {
+            Some("Wait for your recording to finish saving")
+        } else if self.recorder.is_some() || self.take.is_some() {
             Some("Save or discard your recording first")
         } else if self.dictating.is_some() || self.dictation.busy() {
             Some("Wait for speech to text to finish")
@@ -1474,7 +1484,7 @@ mod tests {
                 if active {
                     app.recorder = Some(recorder);
                 } else {
-                    app.take = recorder.finish().unwrap();
+                    app.take = recorder.finish().unwrap().map(Arc::new);
                 }
                 app.hidden = true;
                 let mut input = egui::RawInput::default();
@@ -1495,7 +1505,7 @@ mod tests {
                 assert!(!app.hidden && !app.settings.collapsed, "a hidden quit request must reveal the choice");
                 assert_eq!(app.page, Page::Record);
                 assert_eq!(app.recorder.is_some(), active, "asking to quit must not stop capture");
-                let take = if active { app.recorder.take().unwrap().finish().unwrap().unwrap() } else { app.take.take().unwrap() };
+                let take = if active { Arc::new(app.recorder.take().unwrap().finish().unwrap().unwrap()) } else { app.take.take().unwrap() };
                 assert_eq!(take.samples().unwrap().len(), 240, "no audio was discarded");
             }
         }
@@ -1514,7 +1524,7 @@ mod tests {
             if active {
                 app.recorder = Some(recorder);
             } else {
-                app.take = recorder.finish().unwrap();
+                app.take = recorder.finish().unwrap().map(Arc::new);
             }
             let ctx = egui::Context::default();
             app.run_command(&ctx, Command::Quit);
@@ -1549,7 +1559,7 @@ mod tests {
             assert_eq!(app.quitting, discard);
             assert_eq!(output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::Close), discard);
             assert_eq!(app.recorder.is_some(), active, "capture continues until actual exit");
-            let take = if active { app.recorder.take().unwrap().finish().unwrap().unwrap() } else { app.take.take().unwrap() };
+            let take = if active { Arc::new(app.recorder.take().unwrap().finish().unwrap().unwrap()) } else { app.take.take().unwrap() };
             assert_eq!(take.samples().unwrap().len(), 240, "the take remains intact until actual exit");
         }
 

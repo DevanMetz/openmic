@@ -116,6 +116,8 @@ If writing a recording fails, OpenMic stops and reports the error. When possible
 
 Saving a take replaces an existing WAV only after the new file is complete, including when saving to another drive. If saving fails, your previous WAV stays intact and the take remains available to retry.
 
+**Save WAV** and **Add to soundboard** save in the background, so microphone controls stay responsive even when copying a long take to another drive. The Record page shows **Saving** until the file is ready. If you quit during a save, OpenMic waits for it to finish; a failed save keeps the window and take open for retry.
+
 If you quit with a recording running or a take still unsaved, OpenMic asks whether to return to it or discard it and quit. Closing to the notification area keeps the recording available without asking.
 
 ## Hotkeys and the notification area
