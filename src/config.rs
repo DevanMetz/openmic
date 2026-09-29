@@ -352,11 +352,14 @@ impl Settings {
                     return settings;
                 }
                 Err(error) => {
+                    // Legacy sources can be a bare filename. Keep their full
+                    // location so the recovery screen can open the right folder.
+                    let source = std::path::absolute(source).unwrap_or_else(|_| source.to_owned());
                     crate::logfile::error(format_args!("settings not loaded from {}: {error:#}", source.display()));
                     // Do not replace an unreadable file with defaults or an older
                     // legacy copy. This guard also blocks shutdown/autosave writes.
                     return Self {
-                        load_error: Some(SettingsLoadError { path: source.to_owned(), message: format!("{error:#}") }),
+                        load_error: Some(SettingsLoadError { path: source, message: format!("{error:#}") }),
                         ..Self::default()
                     };
                 }
@@ -601,6 +604,36 @@ mod tests {
         assert!(fresh.load_error.is_none());
         assert_eq!(fresh.sound_volume, Settings::default().sound_volume, "moving the failed file aside allows a fresh start");
         assert_eq!(fs::read(backup).unwrap(), bytes);
+    }
+
+    #[test]
+    fn relative_settings_failures_keep_the_full_location_for_recovery_and_retry() {
+        let current_dir = std::env::current_dir().unwrap();
+        let mut file = tempfile::NamedTempFile::new_in(&current_dir).unwrap();
+        file.write_all(b"{ unfinished settings").unwrap();
+        file.flush().unwrap();
+        let relative = PathBuf::from(file.path().file_name().unwrap());
+        let destination = tempfile::tempdir().unwrap();
+        let path = destination.path().join("settings.json");
+
+        for (primary, legacy) in [
+            (relative.as_path(), Vec::new()),
+            (path.as_path(), vec![relative.clone()]),
+        ] {
+            let failed = Settings::load_from(primary, &legacy);
+            let error = failed.load_error.as_ref().unwrap();
+            assert!(error.path.is_absolute());
+            assert_eq!(error.path, file.path());
+            assert_eq!(error.path.parent(), Some(current_dir.as_path()), "Open settings folder must not receive an empty path");
+            assert!(failed.save_to(primary).is_err());
+        }
+
+        let failed = Settings::load_from(&path, &[relative]);
+        fs::write(file.path(), br#"{"mute":true,"sounds":["clap.wav"]}"#).unwrap();
+        let recovered = failed.retry_from(&path);
+        assert!(recovered.load_error.is_none() && recovered.mute);
+        assert_eq!(recovered.sounds, [Pad::new("clap.wav".into())]);
+        assert!(path.exists(), "a repaired relative legacy source can still migrate");
     }
 
     #[cfg(windows)]
