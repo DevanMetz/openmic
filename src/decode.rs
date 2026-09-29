@@ -96,7 +96,11 @@ fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) {
     let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
     buf.copy_interleaved_ref(decoded);
     mono.extend(buf.samples().chunks_exact(channels).map(|frame| {
-        frame.iter().sum::<f32>() / channels as f32
+        // Float WAVs can contain non-finite or over-range samples. Silence
+        // invalid channels before interpolation spreads them, and accumulate
+        // in f64 so finite channels cannot overflow while being downmixed.
+        let sum: f64 = frame.iter().filter(|s| s.is_finite()).map(|&s| f64::from(s)).sum();
+        (sum / channels as f64).clamp(-1.0, 1.0) as f32
     }));
 }
 
@@ -137,6 +141,54 @@ mod tests {
         let mut mono = Vec::new();
         append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded)));
         assert_eq!(mono, vec![0.5, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn floating_point_clips_stay_finite_and_clipped_through_playback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("float.wav");
+        let frames = [
+            [f32::NAN, 0.5],
+            [f32::INFINITY, 0.5],
+            [f32::NEG_INFINITY, -0.5],
+            [2.0, 0.5],
+            [-2.0, -0.5],
+            [f32::MAX, f32::MAX],
+            [-f32::MAX, -f32::MAX],
+            [f32::MAX, -f32::MAX],
+            [0.5, 0.25],
+        ];
+        for rate in [24_000u32, 48_000, 96_000] {
+            let data_len = (frames.len() * 8) as u32;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&3u16.to_le_bytes()); // IEEE float
+            bytes.extend_from_slice(&2u16.to_le_bytes()); // stereo
+            bytes.extend_from_slice(&rate.to_le_bytes());
+            bytes.extend_from_slice(&(rate * 8).to_le_bytes());
+            bytes.extend_from_slice(&8u16.to_le_bytes());
+            bytes.extend_from_slice(&32u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&data_len.to_le_bytes());
+            for sample in frames.iter().flatten() {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            std::fs::write(&path, bytes).unwrap();
+
+            let samples = load_clip(&path).unwrap();
+            assert!(samples.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)), "{rate} Hz: {samples:?}");
+            if rate == crate::dsp::SR {
+                assert_eq!(samples, [0.25, 0.25, -0.25, 1.0, -1.0, 1.0, -1.0, 0.0, 0.375]);
+            }
+            let mut mixer = crate::dsp::Mixer::default();
+            let mut voice = vec![0.125; samples.len()];
+            mixer.play(crate::dsp::Clip::new(1, std::sync::Arc::new(samples), 1.0), false);
+            mixer.mix(&mut voice, 0.0);
+            assert!(voice.iter().all(|s| *s == 0.125), "a silent pad must never corrupt the microphone");
+        }
     }
 
     /// Minimal 44-byte-header PCM16 WAV writer for the test fixtures.
