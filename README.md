@@ -70,7 +70,7 @@ The **Get set up** checklist at the top of the **Voice** page walks through thes
 3. OpenMic sends your voice to **CABLE Input (VB-Audio Virtual Cable)** automatically on every launch. It never defaults to your speakers, which would play your mic back out loud. Automatic microphone selection skips **CABLE Output** to avoid feeding the processed audio back into itself.
 4. While it runs, OpenMic also makes **CABLE Output** your Windows default microphone, so Discord's **Input Device** can stay on **Default**. Your previous default comes back when processing stops or OpenMic closes; after a crash, OpenMic restores it when processing next stops. Untick **Make CABLE Output my Windows default mic while running** to set Discord's input to **CABLE Output** by hand instead.
 5. In Discord (**User Settings → Voice & Video**), disable Discord/Krisp noise suppression to avoid double processing.
-6. Click **Test my mic** under **Processing**: speak for 5 seconds, then play **Raw** and **Cleaned** to hear what Discord hears. The test plays on your headphone monitor output (or the Windows default output), never into VB-Cable. **Cleaned** uses your current settings, so change a preset or slider and play it again.
+6. Click **Test my mic** under **Processing**: speak for 5 seconds, then play **Raw** and **Cleaned** to hear what Discord hears. The test plays on your headphone monitor output (or the Windows default output), never into VB-Cable. **Cleaned** uses your current settings, so change a preset or slider and play it again. Click the selected preview again to stop, including while cleanup is still running.
 
 The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your voice.
 

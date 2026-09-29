@@ -221,8 +221,12 @@ impl App {
             }
             if self.mic_test.raw.is_some() && !self.mic_test.recording() {
                 for (version, label) in [(Version::Raw, "⏵ Raw"), (Version::Cleaned, "⏵ Cleaned")] {
-                    let playing = self.mic_test.player.as_ref().is_some_and(|(_, v)| *v == version);
-                    if ui.selectable_label(playing, label).clicked() {
+                    let playing = self.mic_test.player.as_ref().is_some_and(|(_, v)| *v == version)
+                        || (version == Version::Cleaned && self.mic_test.cleaning.as_ref().is_some_and(|(_, _, then_play)| *then_play));
+                    if ui.selectable_label(playing, label)
+                        .on_hover_text(if playing { "Stop preview" } else { "Play preview" })
+                        .clicked()
+                    {
                         if playing {
                             self.stop_test();
                             self.mic_test.status = Some(("Playback stopped".into(), MUTED));
@@ -337,6 +341,56 @@ mod tests {
         assert_eq!(samples.as_slice(), &[0.25; 480]);
         assert_eq!(*cleaned_params, params);
         assert!(!app.settings.setup.tested, "cancelling is not a successful listen");
+    }
+
+    #[test]
+    fn the_cleaned_button_can_cancel_playback_while_cleanup_is_running() {
+        let mut app = App::stopped(Settings::default());
+        app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
+        let params = app.test_params();
+        let (done, job) = crossbeam_channel::bounded(1);
+        app.mic_test.cleaning = Some((job, params, false));
+        let ctx = egui::Context::default();
+        let draw = |app: &mut App, events| {
+            ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 100.0))),
+                events,
+                ..Default::default()
+            }, |ui| app.draw_mic_test(ui))
+        };
+        draw(&mut app, Vec::new());
+        let pos = draw(&mut app, Vec::new()).shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "⏵ Cleaned" => Some(text.visual_bounding_rect().center()),
+            _ => None,
+        }).expect("Cleaned control is visible");
+
+        for expected in [true, false] {
+            for pressed in [true, false] {
+                draw(&mut app, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                ]);
+            }
+            assert_eq!(app.mic_test.cleaning.as_ref().unwrap().2, expected, "clicking again cancels pending playback");
+        }
+        done.send(vec![0.25; 480]).unwrap();
+        app.poll_mic_test();
+        assert!(!app.mic_test.busy());
+        assert_eq!(app.mic_test.status, Some(("Playback stopped".into(), MUTED)));
+        assert_eq!(app.mic_test.cleaned.as_ref().unwrap().0.as_slice(), &[0.25; 480]);
+        assert!(!app.settings.setup.tested, "cancelled playback must never open a device or complete setup");
+    }
+
+    #[test]
+    #[ignore = "writes preview-control screenshots; needs Python with Pillow"]
+    fn snapshot_pending_mic_preview() {
+        let mut app = App::stopped(Settings::default());
+        app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
+        let (_done, job) = crossbeam_channel::bounded(1);
+        app.mic_test.cleaning = Some((job, app.test_params(), true));
+        app.mic_test.status = Some(("Applying your settings…".into(), CYAN));
+        let path = super::super::snapshot::snapshot(&mut app, "mic-preview-pending", egui::vec2(760.0, 1100.0), 1.0, true);
+        println!("SNAPSHOT {}", path.display());
     }
 
     #[test]
