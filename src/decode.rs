@@ -35,11 +35,16 @@ pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
     load_clip_cancellable(path, &AtomicBool::new(false))
 }
 
-/// Background imports can stop between packets without blocking the UI.
-pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>> {
+fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         bail!("clip import cancelled");
     }
+    Ok(())
+}
+
+/// Background imports can stop between packets without blocking the UI.
+pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>> {
+    check_cancelled(cancel)?;
     let src = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -63,9 +68,7 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
     let mut mono: Vec<f32> = Vec::new();
     let mut rate = 0u32;
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("clip import cancelled");
-        }
+        check_cancelled(cancel)?;
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(e))
@@ -86,7 +89,7 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
                 } else if spec.rate != rate {
                     bail!("audio sample rate changes within the file");
                 }
-                append_mono(&mut mono, decoded);
+                append_mono(&mut mono, decoded)?;
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(e).context("decode audio packet"),
@@ -97,20 +100,17 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
         bail!("audio file is empty");
     }
 
-    let samples = resample_linear(&mono, rate, crate::dsp::SR);
-    if cancel.load(Ordering::Relaxed) {
-        bail!("clip import cancelled");
-    }
-    Ok(samples)
+    resample_linear(mono, rate, crate::dsp::SR, cancel)
 }
 
-fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) {
+fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) -> Result<()> {
     let spec = *decoded.spec();
     let channels = spec.channels.count();
     // Packet duration is in container time-base ticks, which need not equal
     // decoded frames. Size the buffer using the decoder's actual output.
     let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
     buf.copy_interleaved_ref(decoded);
+    mono.try_reserve(buf.samples().len() / channels).context("not enough memory to load this clip")?;
     mono.extend(buf.samples().chunks_exact(channels).map(|frame| {
         // Float WAVs can contain non-finite or over-range samples. Silence
         // invalid channels before interpolation spreads them, and accumulate
@@ -118,27 +118,35 @@ fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) {
         let sum: f64 = frame.iter().filter(|s| s.is_finite()).map(|&s| f64::from(s)).sum();
         (sum / channels as f64).clamp(-1.0, 1.0) as f32
     }));
+    Ok(())
 }
 
 /// Naive linear interpolation resampler (matches the Python np.interp approach).
 // ponytail: linear interp aliases on big downshifts; use symphonia's resampler
 // or rubato if long-form/high-rate clips ever sound dull.
-fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
+fn resample_linear(input: Vec<f32>, from: u32, to: u32, cancel: &AtomicBool) -> Result<Vec<f32>> {
+    check_cancelled(cancel)?;
     if input.is_empty() || from == to {
-        return input.to_vec();
+        // Most recordings already use the DSP rate. Keep their allocation
+        // instead of briefly needing twice the memory for the entire take.
+        return Ok(input);
     }
     let n = (((input.len() as f64) * to as f64 / from as f64).round() as usize).max(1);
     let ratio = f64::from(from) / f64::from(to);
     let last = input.len() - 1;
-    (0..n)
-        .map(|i| {
+    let mut output = Vec::new();
+    output.try_reserve_exact(n).context("not enough memory to resample this clip")?;
+    for start in (0..n).step_by(4096) {
+        check_cancelled(cancel)?;
+        output.extend((start..n.min(start.saturating_add(4096))).map(|i| {
             let pos = i as f64 * ratio;
             let i0 = (pos.floor() as usize).min(last);
             let i1 = (i0 + 1).min(last);
             let frac = (pos - i0 as f64) as f32;
             input[i0] * (1.0 - frac) + input[i1] * frac
-        })
-        .collect()
+        }));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -155,7 +163,7 @@ mod tests {
         decoded.chan_mut(0).copy_from_slice(&[0.25, -0.5, 0.75]);
         decoded.chan_mut(1).copy_from_slice(&[0.75, 0.5, 0.25]);
         let mut mono = Vec::new();
-        append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded)));
+        append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded))).unwrap();
         assert_eq!(mono, vec![0.5, 0.0, 0.5]);
     }
 
@@ -265,8 +273,16 @@ mod tests {
     #[test]
     fn resample_preserves_constant_and_length() {
         let input = vec![0.5f32; 2400];
-        let out = resample_linear(&input, 24_000, 48_000);
+        let out = resample_linear(input, 24_000, 48_000, &AtomicBool::new(false)).unwrap();
         assert_eq!(out.len(), 4800);
         assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn cancellation_after_decoding_never_returns_partial_resampled_audio() {
+        for rate in [24_000, 48_000, 96_000] {
+            let result = resample_linear(vec![0.5; 100], rate, crate::dsp::SR, &AtomicBool::new(true));
+            assert_eq!(result.unwrap_err().to_string(), "clip import cancelled");
+        }
     }
 }
