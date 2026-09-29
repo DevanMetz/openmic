@@ -108,6 +108,8 @@ To make a clip, choose **Microphone** (the selected raw mic) or **Computer audio
 
 If writing a recording fails, OpenMic stops and reports the error. When possible, it recovers the complete audio frames already on disk so you can save the partial take; a recovered take carries a warning.
 
+Saving a take replaces an existing WAV only after the new file is complete, including when saving to another drive. If saving fails, your previous WAV stays intact and the take remains available to retry.
+
 ## Hotkeys and the notification area
 
 Set shortcuts for **Mute mic**, **Bypass processing**, **Stop all clips** and **Speech to text** on the **Settings** page, and for each pad from its right-click menu. Click **Set…**, then press the combination; Esc cancels. Shortcuts need Ctrl or Alt so they can't swallow ordinary typing, except the spare keys F13–F24 that macro pads and stream decks send. A shortcut given to a new action is taken from its old one. If another app already owns a combination, the Settings page says so.

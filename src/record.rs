@@ -2,7 +2,7 @@
 //! on disk, so a take can run as long as the disk allows, then keep it.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -467,8 +467,23 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
     if fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    fs::copy(from, to).with_context(|| format!("write {}", to.display()))?;
+    let mut source = File::open(from).with_context(|| format!("open {}", from.display()))?;
+    copy_recording(&mut source, to)?;
+    drop(source);
     let _ = fs::remove_file(from);
+    Ok(())
+}
+
+/// Stage cross-drive copies beside the destination so a failed copy leaves
+/// both the original take and any previously saved recording intact.
+fn copy_recording(source: &mut impl Read, to: &Path) -> Result<()> {
+    let parent = to.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent).context("create recording temporary file")?;
+    std::io::copy(source, &mut file).context("copy recording")?;
+    file.as_file().sync_all().context("flush recording")?;
+    file.persist(to)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replace {}", to.display()))?;
     Ok(())
 }
 
@@ -598,6 +613,61 @@ mod tests {
         assert!(path.exists());
         drop(take);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_recording_copy_preserves_the_destination_and_can_be_retried() {
+        struct InterruptedCopy;
+        impl Read for InterruptedCopy {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("recording drive disconnected"))
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("saved.wav");
+        let take = written_take(&[0.25; 8]);
+        let expected = fs::read(&take.path).unwrap();
+        for existing in [false, true] {
+            if existing {
+                fs::write(&path, b"previous recording").unwrap();
+            }
+            let mut source = (&expected[..8]).chain(InterruptedCopy);
+            assert!(copy_recording(&mut source, &path).is_err());
+            if existing {
+                assert_eq!(fs::read(&path).unwrap(), b"previous recording");
+            } else {
+                assert!(!path.exists(), "a failed save leaves no partial WAV");
+            }
+            assert_eq!(fs::read(&take.path).unwrap(), expected, "the take stays available for retry");
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), usize::from(existing));
+        }
+
+        copy_recording(&mut expected.as_slice(), &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(crate::decode::load_clip(&path).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn failed_recording_replacement_keeps_the_take() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("saved.wav");
+        fs::create_dir(&destination).unwrap();
+        let marker = destination.join("keep.txt");
+        fs::write(&marker, b"untouched").unwrap();
+        let take = written_take(&[0.5; 8]);
+        let expected = fs::read(&take.path).unwrap();
+
+        assert!(take.save_wav(&destination).is_err());
+        assert_eq!(fs::read(&take.path).unwrap(), expected);
+        assert_eq!(fs::read(&marker).unwrap(), b"untouched");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        let retry = directory.path().join("retry.wav");
+        take.save_wav(&retry).unwrap();
+        assert_eq!(fs::read(retry).unwrap(), expected);
+        assert!(!take.path.exists());
     }
 
     #[test]
