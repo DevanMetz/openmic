@@ -49,8 +49,8 @@ pub(super) enum Meter {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Strip {
     pub preset: String,
-    /// Starred pads: board index, name, playing.
-    pub pads: Vec<(usize, String, bool)>,
+    /// Starred pads: board index, name, playing, loading.
+    pub pads: Vec<(usize, String, bool, bool)>,
 }
 
 /// What the user did on the strip this frame.
@@ -157,7 +157,7 @@ impl App {
         }
     }
 
-    fn strip_contents(&self) -> Strip {
+    pub(super) fn strip_contents(&self) -> Strip {
         Strip {
             preset: self.preset_name(),
             pads: self
@@ -166,7 +166,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, pad)| pad.starred)
-                .map(|(i, pad)| (i, pad.display_name(), self.playing.contains(&super::clip_key(&pad.path))))
+                .map(|(i, pad)| (i, pad.display_name(), self.playing.contains(&super::clip_key(&pad.path)), self.clip_loading(&pad.path)))
                 .collect(),
         }
     }
@@ -187,7 +187,7 @@ impl App {
             // Sized to fit what it shows, unless resized by hand.
             let width = self.settings.strip_width.unwrap_or_else(|| {
                 let measure = |text: &str| button_width(text_width(ctx, text));
-                let pads: Vec<f32> = strip.pads.iter().map(|(_, name, _)| measure(&truncate(name, MAX_NAME))).collect();
+                let pads: Vec<f32> = strip.pads.iter().map(|(_, name, _, _)| measure(&truncate(name, MAX_NAME))).collect();
                 fitting_width(&pads, measure(&truncate(&strip.preset, MAX_NAME)))
             });
             self.overlay_spawn_width = width.clamp(MIN_WIDTH, MAX_WIDTH);
@@ -238,7 +238,7 @@ impl App {
                 Action::ToggleMute => self.run_command(ctx, Command::ToggleMute),
                 Action::Expand => self.set_collapsed(ctx, false),
                 Action::NextPreset => self.next_preset(),
-                Action::PlayPad(index) => self.toggle_clip(index),
+                Action::PlayPad(index) => self.toggle_clip(index, ctx),
             }
         }
     }
@@ -382,7 +382,7 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip) -> Vec<Action
     }
 
     // Pads first, as wide as their names; the preset after them if there's room.
-    let names: Vec<String> = strip.pads.iter().map(|(_, name, _)| truncate(name, MAX_NAME)).collect();
+    let names: Vec<String> = strip.pads.iter().map(|(_, name, _, _)| truncate(name, MAX_NAME)).collect();
     let preset_name = truncate(&strip.preset, MAX_NAME);
     let measure = |text: &str| button_width(ui.painter().layout_no_wrap(text.to_owned(), label_font(), visuals.text_color()).size().x);
     let widths: Vec<f32> = names.iter().map(|n| measure(n)).collect();
@@ -390,12 +390,17 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip) -> Vec<Action
     let (placed, preset_x) = layout(mic_rect.right() + GAP, right, &widths, preset_width);
     let button_rect = |x: f32, width: f32| Rect::from_min_size(Pos2::new(x, rect.center().y - 11.0), Vec2::new(width, 22.0));
     for (i, x) in placed {
-        let (index, _, playing) = &strip.pads[i];
+        let (index, _, playing, loading) = &strip.pads[i];
         let mut button = egui::Button::new(egui::RichText::new(&names[i]).font(label_font()));
-        if *playing {
+        if *loading {
+            button = button.fill(super::CYAN.gamma_multiply(0.35));
+        } else if *playing {
             button = button.fill(GREEN.gamma_multiply(0.35));
         }
-        if ui.put(button_rect(x, widths[i]), button).clicked() {
+        if ui.put(button_rect(x, widths[i]), button)
+            .on_hover_text(if *loading { "Loading… Click to cancel" } else { "Click to play, pause or resume" })
+            .clicked()
+        {
             actions.push(Action::PlayPad(*index));
         }
     }
@@ -461,7 +466,7 @@ mod tests {
     fn strip(names: &[&str]) -> Strip {
         Strip {
             preset: "Balanced".into(),
-            pads: names.iter().enumerate().map(|(i, n)| (i, n.to_string(), false)).collect(),
+            pads: names.iter().enumerate().map(|(i, n)| (i, n.to_string(), false, false)).collect(),
         }
     }
 
@@ -593,7 +598,7 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
         let s = strip(&["airhorn", "rimshot", "bruh"]);
         let measure = |t: &str| button_width(text_width(&ctx, t));
-        let pads: Vec<f32> = s.pads.iter().map(|(_, n, _)| measure(n)).collect();
+        let pads: Vec<f32> = s.pads.iter().map(|(_, n, _, _)| measure(n)).collect();
         let width = fitting_width(&pads, measure(&s.preset));
         let (texts, _) = run(Meter::Live(-20.0), &s, width, None, false);
         for label in ["airhorn", "rimshot", "bruh", "Balanced", "⛶"] {

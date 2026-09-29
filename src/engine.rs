@@ -366,6 +366,16 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Exercise the real mixer and GUI lifecycle without opening audio devices.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            streams: Vec::new(), worker: None, stop: Arc::default(),
+            params: Arc::new(ArcSwap::from_pointee(Params::default())),
+            mixer: Arc::default(), stats: Arc::default(), reports: Arc::default(), has_monitor: false,
+        }
+    }
+
     /// Start capture on `mic` and playback on `out`, plus `monitor` if given.
     ///
     /// Devices are opened at their default format/rate (WASAPI rejects

@@ -1,6 +1,7 @@
 //! egui front end: app state and lifecycle. Each tab draws from its own
 //! module; routing rules live in `routes`.
 
+mod clips;
 mod mic_tab;
 mod mic_test;
 mod overlay;
@@ -16,14 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{self, CentralPanel, Color32, RichText, ScrollArea, Slider, ViewportCommand};
 
 use crate::config::{self, Settings};
 use crate::default_mic;
 use crate::dictation::{self, Dictation};
-use crate::dsp::{self, Clip, Params};
+use crate::dsp::{self, Params};
 use crate::engine::{list_devices, Engine};
 use crate::hotkeys::{self, Hotkeys};
 use crate::record::{Recorder, Source, Take};
@@ -164,6 +164,8 @@ pub struct App {
     clip_cache: HashMap<PathBuf, CachedClip>,
     /// Files being imported in the background, one decoder at a time.
     clip_import: Option<sound_tab::ClipImport>,
+    /// Pending pad playback, decoded one clip at a time.
+    clip_playback: Option<clips::ClipPlayback>,
     record_source: Source,
     record_output: String,
     recorder: Option<Recorder>,
@@ -321,6 +323,7 @@ impl App {
             trim_peaks: None,
             clip_cache: HashMap::new(),
             clip_import: None,
+            clip_playback: None,
             record_source: Source::Microphone,
             record_output: String::new(),
             recorder: None,
@@ -480,6 +483,7 @@ impl App {
     }
 
     fn stop_engine(&mut self, announce: bool) {
+        self.clip_playback = None;
         self.waiting_for_device = false;
         self.reconnecting = false;
         if let Some(engine) = self.engine.take() {
@@ -498,11 +502,13 @@ impl App {
     /// Live route change: stop old engine, start new, hand the clip playheads over.
     fn restart_engine(&mut self) {
         let clips = self.engine.as_ref().map(Engine::take_clips).unwrap_or_default();
+        let pending = self.clip_playback.take();
         self.stop_engine(false);
         self.status = ("Switching route…".into(), AMBER);
         self.start_engine();
         if let Some(engine) = &self.engine {
             engine.resume_clips(clips);
+            self.clip_playback = pending;
         }
         self.sync_clip_progress();
     }
@@ -705,7 +711,7 @@ impl App {
             Command::StopClips => self.stop_clips(),
             Command::PlayPad(path) => {
                 if let Some(index) = self.settings.sounds.iter().position(|p| p.path == path) {
-                    self.play_clip(index);
+                    self.play_clip(index, ctx);
                 }
             }
             Command::Dictate => {
@@ -1066,104 +1072,6 @@ impl App {
         }
     }
 
-    // ---- soundboard ------------------------------------------------------
-
-    fn sync_clip_progress(&mut self) {
-        let progress = self.engine.as_ref().map(Engine::clip_progress).unwrap_or_default();
-        self.playing = progress.iter().filter(|(_, _, paused)| !paused).map(|(key, _, _)| *key).collect();
-        self.pad_progress = progress.into_iter().map(|(key, at, _)| (key, at)).collect();
-        if self.pad_progress.is_empty()
-            && (self.sound_status.0.starts_with("Playing") || self.sound_status.0.starts_with("Paused"))
-        {
-            self.sound_status = ("Ready".into(), Color32::WHITE);
-        }
-    }
-
-    /// Decoded samples for a clip, from the cache when possible.
-    fn clip_samples(&mut self, path: &Path) -> anyhow::Result<Arc<Vec<f32>>> {
-        let metadata = std::fs::metadata(path);
-        if let (Some(cached), Ok(metadata)) = (self.clip_cache.get(path), &metadata)
-            && cached.bytes == metadata.len()
-            && cached.modified == metadata.modified().ok()
-        {
-            return Ok(Arc::clone(&cached.samples));
-        }
-        self.forget_clip(path);
-        let metadata = metadata.with_context(|| format!("read {}", path.display()))?;
-        let samples = Arc::new(crate::decode::load_clip(path)?);
-        self.cache_clip(path.to_owned(), CachedClip {
-            samples: Arc::clone(&samples),
-            bytes: metadata.len(),
-            modified: metadata.modified().ok(),
-        });
-        Ok(samples)
-    }
-
-    fn cache_clip(&mut self, path: PathBuf, clip: CachedClip) {
-        self.forget_clip(&path);
-        // Keep the cache to about ten minutes of audio (~110 MB).
-        let cached: usize = self.clip_cache.values().map(|clip| clip.samples.len()).sum();
-        if cached + clip.samples.len() > dsp::SR as usize * 600 {
-            self.clip_cache.clear();
-        }
-        self.clip_cache.insert(path, clip);
-    }
-
-    fn forget_clip(&mut self, path: &Path) {
-        self.clip_cache.remove(path);
-        self.pad_durations.remove(path);
-        if self.trim_peaks.as_ref().is_some_and(|(cached_path, _)| cached_path == path) {
-            self.trim_peaks = None;
-        }
-    }
-
-    /// Card and strip clicks pause or resume an existing clip; hotkeys
-    /// still use play_clip to trigger it from the beginning.
-    fn toggle_clip(&mut self, index: usize) {
-        let Some(pad) = self.settings.sounds.get(index) else { return };
-        let paused = self.engine.as_ref().and_then(|engine| {
-            engine.toggle_sound_pause(clip_key(&pad.path), self.settings.overlap_clips)
-        });
-        if let Some(paused) = paused {
-            let (label, color) = if paused { ("Paused", AMBER) } else { ("Playing", GREEN) };
-            self.sound_status = (format!("{label} · {}", pad.display_name()), color);
-            self.sync_clip_progress();
-        } else {
-            self.play_clip(index);
-        }
-    }
-
-    fn play_clip(&mut self, index: usize) {
-        let Some(pad) = self.settings.sounds.get(index).cloned() else {
-            return;
-        };
-        if self.engine.is_none() {
-            self.sound_status = ("Start OpenMic before playing a clip".into(), AMBER);
-            return;
-        }
-        match self.clip_samples(&pad.path) {
-            Ok(samples) => {
-                let key = clip_key(&pad.path);
-                let samples = trimmed(&samples, pad.start, pad.end);
-                if let Some(engine) = &self.engine {
-                    engine.play_sound(Clip::new(key, samples, pad.volume), self.settings.overlap_clips);
-                }
-                self.sound_status = (format!("Playing · {}", pad.display_name()), GREEN);
-                self.sync_clip_progress();
-            }
-            Err(e) => self.sound_status = (short(&format!("{:#}", e)), RED),
-        }
-    }
-
-    fn stop_clips(&mut self) {
-        if let Some(engine) = &self.engine {
-            engine.stop_sounds();
-        }
-        self.playing.clear();
-        self.pad_progress.clear();
-        self.sound_status = ("Ready".into(), Color32::WHITE);
-    }
-
     /// Everything that must keep running while the window is hidden.
     fn tick(&mut self, ctx: &egui::Context) {
         while let Ok(command) = self.commands.1.try_recv() {
@@ -1171,6 +1079,7 @@ impl App {
         }
         self.handle_close(ctx);
         self.poll_engine();
+        self.poll_clip_playback(ctx);
         self.poll_recording();
         self.poll_dictation();
         self.poll_mic_test();
@@ -1805,6 +1714,7 @@ mod tests {
     #[test]
     fn every_symbol_in_the_ui_has_a_glyph() {
         let sources = [
+            ("gui/clips.rs", include_str!("clips.rs")),
             ("gui/mod.rs", include_str!("mod.rs")),
             ("gui/mic_tab.rs", include_str!("mic_tab.rs")),
             ("gui/mic_test.rs", include_str!("mic_test.rs")),

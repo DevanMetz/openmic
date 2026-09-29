@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use anyhow::Context;
 use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea};
 
@@ -168,11 +167,7 @@ impl App {
             let wake = ctx.clone();
             let file = path.clone();
             let spawned = std::thread::Builder::new().name("openmic-clip-import".into()).spawn(move || {
-                let result = (|| {
-                    let metadata = std::fs::metadata(&file).context("read clip metadata")?;
-                    let samples = crate::decode::load_clip_cancellable(&file, &cancel)?;
-                    Ok(CachedClip { samples: Arc::new(samples), bytes: metadata.len(), modified: metadata.modified().ok() })
-                })();
+                let result = CachedClip::read(&file, &cancel);
                 let _ = done.send(result);
                 wake.request_repaint();
             });
@@ -219,11 +214,12 @@ impl App {
         self.import_sounds(paths, ctx);
     }
 
-    fn remove_clip(&mut self, index: usize) {
+    pub(super) fn remove_clip(&mut self, index: usize) {
         if index >= self.settings.sounds.len() {
             return;
         }
         let removed = self.settings.sounds.remove(index);
+        self.cancel_clip_loading(&removed.path);
         if self.renaming_pad.as_ref().is_some_and(|edit| edit.path == removed.path) {
             self.renaming_pad = None;
         }
@@ -614,6 +610,10 @@ impl App {
     fn trim_editor(&mut self, ui: &mut egui::Ui, index: usize) {
         let Some(pad) = self.settings.sounds.get(index).cloned() else { return };
         ui.label(RichText::new("Trim").strong());
+        if self.clip_loading(&pad.path) {
+            ui.horizontal(|ui| { ui.spinner(); ui.label("Loading waveform…"); });
+            return;
+        }
         let samples = match self.clip_samples(&pad.path) {
             Ok(samples) => samples,
             Err(e) => {
@@ -810,6 +810,7 @@ impl App {
                                         let key = clip_key(&pad.path);
                                         let length = self.pad_length(&pad.path);
                                         let state = PadState {
+                                            loading: self.clip_loading(&pad.path),
                                             playing: self.playing.contains(&key),
                                             progress: self.pad_progress.get(&key).copied(),
                                             length: length.map(|full| trimmed_length(full, pad.start, pad.end)),
@@ -825,7 +826,7 @@ impl App {
                                         } else if star.clicked() {
                                             self.toggle_star(i);
                                         } else if play.clicked() {
-                                            self.toggle_clip(i);
+                                            self.toggle_clip(i, ui.ctx());
                                         }
                                         if remove.clicked() {
                                             remove_index = Some(i);
@@ -863,10 +864,12 @@ impl App {
             .map(Pad::display_name)
             .collect();
         let engine_running = self.engine.is_some();
+        let loading = self.clip_playback.is_some();
         let waiting_for_device = self.waiting_for_device;
         let paused = self.pad_progress.len().saturating_sub(playing.len());
         let title = match playing.len() {
             0 if self.settings.sounds.is_empty() => "Add a clip to get started".to_owned(),
+            0 if loading => "Loading audio…".to_owned(),
             0 if paused == 1 => "1 clip paused".to_owned(),
             0 if paused > 1 => format!("{paused} clips paused"),
             0 => "Choose a pad above".to_owned(),
@@ -880,6 +883,8 @@ impl App {
             |ui| {
                 if !playing.is_empty() {
                     widgets::badge(ui, "Playing", GREEN);
+                } else if loading {
+                    widgets::badge(ui, "Loading", CYAN);
                 } else if paused > 0 {
                     widgets::badge(ui, "Paused", AMBER);
                 } else if engine_running {
@@ -900,12 +905,14 @@ impl App {
                         );
                         ui.weak(if self.settings.sounds.is_empty() {
                             "WAV, FLAC, OGG, MP3, and AIFF supported"
+                        } else if loading {
+                            "Click a loading pad to cancel."
                         } else {
                             "Click a pad to play, pause or resume."
                         });
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!self.pad_progress.is_empty(), egui::Button::new("Stop clips")).clicked() {
+                        if ui.add_enabled(!self.pad_progress.is_empty() || self.clip_playback.is_some(), egui::Button::new("Stop clips")).clicked() {
                             self.stop_clips();
                         }
                     });
@@ -975,6 +982,7 @@ fn peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
 
 #[derive(Clone, Copy, Default)]
 struct PadState<'a> {
+    loading: bool,
     playing: bool,
     /// How far through the clip playback is, including while paused.
     progress: Option<f32>,
@@ -997,7 +1005,7 @@ fn clip_pad(
 ) -> (egui::Response, egui::Response, egui::Response, egui::Response) {
     let playing = state.playing;
     let paused = !playing && state.progress.is_some();
-    let action = if playing { "Pause" } else if paused { "Resume" } else { "Play" };
+    let action = if state.loading { "Cancel loading" } else if playing { "Pause" } else if paused { "Resume" } else { "Play" };
     let path = &pad.path;
     let name = pad.display_name();
     let format = path
@@ -1064,8 +1072,8 @@ fn clip_pad(
     });
 
     let visuals = ui.visuals();
-    let accent = if playing { GREEN } else if paused { AMBER } else { CYAN };
-    let fill = if playing || paused {
+    let accent = if state.loading { CYAN } else if playing { GREEN } else if paused { AMBER } else { CYAN };
+    let fill = if playing || paused || state.loading {
         accent.gamma_multiply(0.13)
     } else if play_response.hovered() {
         CYAN.gamma_multiply(0.06)
@@ -1074,7 +1082,7 @@ fn clip_pad(
     };
     let border = if drop_here {
         AMBER
-    } else if playing || paused || play_response.hovered() || state.capturing {
+    } else if playing || paused || state.loading || play_response.hovered() || state.capturing {
         accent
     } else {
         visuals.widgets.noninteractive.bg_stroke.color
@@ -1098,7 +1106,9 @@ fn clip_pad(
 
     let center = egui::pos2(rect.left() + 28.0, body.center().y);
     painter.circle_filled(center, 16.0, accent);
-    if playing {
+    if state.loading {
+        painter.rect_filled(egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)), 1.0, Color32::from_gray(18));
+    } else if playing {
         for dx in [-4.0, 4.0] {
             let bar = egui::Rect::from_center_size(center + egui::vec2(dx, 0.0), egui::vec2(3.0, 12.0));
             painter.rect_filled(bar, 0.0, Color32::from_gray(18));
@@ -1149,6 +1159,8 @@ fn clip_pad(
     };
     let (detail, detail_color) = if state.capturing {
         ("Press a hotkey…".to_owned(), CYAN)
+    } else if state.loading {
+        ("Loading…".to_owned(), CYAN)
     } else if drop_here {
         ("Move here".to_owned(), AMBER)
     } else if playing {
