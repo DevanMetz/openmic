@@ -225,7 +225,19 @@ fn snapshot_pages() {
             ..Settings::default()
         });
         app.page = page;
+        if page == super::Page::Soundboard {
+            let playing = super::clip_key(&app.settings.sounds[0].path);
+            let paused = super::clip_key(&app.settings.sounds[1].path);
+            app.playing.push(playing);
+            app.pad_progress.insert(playing, 0.35);
+            app.pad_progress.insert(paused, 0.6);
+        }
         let path = snapshot(&mut app, &format!("page-{}", page.title().to_lowercase()), egui::vec2(700.0, 720.0), 1.25, true);
         println!("SNAPSHOT {}", path.display());
+        if page == super::Page::Soundboard {
+            app.begin_pad_rename(&app.settings.sounds[0].clone());
+            let path = snapshot(&mut app, "soundboard-rename", egui::vec2(700.0, 720.0), 1.25, true);
+            println!("SNAPSHOT {}", path.display());
+        }
     }
 }

@@ -471,6 +471,10 @@ impl Engine {
         self.mixer.lock().play(clip, overlap);
     }
 
+    pub fn toggle_sound_pause(&self, key: u64, overlap: bool) -> Option<bool> {
+        self.mixer.lock().toggle_pause(key, overlap)
+    }
+
     pub fn stop_sounds(&self) {
         self.mixer.lock().stop();
     }
@@ -483,17 +487,12 @@ impl Engine {
         self.mixer.lock().set_gain(key, gain);
     }
 
-    /// Keys of the clips currently playing.
-    pub fn playing(&self) -> Vec<u64> {
-        self.mixer.lock().playing_keys()
-    }
-
-    /// Playing clips with how far through each one is (0..1).
-    pub fn clip_progress(&self) -> Vec<(u64, f32)> {
+    /// Clip keys, progress (0..1), and paused state from one mixer snapshot.
+    pub fn clip_progress(&self) -> Vec<(u64, f32, bool)> {
         self.mixer.lock().progress()
     }
 
-    /// Playing clips at their playheads (route-switch handoff).
+    /// Playing and paused clips at their playheads (route-switch handoff).
     pub fn take_clips(&self) -> Vec<Clip> {
         self.mixer.lock().take_remaining()
     }

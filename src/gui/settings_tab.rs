@@ -110,6 +110,13 @@ impl App {
                 {
                     self.touch();
                 }
+                if ui
+                    .checkbox(&mut self.settings.always_show_strip, "Always show the strip")
+                    .on_hover_text("Keep the strip visible when you open the full window")
+                    .changed()
+                {
+                    self.touch();
+                }
                 ui.add_space(4.0);
                 self.draw_updates(ui);
             },

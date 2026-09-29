@@ -254,20 +254,21 @@ impl VoiceGate {
 /// Most clips that can sound at once; the oldest is cut to make room.
 pub const MAX_VOICES: usize = 16;
 
-/// One playing soundboard clip and its playhead.
+/// One playing or paused soundboard clip and its playhead.
 #[derive(Clone)]
 pub struct Clip {
     /// Identifies the pad, so a pad restarts rather than stacking on itself.
     pub key: u64,
     pub samples: std::sync::Arc<Vec<f32>>,
     pub pos: usize,
+    pub paused: bool,
     /// The pad's own volume, on top of the soundboard volume.
     pub gain: f32,
 }
 
 impl Clip {
     pub fn new(key: u64, samples: std::sync::Arc<Vec<f32>>, gain: f32) -> Self {
-        Self { key, samples, pos: 0, gain }
+        Self { key, samples, pos: 0, paused: false, gain }
     }
 }
 
@@ -279,15 +280,16 @@ pub struct Mixer {
 
 impl Mixer {
     /// Keys of the clips currently sounding.
+    #[cfg(test)]
     pub fn playing_keys(&self) -> Vec<u64> {
-        self.voices.iter().map(|v| v.key).collect()
+        self.voices.iter().filter(|v| !v.paused).map(|v| v.key).collect()
     }
 
-    /// Each playing clip's key and how far through it is (0..1).
-    pub fn progress(&self) -> Vec<(u64, f32)> {
+    /// Each clip's key, progress (0..1), and whether it is paused.
+    pub fn progress(&self) -> Vec<(u64, f32, bool)> {
         self.voices
             .iter()
-            .map(|v| (v.key, v.pos as f32 / v.samples.len().max(1) as f32))
+            .map(|v| (v.key, v.pos as f32 / v.samples.len().max(1) as f32, v.paused))
             .collect()
     }
 
@@ -306,6 +308,18 @@ impl Mixer {
             self.voices.clear();
         }
         self.voices.push(clip);
+    }
+
+    /// Pause or resume a loaded clip without moving its playhead. Returns
+    /// its new paused state, or None if it needs starting from the beginning.
+    pub fn toggle_pause(&mut self, key: u64, overlap: bool) -> Option<bool> {
+        let voice = self.voices.iter_mut().find(|v| v.key == key)?;
+        voice.paused = !voice.paused;
+        let paused = voice.paused;
+        if !paused && !overlap {
+            self.voices.retain(|v| v.key == key);
+        }
+        Some(paused)
     }
 
     pub fn stop(&mut self) {
@@ -329,7 +343,7 @@ impl Mixer {
         if self.voices.is_empty() {
             return;
         }
-        for clip in &mut self.voices {
+        for clip in self.voices.iter_mut().filter(|v| !v.paused) {
             let end = (clip.pos + frame.len()).min(clip.samples.len());
             let g = gain * clip.gain;
             for (s, src) in frame.iter_mut().zip(&clip.samples[clip.pos..end]) {
@@ -343,7 +357,7 @@ impl Mixer {
         self.voices.retain(|v| v.pos < v.samples.len());
     }
 
-    /// The playing clips with their playheads (route-switch handoff).
+    /// Playing and paused clips with their playheads (route-switch handoff).
     pub fn take_remaining(&mut self) -> Vec<Clip> {
         std::mem::take(&mut self.voices)
     }
@@ -458,6 +472,55 @@ mod tests {
     }
 
     #[test]
+    fn pausing_freezes_the_playhead_and_resumes_the_next_sample() {
+        let samples = vec![0.1, 0.2, 0.3, 0.4];
+        let mut mixer = Mixer::default();
+        mixer.play(clip(1, samples.clone()), false);
+        mixer.mix(&mut [0.0; 1], 1.0);
+        assert_eq!(mixer.toggle_pause(1, false), Some(true));
+        assert!(mixer.playing_keys().is_empty());
+        let mut mic = [0.05; 8];
+        mixer.mix(&mut mic, 1.0);
+        assert_eq!(mic, [0.05; 8], "paused audio contributes nothing to the mic");
+        assert_eq!(mixer.progress(), [(1, 0.25, true)], "the playhead stays put");
+
+        assert_eq!(mixer.toggle_pause(1, false), Some(false));
+        let mut rest = [0.0; 3];
+        mixer.mix(&mut rest, 1.0);
+        assert_eq!(rest, [0.2, 0.3, 0.4], "resume does not replay the start");
+        assert!(mixer.progress().is_empty());
+        assert_eq!(mixer.toggle_pause(1, false), None, "a finished clip can start again");
+
+        mixer.play(clip(1, samples), false);
+        assert_eq!(mixer.progress(), [(1, 0.0, false)]);
+        mixer.toggle_pause(1, false);
+        mixer.stop();
+        assert!(mixer.progress().is_empty(), "Stop clips also discards paused playheads");
+    }
+
+    #[test]
+    fn pausing_one_clip_leaves_other_clips_playing() {
+        let mut mixer = Mixer::default();
+        mixer.play(clip(1, vec![0.1; 8]), true);
+        mixer.play(clip(2, vec![0.2; 8]), true);
+        mixer.mix(&mut [0.0; 2], 1.0);
+        mixer.toggle_pause(1, true);
+        let mut frame = [0.0; 2];
+        mixer.mix(&mut frame, 1.0);
+        assert_eq!(frame, [0.2; 2]);
+        assert_eq!(mixer.progress(), [(1, 0.25, true), (2, 0.5, false)]);
+
+        mixer.toggle_pause(1, true);
+        assert_eq!(mixer.playing_keys(), [1, 2], "resuming respects overlap");
+        mixer.toggle_pause(1, true);
+        mixer.toggle_pause(1, false);
+        assert_eq!(mixer.progress(), [(1, 0.25, false)], "without overlap, resuming replaces other clips");
+        mixer.toggle_pause(1, false);
+        mixer.stop_key(1);
+        assert_eq!(mixer.toggle_pause(1, false), None, "removing a paused pad discards its playhead");
+    }
+
+    #[test]
     fn overlap_caps_the_voice_count() {
         let mut mixer = Mixer::default();
         for key in 0..MAX_VOICES as u64 + 3 {
@@ -484,6 +547,17 @@ mod tests {
         let mut next = [0.0f32; 2];
         resumed.mix(&mut next, 1.0);
         assert!((next[0] - 0.3).abs() < 1e-6 && (next[1] - 0.4).abs() < 1e-6, "{next:?}");
+
+        resumed.toggle_pause(7, false);
+        let mut switched = Mixer::default();
+        switched.resume(resumed.take_remaining());
+        let mut silence = [0.0; 2];
+        switched.mix(&mut silence, 1.0);
+        assert_eq!(silence, [0.0; 2]);
+        assert_eq!(switched.progress(), [(7, 0.625, true)], "a route change preserves pause and position");
+        switched.toggle_pause(7, false);
+        switched.mix(&mut silence, 1.0);
+        assert!((silence[0] - 0.5).abs() < 1e-6 && (silence[1] - 0.6).abs() < 1e-6);
     }
 
     fn tone(freq: f32) -> Vec<f32> {

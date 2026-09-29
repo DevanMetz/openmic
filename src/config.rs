@@ -58,6 +58,8 @@ pub struct Settings {
     pub collapsed: bool,
     /// The window's minimize button collapses to the strip.
     pub minimize_to_strip: bool,
+    /// Keep the strip visible alongside the full window.
+    pub always_show_strip: bool,
     /// Where the pinned meter was last dragged to, in screen pixels (the
     /// same on monitors with different scaling).
     pub overlay_position: Option<[i32; 2]>,
@@ -107,6 +109,7 @@ impl Default for Settings {
             check_for_updates: true,
             collapsed: false,
             minimize_to_strip: true,
+            always_show_strip: true,
             overlay_position: None,
             strip_width: None,
             setup: Setup::default(),
@@ -133,6 +136,8 @@ pub struct Setup {
 #[serde(from = "PadRepr")]
 pub struct Pad {
     pub path: PathBuf,
+    /// A display name; the audio file's stem is used when unset.
+    pub name: Option<String>,
     /// The pad's own volume (0..1), on top of the soundboard volume.
     pub volume: f32,
     /// Global shortcut that plays the pad, e.g. "Ctrl+Alt+1".
@@ -147,7 +152,14 @@ pub struct Pad {
 
 impl Pad {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, volume: 1.0, hotkey: None, start: 0.0, end: None, starred: false }
+        Self { path, name: None, volume: 1.0, hotkey: None, start: 0.0, end: None, starred: false }
+    }
+
+    pub fn display_name(&self) -> String {
+        self.name.as_deref().filter(|name| !name.trim().is_empty()).map_or_else(
+            || self.path.file_stem().unwrap_or(self.path.as_os_str()).to_string_lossy().into_owned(),
+            str::to_owned,
+        )
     }
 }
 
@@ -157,6 +169,8 @@ enum PadRepr {
     Path(PathBuf),
     Full {
         path: PathBuf,
+        #[serde(default)]
+        name: Option<String>,
         #[serde(default = "full_volume")]
         volume: f32,
         #[serde(default)]
@@ -178,8 +192,8 @@ impl From<PadRepr> for Pad {
     fn from(repr: PadRepr) -> Self {
         match repr {
             PadRepr::Path(path) => Pad::new(path),
-            PadRepr::Full { path, volume, hotkey, start, end, starred } => {
-                Pad { path, volume, hotkey, start, end, starred }
+            PadRepr::Full { path, name, volume, hotkey, start, end, starred } => {
+                Pad { path, name, volume, hotkey, start, end, starred }
             }
         }
     }
@@ -434,21 +448,26 @@ mod tests {
         assert_eq!(settings.model, Model::DeepFilter);
         assert!(settings.highpass && settings.voice_gate);
         assert_eq!(settings.voice_threshold, VOICE_THRESHOLD);
+        assert!(settings.always_show_strip, "older settings keep the strip visible by default");
     }
 
     #[test]
     fn bare_pad_paths_from_older_versions_still_load() {
-        let settings: Settings = serde_json::from_str(
+        let mut settings: Settings = serde_json::from_str(
             r#"{"sounds": ["C:/clips/airhorn.mp3", {"path": "C:/clips/drum.wav", "volume": 0.5, "hotkey": "Ctrl+Alt+1"}]}"#,
         )
         .unwrap();
         assert_eq!(settings.sounds[0], Pad::new("C:/clips/airhorn.mp3".into()));
         assert_eq!(settings.sounds[1].volume, 0.5);
         assert_eq!(settings.sounds[1].hotkey.as_deref(), Some("Ctrl+Alt+1"));
+        assert_eq!(settings.sounds[1].display_name(), "drum");
+        settings.sounds[1].name = Some("Drum roll".into());
 
         let saved = serde_json::to_string(&settings).unwrap();
         let reloaded: Settings = serde_json::from_str(&saved).unwrap();
         assert_eq!(reloaded.sounds, settings.sounds);
+        assert_eq!(reloaded.sounds[1].display_name(), "Drum roll");
+        assert_eq!(reloaded.sounds[1].path, PathBuf::from("C:/clips/drum.wav"));
     }
 
     #[test]
@@ -469,9 +488,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.save_to(&path).unwrap();
         settings.mute = true;
+        settings.always_show_strip = false;
         settings.save_to(&path).unwrap();
         let loaded: Settings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(loaded.mute);
+        assert!(!loaded.always_show_strip, "opting out survives a restart");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 

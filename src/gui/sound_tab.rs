@@ -1,7 +1,7 @@
 //! Soundboard tab: recording clips, the pads (with per-pad volume and
 //! hotkeys), and playback.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea};
 
@@ -13,7 +13,69 @@ use crate::config::Pad;
 use crate::record::{self, Recorder, Source, PEAKS_PER_SECOND};
 use crate::widgets;
 
+pub(super) struct PadRename {
+    path: PathBuf,
+    text: String,
+    focus: bool,
+}
+
 impl App {
+    pub(super) fn begin_pad_rename(&mut self, pad: &Pad) {
+        self.finish_pad_rename(true);
+        self.capturing = None;
+        self.renaming_pad = Some(PadRename { path: pad.path.clone(), text: pad.display_name(), focus: true });
+    }
+
+    pub(super) fn finish_pad_rename(&mut self, save: bool) {
+        let Some(edit) = self.renaming_pad.take() else { return };
+        if !save {
+            return;
+        }
+        let Some(pad) = self.settings.sounds.iter_mut().find(|pad| pad.path == edit.path) else { return };
+        let name = edit.text.trim();
+        if name == pad.display_name() {
+            return;
+        }
+        let name = (!name.is_empty()).then(|| name.to_owned());
+        if pad.name != name {
+            pad.name = name;
+            if pad.starred && self.settings.strip_width.is_none() {
+                // Fit the new label when the strip hasn't been resized by hand.
+                self.overlay_placement = Default::default();
+            }
+            self.touch();
+        }
+    }
+
+    fn draw_pad_rename(&mut self, ui: &mut egui::Ui, path: &Path, rect: egui::Rect) {
+        let Some(edit) = self.renaming_pad.as_mut().filter(|edit| edit.path == path) else { return };
+        let first_frame = std::mem::take(&mut edit.focus);
+        let response = ui.place(
+            rect,
+            egui::TextEdit::singleline(&mut edit.text)
+                .id(ui.id().with(("rename_pad", path)))
+                .font(egui::FontId::proportional(14.0))
+                .desired_width(rect.width()),
+        ).on_hover_text("Enter to save, Esc to cancel. Leave blank to use the filename.");
+        if first_frame {
+            response.request_focus();
+            if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), response.id) {
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(edit.text.chars().count()),
+                )));
+                state.store(ui.ctx(), response.id);
+            }
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            response.surrender_focus();
+            self.finish_pad_rename(false);
+        } else if !first_frame && (response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+            response.surrender_focus();
+            self.finish_pad_rename(true);
+        }
+    }
+
     fn add_sounds(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter(
@@ -58,16 +120,20 @@ impl App {
             return;
         }
         let removed = self.settings.sounds.remove(index);
+        if self.renaming_pad.as_ref().is_some_and(|edit| edit.path == removed.path) {
+            self.renaming_pad = None;
+        }
         let key = clip_key(&removed.path);
         if let Some(engine) = &self.engine {
             engine.stop_sound(key);
         }
         self.playing.retain(|&k| k != key);
+        self.pad_progress.remove(&key);
         self.clip_cache.remove(&removed.path);
         if self.capturing == Some(Binding::Pad(removed.path.clone())) {
             self.capturing = None;
         }
-        self.sound_status = (format!("Removed {}", file_name(&removed.path)), MUTED);
+        self.sound_status = (format!("Removed {}", removed.display_name()), MUTED);
         self.touch();
     }
 
@@ -330,7 +396,7 @@ impl App {
     /// Right-click menu for a pad: its volume, hotkey and removal.
     fn pad_menu(&mut self, ui: &mut egui::Ui, index: usize, remove: &mut Option<usize>) {
         let Some(pad) = self.settings.sounds.get(index).cloned() else { return };
-        ui.label(RichText::new(pad_name(&pad.path)).strong());
+        ui.label(RichText::new(pad.display_name()).strong());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Volume");
@@ -469,7 +535,7 @@ impl App {
     }
 
     pub(super) fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
-        ui.weak("Click a pad to play it. Star pads to put them on the strip.");
+        ui.weak("Click a pad to play, pause or resume. Use Add to strip to pin it.");
         if self.engine.is_none() && !self.settings.sounds.is_empty() {
             ui.add_space(6.0);
             ui.colored_label(
@@ -482,10 +548,12 @@ impl App {
             );
         }
         if let Some(Binding::Pad(path)) = &self.capturing {
+            let name = self.settings.sounds.iter().find(|pad| &pad.path == path)
+                .map_or_else(|| file_name(path), Pad::display_name);
             ui.add_space(6.0);
             ui.colored_label(
                 CYAN,
-                format!("Press the hotkey for {}, or Esc to cancel. {}", pad_name(path), self.hotkey_status.0),
+                format!("Press the hotkey for {name}, or Esc to cancel. {}", self.hotkey_status.0),
             );
         }
         ui.add_space(12.0);
@@ -537,7 +605,7 @@ impl App {
                         });
                 } else {
                     ui.horizontal(|ui| {
-                        ui.weak("Click a pad to play it; drag to reorder; right-click for volume, hotkey and trim.");
+                        ui.weak("Click a name to rename; drag to reorder.");
                         // A search box once the board gets long.
                         if sounds.len() > SEARCH_FROM {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -552,7 +620,7 @@ impl App {
                     ui.add_space(8.0);
                     let filter = if sounds.len() > SEARCH_FROM { self.pad_filter.trim().to_lowercase() } else { String::new() };
                     let shown: Vec<usize> = (0..sounds.len())
-                        .filter(|&i| filter.is_empty() || pad_name(&sounds[i].path).to_lowercase().contains(&filter))
+                        .filter(|&i| filter.is_empty() || sounds[i].display_name().to_lowercase().contains(&filter))
                         .collect();
                     if shown.is_empty() {
                         ui.weak(format!("No clips match \"{}\"", self.pad_filter.trim()));
@@ -579,16 +647,20 @@ impl App {
                                             starred: pad.starred,
                                             capturing: self.capturing
                                                 == Some(Binding::Pad(pad.path.clone())),
+                                            renaming: self.renaming_pad.as_ref().is_some_and(|edit| edit.path == pad.path),
                                         };
-                                        let (play, remove, star) = clip_pad(ui, i, &pad.path, width, state);
-                                        if star.clicked() {
+                                        let (play, remove, star, name) = clip_pad(ui, i, pad, width, state);
+                                        if name.clicked() {
+                                            self.begin_pad_rename(pad);
+                                        } else if star.clicked() {
                                             self.toggle_star(i);
                                         } else if play.clicked() {
-                                            self.play_clip(i);
+                                            self.toggle_clip(i);
                                         }
                                         if remove.clicked() {
                                             remove_index = Some(i);
                                         }
+                                        self.draw_pad_rename(ui, &pad.path, name.rect);
                                         // Drag a pad onto another to move it there.
                                         play.dnd_set_drag_payload(i);
                                         if let Some(from) = play.dnd_release_payload::<usize>() {
@@ -618,12 +690,15 @@ impl App {
             .sounds
             .iter()
             .filter(|pad| self.playing.contains(&clip_key(&pad.path)))
-            .map(|pad| pad_name(&pad.path))
+            .map(Pad::display_name)
             .collect();
         let engine_running = self.engine.is_some();
         let waiting_for_device = self.waiting_for_device;
+        let paused = self.pad_progress.len().saturating_sub(playing.len());
         let title = match playing.len() {
             0 if self.settings.sounds.is_empty() => "Add a clip to get started".to_owned(),
+            0 if paused == 1 => "1 clip paused".to_owned(),
+            0 if paused > 1 => format!("{paused} clips paused"),
             0 => "Choose a pad above".to_owned(),
             1 => playing[0].clone(),
             n => format!("{n} clips playing"),
@@ -635,6 +710,8 @@ impl App {
             |ui| {
                 if !playing.is_empty() {
                     widgets::badge(ui, "Playing", GREEN);
+                } else if paused > 0 {
+                    widgets::badge(ui, "Paused", AMBER);
                 } else if engine_running {
                     widgets::badge(ui, "Ready", GREEN);
                 } else if waiting_for_device {
@@ -654,11 +731,11 @@ impl App {
                         ui.weak(if self.settings.sounds.is_empty() {
                             "WAV, FLAC, OGG, MP3, and AIFF supported"
                         } else {
-                            "Click a pad to play or restart it."
+                            "Click a pad to play, pause or resume."
                         });
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!playing.is_empty(), egui::Button::new("Stop clips")).clicked() {
+                        if ui.add_enabled(!self.pad_progress.is_empty(), egui::Button::new("Stop clips")).clicked() {
                             self.stop_clips();
                         }
                     });
@@ -700,13 +777,6 @@ fn is_silent(peaks: &[f32]) -> bool {
     peaks.iter().all(|&p| p < 1e-3)
 }
 
-/// A pad's display name: its file name without the extension.
-pub(super) fn pad_name(path: &Path) -> String {
-    path.file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file_name(path))
-}
-
 /// Show a search box above the pads once there are more than this many.
 const SEARCH_FROM: usize = 9;
 /// The shortest a trimmed clip can be, seconds.
@@ -736,7 +806,7 @@ fn peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
 #[derive(Clone, Copy, Default)]
 struct PadState<'a> {
     playing: bool,
-    /// How far through the clip playback is.
+    /// How far through the clip playback is, including while paused.
     progress: Option<f32>,
     /// How long the pad plays, seconds (after trimming).
     length: Option<f32>,
@@ -745,39 +815,61 @@ struct PadState<'a> {
     starred: bool,
     /// Waiting for the user to press this pad's new hotkey.
     capturing: bool,
+    renaming: bool,
 }
 
 fn clip_pad(
     ui: &mut egui::Ui,
     index: usize,
-    path: &Path,
+    pad: &Pad,
     width: f32,
     state: PadState,
-) -> (egui::Response, egui::Response, egui::Response) {
+) -> (egui::Response, egui::Response, egui::Response, egui::Response) {
     let playing = state.playing;
-    let name = pad_name(path);
+    let paused = !playing && state.progress.is_some();
+    let action = if playing { "Pause" } else if paused { "Resume" } else { "Play" };
+    let path = &pad.path;
+    let name = pad.display_name();
     let format = path
         .extension()
         .map(|ext| ext.to_string_lossy().to_ascii_uppercase())
         .unwrap_or_else(|| "AUDIO".into());
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 78.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 108.0), egui::Sense::hover());
+    let body = egui::Rect::from_min_size(rect.min, egui::vec2(width, 78.0));
     let play_rect = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.right() - 36.0, rect.bottom()),
+        body.min,
+        egui::pos2(body.right() - 36.0, body.bottom()),
     );
     let remove_rect = egui::Rect::from_min_max(
         egui::pos2(rect.right() - 36.0, rect.top()),
-        rect.max,
+        body.max,
     );
     let play_response = ui.interact(
         play_rect,
         ui.id().with(("sound_play", index)),
         egui::Sense::click_and_drag(),
     );
-    let star_rect = egui::Rect::from_center_size(egui::pos2(play_rect.right() - 13.0, rect.top() + 13.0), egui::vec2(20.0, 20.0));
-    let star_response = ui.interact(star_rect, ui.id().with(("sound_star", index)), egui::Sense::click());
+    let name_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 50.0, rect.top() + 18.0),
+        egui::pos2(play_rect.right() - 4.0, rect.top() + 42.0),
+    );
+    let name_response = ui.interact(
+        name_rect,
+        ui.id().with(("sound_name", &pad.path)),
+        if state.renaming { egui::Sense::hover() } else { egui::Sense::click() },
+    ).on_hover_cursor(egui::CursorIcon::Text);
+    name_response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), format!("Rename {name}"))
+    });
+    let star_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 8.0, body.bottom() + 2.0),
+        egui::pos2(rect.right() - 8.0, rect.bottom() - 6.0),
+    );
+    let star_response = ui.interact(star_rect, ui.id().with(("sound_star", index)), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
     star_response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), state.starred, format!("Show {name} on the strip"))
+        let label = if state.starred { format!("Remove {name} from the strip") } else { format!("Add {name} to the strip") };
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), state.starred, label)
     });
     // Another pad is being dragged over this one: it will land here.
     let drop_here = play_response.dnd_hover_payload::<usize>().is_some_and(|from| *from != index);
@@ -790,7 +882,7 @@ fn clip_pad(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             ui.is_enabled(),
-            format!("Play {name}"),
+            format!("{action} {name}"),
         )
     });
     remove_response.widget_info(|| {
@@ -802,9 +894,9 @@ fn clip_pad(
     });
 
     let visuals = ui.visuals();
-    let accent = if playing { GREEN } else { CYAN };
-    let fill = if playing {
-        GREEN.gamma_multiply(0.13)
+    let accent = if playing { GREEN } else if paused { AMBER } else { CYAN };
+    let fill = if playing || paused {
+        accent.gamma_multiply(0.13)
     } else if play_response.hovered() {
         CYAN.gamma_multiply(0.06)
     } else {
@@ -812,7 +904,7 @@ fn clip_pad(
     };
     let border = if drop_here {
         AMBER
-    } else if playing || play_response.hovered() || state.capturing {
+    } else if playing || paused || play_response.hovered() || state.capturing {
         accent
     } else {
         visuals.widgets.noninteractive.bg_stroke.color
@@ -834,17 +926,24 @@ fn clip_pad(
         );
     }
 
-    let center = egui::pos2(rect.left() + 28.0, rect.center().y);
+    let center = egui::pos2(rect.left() + 28.0, body.center().y);
     painter.circle_filled(center, 16.0, accent);
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(center.x - 3.0, center.y - 6.0),
-            egui::pos2(center.x + 7.0, center.y),
-            egui::pos2(center.x - 3.0, center.y + 6.0),
-        ],
-        Color32::from_gray(18),
-        egui::Stroke::NONE,
-    ));
+    if playing {
+        for dx in [-4.0, 4.0] {
+            let bar = egui::Rect::from_center_size(center + egui::vec2(dx, 0.0), egui::vec2(3.0, 12.0));
+            painter.rect_filled(bar, 0.0, Color32::from_gray(18));
+        }
+    } else {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(center.x - 3.0, center.y - 6.0),
+                egui::pos2(center.x + 7.0, center.y),
+                egui::pos2(center.x - 3.0, center.y + 6.0),
+            ],
+            Color32::from_gray(18),
+            egui::Stroke::NONE,
+        ));
+    }
 
     let max_chars = ((width - 106.0) / 7.0).max(7.0) as usize;
     let title = if name.chars().count() > max_chars {
@@ -859,16 +958,21 @@ fn clip_pad(
     };
     let text_area = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 52.0, rect.top() + 9.0),
-        egui::pos2(rect.right() - 43.0, rect.bottom() - 8.0),
+        egui::pos2(rect.right() - 43.0, body.bottom() - 8.0),
     );
     let text_painter = painter.with_clip_rect(text_area);
-    text_painter.text(
-        egui::pos2(rect.left() + 52.0, rect.top() + 30.0),
-        egui::Align2::LEFT_CENTER,
-        title,
-        egui::FontId::proportional(14.0),
-        visuals.text_color(),
-    );
+    if !state.renaming {
+        if name_response.hovered() || name_response.has_focus() {
+            painter.rect_filled(name_rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        text_painter.text(
+            egui::pos2(rect.left() + 52.0, rect.top() + 30.0),
+            egui::Align2::LEFT_CENTER,
+            title,
+            egui::FontId::proportional(14.0),
+            if name_response.hovered() || name_response.has_focus() { CYAN } else { visuals.text_color() },
+        );
+    }
     let format = match state.length {
         Some(length) => format!("{format} · {}", clock_seconds(length)),
         None => format,
@@ -879,20 +983,22 @@ fn clip_pad(
         ("Move here".to_owned(), AMBER)
     } else if playing {
         (format!("{format} · Playing"), GREEN)
+    } else if paused {
+        (format!("Paused · {format}"), AMBER)
     } else if let Some(hotkey) = state.hotkey {
         (format!("{format} · {hotkey}"), visuals.weak_text_color())
     } else {
         (format, visuals.weak_text_color())
     };
     // Playback progress along the bottom of the pad.
-    if let (true, Some(progress)) = (playing, state.progress) {
+    if let Some(progress) = state.progress {
         let track = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 10.0, rect.bottom() - 6.0),
-            egui::pos2(remove_rect.left() - 8.0, rect.bottom() - 3.0),
+            egui::pos2(rect.left() + 10.0, body.bottom() - 6.0),
+            egui::pos2(remove_rect.left() - 8.0, body.bottom() - 3.0),
         );
-        painter.rect_filled(track, 1.5, GREEN.gamma_multiply(0.2));
+        painter.rect_filled(track, 1.5, accent.gamma_multiply(0.2));
         let done = egui::Rect::from_min_max(track.min, egui::pos2(track.left() + track.width() * progress.clamp(0.0, 1.0), track.bottom()));
-        painter.rect_filled(done, 1.5, GREEN);
+        painter.rect_filled(done, 1.5, accent);
     }
     text_painter.text(
         egui::pos2(rect.left() + 52.0, rect.top() + 55.0),
@@ -904,7 +1010,7 @@ fn clip_pad(
     painter.line_segment(
         [
             egui::pos2(remove_rect.left(), rect.top() + 8.0),
-            egui::pos2(remove_rect.left(), rect.bottom() - 8.0),
+            egui::pos2(remove_rect.left(), body.bottom() - 8.0),
         ],
         egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
     );
@@ -930,31 +1036,42 @@ fn clip_pad(
             visuals.weak_text_color()
         },
     );
-    // Starred pads show on the strip; the outline star appears on hover.
-    if state.starred || play_response.hovered() || star_response.hovered() {
-        let color = if state.starred { AMBER } else if star_response.hovered() { visuals.text_color() } else { visuals.weak_text_color() };
-        painter.text(
-            star_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            if state.starred { "★" } else { "☆" },
-            egui::FontId::proportional(15.0),
-            color,
-        );
+    // A separate, labeled strip toggle below the playback hit target.
+    let star_visuals = ui.style().interact(&star_response);
+    let star_color = if state.starred { AMBER } else { star_visuals.text_color() };
+    painter.rect(
+        star_rect,
+        4.0,
+        if state.starred { AMBER.gamma_multiply(0.13) } else { star_visuals.weak_bg_fill },
+        if state.starred { egui::Stroke::new(1.0, AMBER) } else { star_visuals.bg_stroke },
+        egui::StrokeKind::Inside,
+    );
+    if star_response.has_focus() {
+        painter.rect_stroke(star_rect.expand(2.0), 6.0, visuals.selection.stroke, egui::StrokeKind::Outside);
     }
+    painter.text(
+        star_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if state.starred { "★ On strip" } else { "☆ Add to strip" },
+        egui::FontId::proportional(11.0),
+        star_color,
+    );
     let star_response = star_response.on_hover_text(if state.starred {
-        "On the strip: click to remove"
+        "Remove this pad from the strip"
     } else {
-        "Show this pad on the strip"
+        "Add this pad to the strip"
     });
     let play_response = play_response.on_hover_text(format!(
-        "Click to play, drag to reorder, right-click for volume, hotkey and trim\n{}",
+        "Click to {}, drag to reorder, right-click for volume, hotkey and trim\n{}",
+        action.to_lowercase(),
         path.display()
     ));
     let remove_response = remove_response.on_hover_text(format!(
         "Remove {} from the soundboard. The file stays on disk.",
         file_name(path)
     ));
-    (play_response, remove_response, star_response)
+    let name_response = name_response.on_hover_text(format!("{name}\nClick to rename"));
+    (play_response, remove_response, star_response, name_response)
 }
 
 #[cfg(test)]
@@ -964,9 +1081,9 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn sound_pad_play_and_remove_have_separate_hit_targets() {
+    fn sound_pad_play_remove_and_strip_button_have_separate_hit_targets() {
         let ctx = egui::Context::default();
-        let path = PathBuf::from("airhorn.mp3");
+        let pad = Pad::new(PathBuf::from("airhorn.mp3"));
         let frame = |events| {
             let mut responses = None;
             let _ = ctx.run_ui(
@@ -979,15 +1096,20 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    let (play, remove, _) = clip_pad(ui, 0, &path, 240.0, PadState::default());
-                    responses = Some((play, remove));
+                    responses = Some(clip_pad(ui, 0, &pad, 240.0, PadState::default()));
                 },
             );
             responses.unwrap()
         };
-        let (play, remove) = frame(Vec::new());
+        let (play, remove, star, name) = frame(Vec::new());
         assert!(play.rect.right() <= remove.rect.left());
-        for (pos, expect_play) in [(play.rect.center(), true), (remove.rect.center(), false)] {
+        assert!(star.rect.top() >= play.rect.bottom() && star.rect.top() >= remove.rect.bottom());
+        for (pos, expected) in [
+            (egui::pos2(play.rect.left() + 28.0, play.rect.center().y), (true, false, false, false)),
+            (remove.rect.center(), (false, true, false, false)),
+            (star.rect.center(), (false, false, true, false)),
+            (name.rect.center(), (false, false, false, true)),
+        ] {
             frame(vec![
                 egui::Event::PointerMoved(pos),
                 egui::Event::PointerButton {
@@ -997,14 +1119,13 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 },
             ]);
-            let (play, remove) = frame(vec![egui::Event::PointerButton {
+            let (play, remove, star, name) = frame(vec![egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
             }]);
-            assert_eq!(play.clicked(), expect_play);
-            assert_eq!(remove.clicked(), !expect_play);
+            assert_eq!((play.clicked(), remove.clicked(), star.clicked(), name.clicked()), expected);
         }
     }
 
@@ -1065,11 +1186,11 @@ mod tests {
         let mut mixer = crate::dsp::Mixer::default();
         mixer.play(crate::dsp::Clip::new(7, Arc::new(vec![0.1; 1000]), 1.0), false);
         mixer.mix(&mut [0.0; 250], 1.0);
-        assert_eq!(mixer.progress(), [(7, 0.25)]);
+        assert_eq!(mixer.progress(), [(7, 0.25, false)]);
     }
 
     /// Draw the whole app on the Soundboard tab, with `events` this frame.
-    fn board(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<String> {
+    fn board_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
         use eframe::App as _;
         let mut frame = eframe::Frame::_new_kittest();
         let input = egui::RawInput {
@@ -1077,7 +1198,11 @@ mod tests {
             events,
             ..Default::default()
         };
-        let output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        ctx.run_ui(input, |ui| app.ui(ui, &mut frame))
+    }
+
+    fn board(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<String> {
+        let output = board_frame(app, ctx, events);
         let mut texts = Vec::new();
         fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
             match shape {
@@ -1088,6 +1213,64 @@ mod tests {
         }
         output.shapes.iter().for_each(|c| collect(&c.shape, &mut texts));
         texts
+    }
+
+    fn pad_title_position(app: &mut App, ctx: &egui::Context, name: &str) -> egui::Pos2 {
+        board_frame(app, ctx, Vec::new()).shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == name => Some(t.visual_bounding_rect().center()),
+            _ => None,
+        }).unwrap_or_else(|| panic!("{name} not drawn"))
+    }
+
+    #[test]
+    fn clicking_a_name_edits_it_without_changing_playback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav(dir.path(), "a.wav", 0.5);
+        let mut pad = Pad::new(path.clone());
+        pad.starred = true;
+        let mut app = App::stopped(crate::config::Settings { sounds: vec![pad], ..Default::default() });
+        app.page = super::super::Page::Soundboard;
+        let key = clip_key(&path);
+        app.playing.push(key);
+        app.pad_progress.insert(key, 0.25);
+        let ctx = egui::Context::default();
+        board(&mut app, &ctx, Vec::new());
+        let click = |app: &mut App, pos| {
+            for pressed in [true, false] {
+                board(app, &ctx, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                ]);
+            }
+        };
+        for (text, finish, expected) in [
+            (" Beep ", Some(egui::Key::Enter), "Beep"),
+            ("Cancel", Some(egui::Key::Escape), "Beep"),
+            ("Chime", None, "Chime"),
+            ("   ", Some(egui::Key::Enter), "a"),
+        ] {
+            let name = app.settings.sounds[0].display_name();
+            let pos = pad_title_position(&mut app, &ctx, &name);
+            click(&mut app, pos);
+            assert!(app.renaming_pad.is_some(), "clicking the title starts an inline edit");
+            board(&mut app, &ctx, vec![egui::Event::Text(text.into())]);
+            if let Some(key) = finish {
+                board(&mut app, &ctx, [true, false].into_iter().map(|pressed| egui::Event::Key {
+                    key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                }).collect());
+            } else {
+                click(&mut app, egui::pos2(730.0, 1500.0));
+            }
+            assert!(app.renaming_pad.is_none());
+            assert_eq!(app.settings.sounds[0].display_name(), expected);
+            assert_eq!(app.sound_status.0, "Ready", "renaming never triggers play/pause");
+            assert_eq!(app.playing, [key]);
+            assert_eq!(app.pad_progress.get(&key), Some(&0.25));
+            assert!(app.settings.sounds[0].starred);
+            assert_eq!(app.settings.sounds[0].path, path);
+            assert!(path.exists(), "the file is not renamed");
+        }
+        assert!(app.dirty_since.is_some(), "the saved label is persisted");
     }
 
     #[test]
@@ -1113,6 +1296,11 @@ mod tests {
         let texts = board(&mut app, &ctx, Vec::new());
         let names: Vec<&String> = texts.iter().filter(|t| t.starts_with("clip") && *t != "clip1").collect(); // not the search box
         assert_eq!(names, ["clip10", "clip11"].map(String::from).iter().collect::<Vec<_>>(), "only matches");
+        app.settings.sounds[0].name = Some("Beep".into());
+        app.pad_filter = "BEEP".into();
+        let texts = board(&mut app, &ctx, Vec::new());
+        assert!(texts.iter().any(|t| t == "Beep"), "search finds the saved name");
+        assert!(!texts.iter().any(|t| t.starts_with("clip")), "the old filenames do not match");
     }
 
     #[test]
@@ -1126,26 +1314,8 @@ mod tests {
         app.page = super::super::Page::Soundboard;
         let ctx = egui::Context::default();
         board(&mut app, &ctx, Vec::new());
-        // Where the pads landed: find each title's position.
-        let find = |ctx: &egui::Context, app: &mut App, name: &str| -> egui::Pos2 {
-            use eframe::App as _;
-            let mut frame = eframe::Frame::_new_kittest();
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 1600.0))),
-                ..Default::default()
-            };
-            let output = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
-            output
-                .shapes
-                .iter()
-                .find_map(|c| match &c.shape {
-                    egui::Shape::Text(t) if t.galley.text() == name => Some(t.visual_bounding_rect().center()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("{name} not drawn"))
-        };
-        let from = find(&ctx, &mut app, "a");
-        let to = find(&ctx, &mut app, "c");
+        let from = pad_title_position(&mut app, &ctx, "a");
+        let to = pad_title_position(&mut app, &ctx, "c");
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -1163,7 +1333,7 @@ mod tests {
         ] {
             board(&mut app, &ctx, events);
         }
-        let order: Vec<String> = app.settings.sounds.iter().map(|p| pad_name(&p.path)).collect();
+        let order: Vec<String> = app.settings.sounds.iter().map(Pad::display_name).collect();
         assert_eq!(order, ["b", "c", "a"]);
         assert!(app.dirty_since.is_some(), "the new order is saved");
     }

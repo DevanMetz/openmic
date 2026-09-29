@@ -166,15 +166,19 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, pad)| pad.starred)
-                .map(|(i, pad)| (i, super::sound_tab::pad_name(&pad.path), self.playing.contains(&super::clip_key(&pad.path))))
+                .map(|(i, pad)| (i, pad.display_name(), self.playing.contains(&super::clip_key(&pad.path))))
                 .collect(),
         }
     }
 
-    /// Show the strip while OpenMic is collapsed. Called every tick, so it
+    pub(super) fn strip_visible(&self) -> bool {
+        (self.settings.collapsed || self.settings.always_show_strip) && !self.strip_suppressed
+    }
+
+    /// Show the strip while collapsed or always shown. Called every tick, so it
     /// keeps working with the main window hidden.
     pub(super) fn show_overlay(&mut self, ctx: &egui::Context) {
-        if !self.settings.collapsed || self.strip_suppressed {
+        if !self.strip_visible() {
             self.overlay_placement = Placement::default();
             return;
         }
@@ -234,7 +238,7 @@ impl App {
                 Action::ToggleMute => self.run_command(ctx, Command::ToggleMute),
                 Action::Expand => self.set_collapsed(ctx, false),
                 Action::NextPreset => self.next_preset(),
-                Action::PlayPad(index) => self.play_clip(index),
+                Action::PlayPad(index) => self.toggle_clip(index),
             }
         }
     }
@@ -697,33 +701,48 @@ mod tests {
     }
 
     #[test]
-    fn collapsing_swaps_the_window_for_the_strip_and_back() {
+    fn opening_the_full_window_keeps_the_strip_when_enabled() {
         use eframe::App as _;
-        let mut app = App::stopped(Settings::default());
-        let ctx = egui::Context::default();
-        let mut frame = eframe::Frame::_new_kittest();
-        let mut step = |app: &mut App| {
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(760.0, 880.0))),
-                ..Default::default()
+        for always_show_strip in [true, false] {
+            let mut app = App::stopped(Settings { always_show_strip, ..Settings::default() });
+            let ctx = egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut step = |app: &mut App| {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(760.0, 880.0));
+                let mut input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+                let info = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
+                info.outer_rect = Some(rect);
+                info.native_pixels_per_point = Some(1.0);
+                let output = ctx.run_ui(input, |ui| {
+                    app.logic(ui.ctx(), &mut frame);
+                    app.ui(ui, &mut frame);
+                });
+                output.viewport_output.into_values().flat_map(|v| v.commands).collect::<Vec<_>>()
             };
-            let output = ctx.run_ui(input, |ui| {
-                app.logic(ui.ctx(), &mut frame);
-                app.ui(ui, &mut frame);
-            });
-            output.viewport_output.into_values().flat_map(|v| v.commands).collect::<Vec<_>>()
-        };
-        step(&mut app);
-        app.commands.0.send(Command::ToggleCollapse).unwrap();
-        let commands = step(&mut app);
-        assert!(app.settings.collapsed && app.hidden, "collapsed: the window hides");
-        assert!(commands.contains(&ViewportCommand::Visible(false)), "{commands:?}");
-        assert!(app.dirty_since.is_some(), "and it reopens collapsed");
+            step(&mut app);
+            assert_eq!(app.overlay_placement.placed, always_show_strip, "strip visibility on launch");
+            app.commands.0.send(Command::ToggleCollapse).unwrap();
+            let commands = step(&mut app);
+            assert!(app.settings.collapsed && app.hidden, "collapsed: the window hides");
+            assert!(commands.contains(&ViewportCommand::Visible(false)), "{commands:?}");
+            assert!(app.overlay_placement.placed, "collapsing always shows the strip");
+            assert!(app.dirty_since.is_some(), "and it reopens collapsed");
 
-        app.commands.0.send(Command::Show).unwrap();
-        let commands = step(&mut app);
-        assert!(!app.settings.collapsed && !app.hidden, "showing the window expands it");
-        assert!(commands.contains(&ViewportCommand::Visible(true)), "{commands:?}");
+            // The strip's expand button restores the main window.
+            let placed_frames = app.overlay_placement.frames;
+            app.set_collapsed(&ctx, false);
+            let commands = step(&mut app);
+            assert!(!app.settings.collapsed && !app.hidden, "showing the window expands it");
+            assert!(commands.contains(&ViewportCommand::Visible(true)), "{commands:?}");
+            assert_eq!(app.overlay_placement.placed, always_show_strip, "strip visibility after expanding");
+            if always_show_strip {
+                assert!(app.overlay_placement.frames > placed_frames, "the strip stays in place");
+            }
+
+            app.settings.always_show_strip = !always_show_strip;
+            step(&mut app);
+            assert_eq!(app.overlay_placement.placed, !always_show_strip, "changing the setting takes effect immediately");
+        }
     }
 
     #[test]

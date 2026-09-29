@@ -143,12 +143,14 @@ pub struct App {
     sound_status: Status,
     /// Keys of the clips playing as of this frame.
     playing: Vec<u64>,
-    /// How far through each playing clip is (0..1), by clip key.
+    /// Progress (0..1) for playing and paused clips, by clip key.
     pad_progress: HashMap<u64, f32>,
     /// Clip lengths in seconds, read once per file (`None`: unknown).
     pad_durations: HashMap<PathBuf, Option<f32>>,
     /// The soundboard's search text.
     pad_filter: String,
+    /// A clip name being edited, separate from its saved display name.
+    renaming_pad: Option<sound_tab::PadRename>,
     /// Waveform peaks of the pad being trimmed.
     trim_peaks: Option<(PathBuf, Vec<f32>)>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
@@ -302,6 +304,7 @@ impl App {
             pad_progress: HashMap::new(),
             pad_durations: HashMap::new(),
             pad_filter: String::new(),
+            renaming_pad: None,
             trim_peaks: None,
             clip_cache: HashMap::new(),
             record_source: Source::Microphone,
@@ -469,6 +472,7 @@ impl App {
         }
         self.hold = [-60.0; 2];
         self.playing.clear();
+        self.pad_progress.clear();
         if announce {
             self.status = ("Stopped".into(), MUTED);
             self.sound_status = ("Ready".into(), Color32::WHITE);
@@ -484,6 +488,7 @@ impl App {
         if let Some(engine) = &self.engine {
             engine.resume_clips(clips);
         }
+        self.sync_clip_progress();
     }
 
     fn toggle_running(&mut self) {
@@ -589,12 +594,7 @@ impl App {
                 self.warn_until = None;
             }
         }
-        let progress = self.engine.as_ref().map(Engine::clip_progress).unwrap_or_default();
-        self.playing = progress.iter().map(|(key, _)| *key).collect();
-        self.pad_progress = progress.into_iter().collect();
-        if self.playing.is_empty() && self.sound_status.0.starts_with("Playing") {
-            self.sound_status = ("Ready".into(), Color32::WHITE);
-        }
+        self.sync_clip_progress();
     }
 
     /// Point the Windows default microphone at VB-Cable while processing into
@@ -780,7 +780,7 @@ impl App {
         }
     }
 
-    /// Swap between the full window and the strip.
+    /// Hide or restore the full window; the strip can stay visible alongside it.
     fn set_collapsed(&mut self, ctx: &egui::Context, collapsed: bool) {
         if collapsed {
             self.settings.collapsed = true;
@@ -988,6 +988,17 @@ impl App {
 
     // ---- soundboard ------------------------------------------------------
 
+    fn sync_clip_progress(&mut self) {
+        let progress = self.engine.as_ref().map(Engine::clip_progress).unwrap_or_default();
+        self.playing = progress.iter().filter(|(_, _, paused)| !paused).map(|(key, _, _)| *key).collect();
+        self.pad_progress = progress.into_iter().map(|(key, at, _)| (key, at)).collect();
+        if self.pad_progress.is_empty()
+            && (self.sound_status.0.starts_with("Playing") || self.sound_status.0.starts_with("Paused"))
+        {
+            self.sound_status = ("Ready".into(), Color32::WHITE);
+        }
+    }
+
     /// Decoded samples for a clip, from the cache when possible.
     fn clip_samples(&mut self, path: &Path) -> anyhow::Result<Arc<Vec<f32>>> {
         if let Some(samples) = self.clip_cache.get(path) {
@@ -1001,6 +1012,22 @@ impl App {
         }
         self.clip_cache.insert(path.to_owned(), Arc::clone(&samples));
         Ok(samples)
+    }
+
+    /// Card and strip clicks pause or resume an existing clip; hotkeys
+    /// still use play_clip to trigger it from the beginning.
+    fn toggle_clip(&mut self, index: usize) {
+        let Some(pad) = self.settings.sounds.get(index) else { return };
+        let paused = self.engine.as_ref().and_then(|engine| {
+            engine.toggle_sound_pause(clip_key(&pad.path), self.settings.overlap_clips)
+        });
+        if let Some(paused) = paused {
+            let (label, color) = if paused { ("Paused", AMBER) } else { ("Playing", GREEN) };
+            self.sound_status = (format!("{label} · {}", pad.display_name()), color);
+            self.sync_clip_progress();
+        } else {
+            self.play_clip(index);
+        }
     }
 
     fn play_clip(&mut self, index: usize) {
@@ -1017,9 +1044,9 @@ impl App {
                 let samples = trimmed(&samples, pad.start, pad.end);
                 if let Some(engine) = &self.engine {
                     engine.play_sound(Clip::new(key, samples, pad.volume), self.settings.overlap_clips);
-                    self.playing = engine.playing();
                 }
-                self.sound_status = (format!("Playing · {}", file_name(&pad.path)), GREEN);
+                self.sound_status = (format!("Playing · {}", pad.display_name()), GREEN);
+                self.sync_clip_progress();
             }
             Err(e) => self.sound_status = (short(&format!("{:#}", e)), RED),
         }
@@ -1030,6 +1057,7 @@ impl App {
             engine.stop_sounds();
         }
         self.playing.clear();
+        self.pad_progress.clear();
         self.sound_status = ("Ready".into(), Color32::WHITE);
     }
 
@@ -1075,6 +1103,7 @@ const MAX_DICTATION: Duration = Duration::from_secs(300);
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         logfile::info("quitting");
+        self.finish_pad_rename(true);
         self.recorder.take();
         self.dictating.take();
         self.stop_engine(false);
@@ -1094,7 +1123,7 @@ impl eframe::App for App {
         // fps. Hidden, a slow tick still handles device loss and the default
         // mic; tray and hotkey commands wake it immediately.
         let animating = self.engine.is_some() || self.recorder.is_some();
-        let meter_live = self.settings.collapsed && self.engine.is_some();
+        let meter_live = self.strip_visible() && self.engine.is_some();
         let frame_time = match (self.hidden, animating) {
             (true, _) if meter_live => 33,
             (true, _) => 250,
@@ -1145,7 +1174,7 @@ const SIDEBAR_WIDTH: f32 = 176.0;
 
 impl App {
     /// Navigation above; below, what matters on every page: whether Discord
-    /// hears you, your level, Mute, Start/Stop and collapsing to the strip.
+    /// hears you, your level, Mute and Start/Stop.
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -1167,6 +1196,7 @@ impl App {
             let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
             let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, text));
             if response.clicked() {
+                self.finish_pad_rename(true);
                 self.page = page;
             }
         }
@@ -1178,11 +1208,6 @@ impl App {
 
     fn draw_status_panel(&mut self, ui: &mut egui::Ui) {
         // Laid out bottom-up: the last widget added is the top one.
-        if ui.button("🗕 Collapse to strip").on_hover_text("Swap this window for a thin always-on-top bar").clicked() {
-            let ctx = ui.ctx().clone();
-            self.set_collapsed(&ctx, true);
-        }
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let running = self.running();
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
@@ -1479,13 +1504,13 @@ mod tests {
                 app.page = page;
                 let (texts, _) = render(&mut app, size);
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-                for needle in ["OpenMic", "Voice", "Settings", "• Stopped", "Start", "Mute", "Collapse to strip"] {
+                for needle in ["OpenMic", "Voice", "Settings", "• Stopped", "Start", "Mute"] {
                     let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} missing on {page:?} at {size:?}"));
                     assert!(screen.contains_rect(*rect), "{needle} off screen on {page:?} at {size:?}: {rect:?}");
                     assert!(rect.right() < SIDEBAR_WIDTH + 4.0 || needle == "Voice", "{needle} is in the sidebar: {rect:?}");
                 }
-                let collapse = visible(&texts, "Collapse to strip").unwrap();
-                assert!(collapse.bottom() > size.y - 40.0, "the status panel sits at the bottom: {collapse:?}");
+                let start = visible(&texts, "Start").unwrap();
+                assert!(start.bottom() > size.y - 40.0, "the status panel sits at the bottom: {start:?}");
                 let title = texts.iter().filter(|(t, _)| t == page.title()).map(|(_, r)| r).find(|r| r.left() > SIDEBAR_WIDTH);
                 assert!(title.is_some(), "{page:?} shows its title beside the sidebar");
             }
@@ -1729,6 +1754,7 @@ mod tests {
         app.page = Page::Settings;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
         assert!(visible(&texts, "ROUTING").is_none() && visible(&texts, "HOTKEYS").is_some());
+        assert!(visible(&texts, "Always show the strip").is_some(), "strip visibility is a Settings option");
         assert!(visible(&texts, "SPEECH TO TEXT").is_none(), "dictation has its own page");
         app.page = Page::Dictation;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
@@ -1777,7 +1803,7 @@ mod tests {
         let (_, output) = render(&mut app, egui::vec2(760.0, 880.0));
         let tree = output.platform_output.accesskit_update.expect("accessibility tree");
         let labels: Vec<String> = tree.nodes.iter().filter_map(|(_, node)| node.label().map(str::to_owned)).collect();
-        for control in ["Start", "Mute", "Voice", "Soundboard", "Record", "Dictation", "Settings", "Collapse to strip"] {
+        for control in ["Start", "Mute", "Voice", "Soundboard", "Record", "Dictation", "Settings"] {
             assert!(labels.iter().any(|l| l.contains(control)), "{control} has no accessible name: {labels:?}");
         }
     }
