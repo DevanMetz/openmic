@@ -110,6 +110,8 @@ Hover over a pad's name and click it to rename it. Press **Enter** or click else
 
 If you edit a clip's audio file outside OpenMic, the next time you start the pad or open its trim controls, OpenMic reloads the audio and updates its duration and waveform.
 
+Trim waveforms load in the background, including while OpenMic is stopped. The menu shows **Loading waveform…** until the controls are ready, or **Retry waveform** if the file could not be read. Opening the menu never starts playback. Closing it cancels an unfinished preview unless the pad is also waiting to play.
+
 The first playback after launch, or after editing a clip, loads its audio in the background. The pad shows **Loading**; click it again or use **Stop clips** to cancel. Cached clips start immediately. With overlap off, choosing another pad cancels older pending playback; with overlap on, requested clips load one at a time and start as each is ready.
 
 To make a clip, choose **Microphone** (the selected raw mic) or **Computer audio** (the Windows default output or another playback device), then click **Record** and **Stop recording**. While it records, a live waveform, level meter and running file size show what's being captured; afterwards the whole take is drawn so you can check it before keeping it. Name the take and choose **Save WAV** or **Add to soundboard**. Takes are written to disk as they record, so there's no time limit beyond the WAV format's 4 GB (about six hours of 48 kHz stereo); a take you discard is deleted. Computer audio records the full mix playing through the chosen output; recording works even when OpenMic processing is stopped.

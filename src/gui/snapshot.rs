@@ -117,17 +117,24 @@ fn sample(tex: &ColorImage, u: f32, v: f32) -> [f32; 4] {
 
 /// Draw the app at `size` points and `ppp` pixels per point, and save it.
 pub(super) fn snapshot(app: &mut App, name: &str, size: egui::Vec2, ppp: f32, dark: bool) -> PathBuf {
+    snapshot_with_events(app, name, size, ppp, dark, Vec::new())
+}
+
+/// Replay input first, then let menus and animations settle before rendering.
+pub(super) fn snapshot_with_events(app: &mut App, name: &str, size: egui::Vec2, ppp: f32, dark: bool, events: Vec<Vec<egui::Event>>) -> PathBuf {
     use eframe::App as _;
     let ctx = egui::Context::default();
     ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
     let mut frame = eframe::Frame::_new_kittest();
     let mut textures: HashMap<TextureId, ColorImage> = HashMap::new();
     let mut output = None;
-    // Let measured layouts and popup fade-in animations settle.
-    for step in 0..4 {
+    let frames = events.len() + 4;
+    let mut events = events.into_iter();
+    for step in 0..frames {
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
-            time: Some(f64::from(step) * 0.2),
+            time: Some(step as f64 * 0.2),
+            events: events.next().unwrap_or_default(),
             ..Default::default()
         };
         input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);

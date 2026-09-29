@@ -609,24 +609,20 @@ impl App {
     /// Trim a pad: drag the start and end on its waveform, or type them.
     fn trim_editor(&mut self, ui: &mut egui::Ui, index: usize) {
         let Some(pad) = self.settings.sounds.get(index).cloned() else { return };
-        ui.label(RichText::new("Trim").strong());
-        if self.clip_loading(&pad.path) {
-            ui.horizontal(|ui| { ui.spinner(); ui.label("Loading waveform…"); });
-            return;
-        }
-        let samples = match self.clip_samples(&pad.path) {
-            Ok(samples) => samples,
-            Err(e) => {
-                ui.colored_label(RED, short(&format!("{e:#}")));
-                return;
-            }
-        };
-        let length = samples.len() as f32 / crate::dsp::SR as f32;
-        if self.trim_peaks.as_ref().is_none_or(|(path, _)| *path != pad.path) {
-            self.trim_peaks = Some((pad.path.clone(), peaks(&samples, 240)));
-        }
-        let peaks = self.trim_peaks.as_ref().map(|(_, p)| p.clone()).unwrap_or_default();
         ui.set_min_width(300.0);
+        ui.label(RichText::new("Trim").strong());
+        let Some((length, peaks)) = self.trim_waveform(&pad.path, ui.ctx()) else {
+            if let Some(error) = self.trim_clip.as_ref().and_then(|trim| trim.error.as_ref()) {
+                ui.colored_label(RED, short(error)).on_hover_text(error);
+                if ui.button("Retry waveform").clicked() {
+                    self.trim_clip.as_mut().unwrap().error = None;
+                    ui.ctx().request_repaint();
+                }
+            } else {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Loading waveform…"); });
+            }
+            return;
+        };
         let (mut start, mut end) = (pad.start.clamp(0.0, length), pad.end.unwrap_or(length).clamp(0.0, length));
 
         // Drag near either edge of the kept part to move it.
@@ -732,6 +728,7 @@ impl App {
         let mut add_header = false;
         let mut add_empty = false;
         let mut remove_index = None;
+        let mut trim_open = false;
         widgets::card(
             ui,
             "SOUND PADS",
@@ -837,7 +834,12 @@ impl App {
                                         if let Some(from) = play.dnd_release_payload::<usize>() {
                                             moved = Some((*from, i));
                                         }
-                                        play.context_menu(|ui| self.pad_menu(ui, i, &mut remove_index));
+                                        egui::Popup::context_menu(&play)
+                                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                            .show(|ui| {
+                                                trim_open = true;
+                                                self.pad_menu(ui, i, &mut remove_index);
+                                            });
                                     }
                                 });
                             }
@@ -854,6 +856,7 @@ impl App {
         if let Some(index) = remove_index {
             self.remove_clip(index);
         }
+        if !trim_open { self.close_trim_editor(); }
 
         ui.add_space(10.0);
         let playing: Vec<String> = self
@@ -864,7 +867,7 @@ impl App {
             .map(Pad::display_name)
             .collect();
         let engine_running = self.engine.is_some();
-        let loading = self.clip_playback.is_some();
+        let loading = self.has_pending_playback();
         let waiting_for_device = self.waiting_for_device;
         let paused = self.pad_progress.len().saturating_sub(playing.len());
         let title = match playing.len() {
@@ -912,7 +915,7 @@ impl App {
                         });
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!self.pad_progress.is_empty() || self.clip_playback.is_some(), egui::Button::new("Stop clips")).clicked() {
+                        if ui.add_enabled(!self.pad_progress.is_empty() || loading, egui::Button::new("Stop clips")).clicked() {
                             self.stop_clips();
                         }
                     });
@@ -972,12 +975,6 @@ fn clock_seconds(seconds: f32) -> String {
 /// How long a pad plays with its trim points.
 fn trimmed_length(full: f32, start: f32, end: Option<f32>) -> f32 {
     (end.unwrap_or(full).min(full) - start.max(0.0)).max(0.0)
-}
-
-/// Peak level in `buckets` even slices of `samples`, for a waveform.
-fn peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
-    let per = samples.len().div_ceil(buckets.max(1)).max(1);
-    samples.chunks(per).map(|c| c.iter().fold(0.0f32, |m, s| m.max(s.abs()))).collect()
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1351,7 +1348,6 @@ mod tests {
         assert_eq!(trimmed_length(4.0, 0.0, None), 4.0);
         assert_eq!(clock_seconds(4.25), "4.2 s");
         assert_eq!(clock_seconds(75.0), "1:15");
-        assert_eq!(peaks(&[0.1, -0.5, 0.2, 0.9], 2), [0.5, 0.9]);
     }
 
     #[test]
@@ -1646,12 +1642,12 @@ mod tests {
         app.run_command(&ctx, super::super::Command::ToggleMute);
         assert!(app.settings.mute, "global microphone controls keep working during an import");
 
-        let metadata = std::fs::metadata(&first).unwrap();
-        let samples = Arc::new(crate::decode::load_clip(&first).unwrap());
-        assert!(done.send(Ok(CachedClip { samples: Arc::clone(&samples), bytes: metadata.len(), modified: metadata.modified().ok() })).is_ok());
+        let clip = CachedClip::read(&first, &AtomicBool::new(false)).unwrap();
+        let samples = Arc::clone(&clip.samples);
+        assert!(done.send(Ok(clip)).is_ok());
         app.poll_clip_import(&ctx);
         assert_eq!(app.settings.sounds, [Pad::new(first.clone())], "completed clips become available before the whole batch ends");
-        assert!(Arc::ptr_eq(&app.clip_samples(&first).unwrap(), &samples), "completed imports warm the playback cache");
+        assert!(Arc::ptr_eq(&app.cached_clip(&first).unwrap().samples, &samples), "completed imports warm the playback cache");
         finish_import(&mut app, &ctx);
         assert_eq!(app.settings.sounds, [first, second, third].map(Pad::new));
         assert_eq!(app.sound_status, ("Added 3 clips".into(), GREEN));
@@ -1731,18 +1727,28 @@ mod tests {
     fn edited_clip_files_refresh_audio_duration_and_trim_waveform() {
         let dir = tempfile::tempdir().unwrap();
         let path = wav(dir.path(), "editable.wav", 0.2);
-        let mut app = App::stopped(crate::config::Settings::default());
-        let original = app.clip_samples(&path).unwrap();
-        assert!(Arc::ptr_eq(&original, &app.clip_samples(&path).unwrap()), "unchanged files reuse decoded audio");
+        let mut app = App::stopped(crate::config::Settings { sounds: vec![Pad::new(path.clone())], ..Default::default() });
+        let ctx = egui::Context::default();
+        let load = |app: &mut App| {
+            app.trim_waveform(&path, &ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.clip_loads.is_some() {
+                app.poll_clip_loads(&ctx);
+                assert!(std::time::Instant::now() < deadline, "waveform load did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            app.cached_clip(&path).map(|clip| (Arc::clone(&clip.samples), Arc::clone(&clip.peaks)))
+        };
+        let (original, original_peaks) = load(&mut app).unwrap();
+        assert!(Arc::ptr_eq(&original, &load(&mut app).unwrap().0), "unchanged files reuse decoded audio");
         assert_eq!(app.pad_length(&path), Some(0.2));
-        app.trim_peaks = Some((path.clone(), vec![0.5]));
 
         wav(dir.path(), "editable.wav", 1.0);
-        let longer = app.clip_samples(&path).unwrap();
+        let (longer, longer_peaks) = load(&mut app).unwrap();
         assert_eq!(longer.len(), 48_000);
         assert_eq!(original.len(), 9_600, "audio already handed to a playing clip stays intact");
         assert_eq!(app.pad_length(&path), Some(1.0));
-        assert!(app.trim_peaks.is_none(), "regenerate the old waveform");
+        assert!(!Arc::ptr_eq(&original_peaks, &longer_peaks), "regenerate the old waveform");
 
         // An edit can keep the length while changing all its samples.
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -1752,12 +1758,14 @@ mod tests {
         std::fs::File::options().write(true).open(&path).unwrap().set_times(
             std::fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(2)),
         ).unwrap();
-        let edited = app.clip_samples(&path).unwrap();
+        let (edited, edited_peaks) = load(&mut app).unwrap();
         assert!(edited.iter().all(|&sample| sample == 0.0));
+        assert!(edited_peaks.iter().all(|&peak| peak == 0.0), "same-length edits also refresh the waveform");
         assert!(!Arc::ptr_eq(&longer, &edited));
 
         std::fs::remove_file(&path).unwrap();
-        assert!(app.clip_samples(&path).is_err(), "a removed source must not play stale audio");
+        assert!(load(&mut app).is_none(), "a removed source must not play stale audio");
+        assert!(app.trim_clip.as_ref().unwrap().error.is_some());
         assert_eq!(app.pad_length(&path), None);
     }
 

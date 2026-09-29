@@ -136,6 +136,7 @@ enum Binding {
 
 struct CachedClip {
     samples: Arc<Vec<f32>>,
+    peaks: Arc<Vec<f32>>,
     bytes: u64,
     modified: Option<SystemTime>,
 }
@@ -158,14 +159,14 @@ pub struct App {
     pad_filter: String,
     /// A clip name being edited, separate from its saved display name.
     renaming_pad: Option<sound_tab::PadRename>,
-    /// Waveform peaks of the pad being trimmed.
-    trim_peaks: Option<(PathBuf, Vec<f32>)>,
+    /// The trim menu's current clip and any load error awaiting a retry.
+    trim_clip: Option<clips::TrimClip>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
     clip_cache: HashMap<PathBuf, CachedClip>,
     /// Files being imported in the background, one decoder at a time.
     clip_import: Option<sound_tab::ClipImport>,
-    /// Pending pad playback, decoded one clip at a time.
-    clip_playback: Option<clips::ClipPlayback>,
+    /// Pending playback and trim previews, decoded one clip at a time.
+    clip_loads: Option<clips::ClipLoads>,
     record_source: Source,
     record_output: String,
     recorder: Option<Recorder>,
@@ -320,10 +321,10 @@ impl App {
             pad_durations: HashMap::new(),
             pad_filter: String::new(),
             renaming_pad: None,
-            trim_peaks: None,
+            trim_clip: None,
             clip_cache: HashMap::new(),
             clip_import: None,
-            clip_playback: None,
+            clip_loads: None,
             record_source: Source::Microphone,
             record_output: String::new(),
             recorder: None,
@@ -483,7 +484,7 @@ impl App {
     }
 
     fn stop_engine(&mut self, announce: bool) {
-        self.clip_playback = None;
+        self.cancel_pending_playback(None);
         self.waiting_for_device = false;
         self.reconnecting = false;
         if let Some(engine) = self.engine.take() {
@@ -502,14 +503,15 @@ impl App {
     /// Live route change: stop old engine, start new, hand the clip playheads over.
     fn restart_engine(&mut self) {
         let clips = self.engine.as_ref().map(Engine::take_clips).unwrap_or_default();
-        let pending = self.clip_playback.take();
+        let pending = self.clip_loads.take();
         self.stop_engine(false);
         self.status = ("Switching route…".into(), AMBER);
         self.start_engine();
         if let Some(engine) = &self.engine {
             engine.resume_clips(clips);
-            self.clip_playback = pending;
         }
+        self.clip_loads = pending;
+        if self.engine.is_none() { self.cancel_pending_playback(None); }
         self.sync_clip_progress();
     }
 
@@ -1079,7 +1081,8 @@ impl App {
         }
         self.handle_close(ctx);
         self.poll_engine();
-        self.poll_clip_playback(ctx);
+        if self.hidden || self.page != Page::Soundboard { self.close_trim_editor(); }
+        self.poll_clip_loads(ctx);
         self.poll_recording();
         self.poll_dictation();
         self.poll_mic_test();
@@ -1120,6 +1123,7 @@ impl eframe::App for App {
         self.clip_import.take();
         self.recorder.take();
         self.dictating.take();
+        self.close_trim_editor();
         self.stop_engine(false);
         // Quit gets one final restoration attempt even if Stop just failed.
         self.default_mic_sync = DefaultMicSync::default();
@@ -1181,6 +1185,7 @@ impl eframe::App for App {
                     Page::Settings => self.draw_settings_tab(ui),
                 });
         });
+        if self.page != Page::Soundboard { self.close_trim_editor(); }
         self.draw_quit_confirmation(&ctx);
     }
 }
