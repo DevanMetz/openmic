@@ -14,8 +14,9 @@ mod updates;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::{self, CentralPanel, Color32, RichText, ScrollArea, Slider, ViewportCommand};
 
@@ -133,6 +134,12 @@ enum Binding {
     Pad(PathBuf),
 }
 
+struct CachedClip {
+    samples: Arc<Vec<f32>>,
+    bytes: u64,
+    modified: Option<SystemTime>,
+}
+
 pub struct App {
     settings: Settings,
     inputs: Vec<String>,
@@ -154,7 +161,7 @@ pub struct App {
     /// Waveform peaks of the pad being trimmed.
     trim_peaks: Option<(PathBuf, Vec<f32>)>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
-    clip_cache: HashMap<PathBuf, Arc<Vec<f32>>>,
+    clip_cache: HashMap<PathBuf, CachedClip>,
     record_source: Source,
     record_output: String,
     recorder: Option<Recorder>,
@@ -1001,17 +1008,35 @@ impl App {
 
     /// Decoded samples for a clip, from the cache when possible.
     fn clip_samples(&mut self, path: &Path) -> anyhow::Result<Arc<Vec<f32>>> {
-        if let Some(samples) = self.clip_cache.get(path) {
-            return Ok(Arc::clone(samples));
+        let metadata = std::fs::metadata(path);
+        if let (Some(cached), Ok(metadata)) = (self.clip_cache.get(path), &metadata)
+            && cached.bytes == metadata.len()
+            && cached.modified == metadata.modified().ok()
+        {
+            return Ok(Arc::clone(&cached.samples));
         }
+        self.forget_clip(path);
+        let metadata = metadata.with_context(|| format!("read {}", path.display()))?;
         let samples = Arc::new(crate::decode::load_clip(path)?);
         // Keep the cache to about ten minutes of audio (~110 MB).
-        let cached: usize = self.clip_cache.values().map(|s| s.len()).sum();
+        let cached: usize = self.clip_cache.values().map(|clip| clip.samples.len()).sum();
         if cached + samples.len() > dsp::SR as usize * 600 {
             self.clip_cache.clear();
         }
-        self.clip_cache.insert(path.to_owned(), Arc::clone(&samples));
+        self.clip_cache.insert(path.to_owned(), CachedClip {
+            samples: Arc::clone(&samples),
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
         Ok(samples)
+    }
+
+    fn forget_clip(&mut self, path: &Path) {
+        self.clip_cache.remove(path);
+        self.pad_durations.remove(path);
+        if self.trim_peaks.as_ref().is_some_and(|(cached_path, _)| cached_path == path) {
+            self.trim_peaks = None;
+        }
     }
 
     /// Card and strip clicks pause or resume an existing clip; hotkeys

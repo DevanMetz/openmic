@@ -150,7 +150,7 @@ impl App {
         }
         self.playing.retain(|&k| k != key);
         self.pad_progress.remove(&key);
-        self.clip_cache.remove(&removed.path);
+        self.forget_clip(&removed.path);
         if self.capturing == Some(Binding::Pad(removed.path.clone())) {
             self.capturing = None;
         }
@@ -450,11 +450,13 @@ impl App {
         }
     }
 
-    /// A clip's full length in seconds: from its header, or from the
-    /// decoded samples when the header doesn't say.
+    /// A clip's full length in seconds, using decoded audio when available
+    /// because container headers can be approximate.
     fn pad_length(&mut self, path: &Path) -> Option<f32> {
-        let from_header = *self.pad_durations.entry(path.to_owned()).or_insert_with(|| crate::decode::duration(path));
-        from_header.or_else(|| self.clip_cache.get(path).map(|s| s.len() as f32 / crate::dsp::SR as f32))
+        if let Some(clip) = self.clip_cache.get(path) {
+            return Some(clip.samples.len() as f32 / crate::dsp::SR as f32);
+        }
+        *self.pad_durations.entry(path.to_owned()).or_insert_with(|| crate::decode::duration(path))
     }
 
     fn toggle_star(&mut self, index: usize) {
@@ -1314,6 +1316,40 @@ mod tests {
         assert_eq!(app.settings.sounds, [pad]);
         assert!(app.dirty_since.is_none());
         assert_eq!(app.sound_status, ("Could not read: missing.wav".into(), RED));
+    }
+
+    #[test]
+    fn edited_clip_files_refresh_audio_duration_and_trim_waveform() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav(dir.path(), "editable.wav", 0.2);
+        let mut app = App::stopped(crate::config::Settings::default());
+        let original = app.clip_samples(&path).unwrap();
+        assert!(Arc::ptr_eq(&original, &app.clip_samples(&path).unwrap()), "unchanged files reuse decoded audio");
+        assert_eq!(app.pad_length(&path), Some(0.2));
+        app.trim_peaks = Some((path.clone(), vec![0.5]));
+
+        wav(dir.path(), "editable.wav", 1.0);
+        let longer = app.clip_samples(&path).unwrap();
+        assert_eq!(longer.len(), 48_000);
+        assert_eq!(original.len(), 9_600, "audio already handed to a playing clip stays intact");
+        assert_eq!(app.pad_length(&path), Some(1.0));
+        assert!(app.trim_peaks.is_none(), "regenerate the old waveform");
+
+        // An edit can keep the length while changing all its samples.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut silent = std::fs::read(&path).unwrap();
+        silent[44..].fill(0);
+        std::fs::write(&path, silent).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(
+            std::fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(2)),
+        ).unwrap();
+        let edited = app.clip_samples(&path).unwrap();
+        assert!(edited.iter().all(|&sample| sample == 0.0));
+        assert!(!Arc::ptr_eq(&longer, &edited));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(app.clip_samples(&path).is_err(), "a removed source must not play stale audio");
+        assert_eq!(app.pad_length(&path), None);
     }
 
     #[test]
