@@ -255,6 +255,14 @@ fn snapshot_pages() {
         }
         let path = snapshot(&mut app, &format!("page-{}", page.title().to_lowercase()), egui::vec2(700.0, 720.0), 1.25, true);
         println!("SNAPSHOT {}", path.display());
+        if page == super::Page::Record {
+            let recorder = crate::record::Recorder::from_samples_for_test(&vec![0.25; 96_000]);
+            recorder.report_error_for_test("Microphone disconnected");
+            app.recorder = Some(recorder);
+            app.poll_recording();
+            let path = snapshot(&mut app, "record-partial-take", egui::vec2(700.0, 420.0), 1.25, true);
+            println!("SNAPSHOT {}", path.display());
+        }
         if page == super::Page::Soundboard {
             app.begin_pad_rename(&app.settings.sounds[0].clone());
             let path = snapshot(&mut app, "soundboard-rename", egui::vec2(700.0, 720.0), 1.25, true);

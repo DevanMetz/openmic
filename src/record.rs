@@ -124,6 +124,11 @@ impl Recorder {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn report_error_for_test(&self, message: &str) {
+        *self.error.lock() = Some(message.into());
+    }
+
     /// An empty `device_name` means the Windows default device for that source.
     pub fn start(source: Source, device_name: &str) -> Result<Self> {
         #[cfg(not(windows))]
@@ -274,8 +279,10 @@ impl Recorder {
         self.full.load(Ordering::Relaxed)
     }
 
-    pub fn take_error(&self) -> Option<String> {
-        self.error.lock().take()
+    /// A capture failure. Keep it until finish so a recovered take carries
+    /// its warning even after the UI has noticed and stopped the recording.
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().clone()
     }
 
     /// Whether audio was dropped because the disk fell behind (reported once).
@@ -797,10 +804,20 @@ mod tests {
             skipped: Arc::new(AtomicBool::new(false)),
             error,
         };
-        assert!(recorder.take_error().is_none());
+        assert!(recorder.error().is_none());
         let take = recorder.finish().unwrap().unwrap();
         assert_eq!(take.warning(), Some("disk full"));
         assert_eq!(take.samples().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn reporting_a_capture_error_does_not_erase_the_recovered_takes_warning() {
+        let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+        recorder.report_error_for_test("microphone disconnected");
+        assert_eq!(recorder.error().as_deref(), Some("microphone disconnected"));
+        let take = recorder.finish().unwrap().unwrap();
+        assert_eq!(take.warning(), Some("microphone disconnected"));
+        assert_eq!(take.samples().unwrap().len(), 240);
     }
 
     #[test]

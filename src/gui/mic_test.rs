@@ -145,7 +145,7 @@ impl App {
     pub(super) fn poll_mic_test(&mut self) {
         let test = &mut self.mic_test;
         if let Some((recorder, started)) = &test.recording {
-            if let Some(e) = recorder.take_error() {
+            if let Some(e) = recorder.error() {
                 test.recording = None;
                 test.status = Some((short(&e), RED));
             } else if started.elapsed() >= TEST_LENGTH {

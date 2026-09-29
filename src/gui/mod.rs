@@ -1025,7 +1025,7 @@ impl App {
     }
 
     fn poll_dictation(&mut self) {
-        if let Some(e) = self.dictating.as_ref().and_then(Recorder::take_error) {
+        if let Some(e) = self.dictating.as_ref().and_then(Recorder::error) {
             self.dictating = None;
             self.dictation_status = (short(&e), RED);
         }
@@ -1438,6 +1438,30 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_capture_error_distinguishes_recovered_audio_from_an_empty_recording() {
+        for count in [0, 480] {
+            let mut app = App::stopped(Settings::default());
+            let recorder = Recorder::from_samples_for_test(&vec![0.25; count]);
+            recorder.report_error_for_test("microphone disconnected");
+            app.recorder = Some(recorder);
+            app.poll_recording();
+            assert!(app.recorder.is_none());
+            assert!(app.record_status.0.contains("microphone disconnected"));
+            if count == 0 {
+                assert!(app.take.is_none());
+                assert_eq!(app.record_status.1, RED);
+            } else {
+                let take = app.take.as_ref().unwrap();
+                assert_eq!(take.warning(), Some("microphone disconnected"));
+                assert_eq!(take.samples().unwrap().len(), count / 2);
+                assert!(app.record_status.0.starts_with("Partial take ready"));
+                assert_eq!(app.record_status.1, AMBER);
+                assert!(app.update_blocker().is_some(), "the recovered audio still needs to be saved");
+            }
+        }
     }
 
     #[test]

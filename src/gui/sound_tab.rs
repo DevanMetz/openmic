@@ -281,11 +281,13 @@ impl App {
     }
 
     pub(super) fn poll_recording(&mut self) {
-        let error = self.recorder.as_ref().and_then(Recorder::take_error);
+        let error = self.recorder.as_ref().and_then(Recorder::error);
         if let Some(error) = error {
             crate::logfile::error(format_args!("recording stopped: {error}"));
             self.stop_recording();
-            self.record_status = (short(&format!("Recording stopped: {error}")), RED);
+            if self.take.is_none() {
+                self.record_status = (short(&format!("Recording stopped: {error}")), RED);
+            }
         } else if self.recorder.as_ref().is_some_and(Recorder::is_full) {
             self.stop_recording();
             self.record_status = ("Reached the 4 GB WAV size limit; your take is ready".into(), AMBER);
