@@ -7,7 +7,7 @@
 //! SoundSwitch do. COM work runs on a short-lived MTA thread so it never
 //! touches the GUI thread's apartment.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// The default recording endpoints before OpenMic changed them, persisted so
@@ -73,12 +73,15 @@ fn restore_roles(
 }
 
 fn on_com_thread<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    std::thread::spawn(move || {
-        imp::com_init()?;
-        f()
-    })
-    .join()
-    .map_err(|_| anyhow!("default microphone thread panicked"))?
+    std::thread::Builder::new()
+        .name("openmic-default-mic".into())
+        .spawn(move || {
+            imp::com_init()?;
+            f()
+        })
+        .context("start default microphone helper")?
+        .join()
+        .map_err(|_| anyhow!("default microphone thread panicked"))?
 }
 
 #[cfg(windows)]
