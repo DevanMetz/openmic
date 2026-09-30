@@ -10,9 +10,9 @@ pub fn cable_input(outputs: &[String]) -> Option<&String> {
 }
 
 /// Keep valid device choices and fill missing ones: the processed output
-/// prefers VB-Cable and the monitor avoids it. When VB-Cable has just been
-/// installed or the app launches (`prefer_cable`), switch the processed
-/// output over to it.
+/// prefers VB-Cable. The monitor avoids both the cable and the processed
+/// output. When VB-Cable has just been installed or the app launches
+/// (`prefer_cable`), switch the processed output over to it.
 /// Without VB-Cable the processed output stays unset: defaulting to the
 /// first device would play the mic out of the speakers (feedback).
 /// Choices whose device is absent are only replaced if `replace_missing`.
@@ -41,7 +41,7 @@ pub fn choose_routes(
     if needs(&s.monitor_output, outputs) {
         s.monitor_output = outputs
             .iter()
-            .find(|n| Some(*n) != cable)
+            .find(|n| Some(*n) != cable && *n != &s.output)
             .cloned()
             .unwrap_or_default();
     }
@@ -92,6 +92,20 @@ mod tests {
         choose_routes(&mut s, &inputs, &only_cable, false, true);
         assert!(s.monitor_output.is_empty(), "Refresh must not replace missing headphones with the voice-call output");
         assert_eq!(s.output, cable);
+    }
+
+    #[test]
+    fn automatic_monitor_selection_also_avoids_a_custom_processed_output() {
+        let processed = "My virtual output";
+        let mut s = Settings { output: processed.into(), ..Settings::default() };
+        let inputs = names(&["USB mic"]);
+        choose_routes(&mut s, &inputs, &names(&[processed]), false, false);
+        assert!(s.monitor_output.is_empty());
+
+        let outputs = names(&[processed, "CABLE Input (VB-Audio Virtual Cable)", "Headphones"]);
+        choose_routes(&mut s, &inputs, &outputs, false, false);
+        assert_eq!(s.output, processed, "keep the explicitly selected voice-call route");
+        assert_eq!(s.monitor_output, "Headphones", "neither virtual voice-call route is a monitor default");
     }
 
     #[test]
