@@ -135,6 +135,12 @@ impl Recorder {
         self.skipped.store(true, Ordering::Relaxed);
     }
 
+    /// Exercise size-limit handling with a small synthetic WAV.
+    #[cfg(test)]
+    pub(crate) fn report_full_for_test(&self) {
+        self.full.store(true, Ordering::Relaxed);
+    }
+
     /// An empty `device_name` means the Windows default device for that source.
     pub fn start(source: Source, device_name: &str) -> Result<Self> {
         #[cfg(not(windows))]

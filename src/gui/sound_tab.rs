@@ -301,7 +301,9 @@ impl App {
             }
         } else if self.recorder.as_ref().is_some_and(Recorder::is_full) {
             self.stop_recording();
-            self.record_status = ("Reached the 4 GB WAV size limit; your take is ready".into(), AMBER);
+            if self.take.as_ref().is_some_and(|take| take.warning().is_none()) {
+                self.record_status = ("Reached the 4 GB WAV size limit; your take is ready".into(), AMBER);
+            }
         } else if self.recorder.as_mut().is_some_and(Recorder::take_skipped) {
             self.record_status = ("The disk fell behind, so a moment of audio was skipped".into(), AMBER);
         }
@@ -1278,6 +1280,34 @@ mod tests {
         assert!(app.record_status.0.contains("audio was skipped"));
         assert_eq!(app.record_status.1, AMBER);
         assert_eq!(app.take.as_ref().unwrap().samples().unwrap().len(), 240);
+    }
+
+    #[test]
+    fn reaching_the_wav_limit_preserves_partial_and_empty_take_results() {
+        for (count, skipped) in [(480, false), (480, true), (0, false)] {
+            let mut app = App::stopped(Default::default());
+            let recorder = Recorder::from_samples_for_test(&vec![0.25; count]);
+            recorder.report_full_for_test();
+            if skipped {
+                recorder.report_skipped_for_test();
+            }
+            app.recorder = Some(recorder);
+            app.poll_recording();
+            assert!(app.recorder.is_none(), "the size limit must stop recording");
+            if count == 0 {
+                assert!(app.take.is_none());
+                assert!(app.record_status.0.contains("No audio was captured"));
+            } else {
+                assert_eq!(app.take.as_ref().unwrap().samples().unwrap().len(), count / 2);
+                if skipped {
+                    assert!(app.record_status.0.starts_with("Partial take ready"));
+                    assert!(app.record_status.0.contains("audio was skipped"));
+                } else {
+                    assert!(app.record_status.0.contains("4 GB WAV size limit; your take is ready"));
+                }
+            }
+            assert_eq!(app.record_status.1, AMBER);
+        }
     }
 
     #[test]
