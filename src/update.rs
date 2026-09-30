@@ -12,7 +12,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{Receiver, Sender};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -334,7 +333,7 @@ pub struct Updater {
     /// Check once a day on its own (off in development builds and tests).
     automatic: bool,
     last_check: Option<Instant>,
-    events: (Sender<Event>, Receiver<Event>),
+    worker: Option<thread::JoinHandle<Event>>,
     wake: Arc<dyn Fn() + Send + Sync>,
     done: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
@@ -347,7 +346,7 @@ impl Updater {
             status: Status::Idle,
             automatic,
             last_check: None,
-            events: crossbeam_channel::unbounded(),
+            worker: None,
             wake: Arc::new(wake),
             done: Arc::default(),
             cancel: Arc::default(),
@@ -368,7 +367,14 @@ impl Updater {
 
     /// Collect finished work, and start the daily check when `enabled`.
     pub fn tick(&mut self, enabled: bool) {
-        while let Ok(event) = self.events.1.try_recv() {
+        if self.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            let event = self.worker.take().unwrap().join().unwrap_or_else(|_| {
+                let error = anyhow::anyhow!("Update task stopped unexpectedly; try again");
+                match &self.status {
+                    Status::Downloading(release) => Event::Downloaded(release.clone(), Err(error)),
+                    _ => Event::Checked(Err(error)),
+                }
+            });
             match &event {
                 Event::Checked(Ok(Some(release))) => logfile::info(format_args!("update available: {}", release.tag)),
                 Event::Checked(Err(e)) => logfile::warn(format_args!("update check failed: {e:#}")),
@@ -445,15 +451,22 @@ impl Updater {
         Ok(())
     }
 
-    fn spawn(&self, name: &str, work: impl FnOnce(&AtomicU64, &AtomicBool) -> Event + Send + 'static) {
-        let (events, wake) = (self.events.0.clone(), Arc::clone(&self.wake));
+    fn spawn(&mut self, name: &str, work: impl FnOnce(&AtomicU64, &AtomicBool) -> Event + Send + 'static) {
+        let wake = Arc::clone(&self.wake);
         let (done, cancel) = (Arc::clone(&self.done), Arc::clone(&self.cancel));
         let spawned = thread::Builder::new().name(name.into()).spawn(move || {
-            let _ = events.send(work(&done, &cancel));
+            let event = work(&done, &cancel);
             wake();
+            event
         });
-        if let Err(e) = spawned {
-            self.events.0.send(Event::Checked(Err(e.into()))).ok();
+        match spawned {
+            Ok(worker) => self.worker = Some(worker),
+            Err(error) => {
+                let message = format!("Could not start update task: {error}");
+                logfile::warn(&message);
+                self.status = Status::Failed(message);
+                (self.wake)();
+            }
         }
     }
 }
@@ -732,6 +745,93 @@ mod tests {
         fs::write(&paths.exe, "old").unwrap();
         assert!(replace(&paths).is_err());
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "old");
+    }
+
+    fn wait_for_worker(updater: &Updater) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !updater.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "update worker did not exit");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn crashed_update_check_reports_failure_and_accepts_another_check() {
+        let mut updater = Updater::new(true, || {});
+        updater.last_check = Some(Instant::now());
+        updater.status = Status::Checking;
+        updater.spawn("test-update-crash", |_, _| panic!("simulated check failure"));
+        wait_for_worker(&updater);
+        updater.tick(true);
+        assert!(matches!(updater.status(), Status::Failed(error) if error.contains("try again")));
+        assert!(updater.worker.is_none(), "a crash must not immediately retry the daily check");
+
+        updater.status = Status::Checking;
+        updater.spawn("test-update-retry", |_, _| Event::Checked(Ok(None)));
+        wait_for_worker(&updater);
+        updater.tick(true);
+        assert_eq!(updater.status(), &Status::UpToDate);
+        assert!(updater.worker.is_none());
+    }
+
+    #[test]
+    fn crashed_update_download_clears_progress_and_respects_cancellation() {
+        for cancelled in [false, true] {
+            let mut updater = Updater::new(false, || {});
+            let release = Release::sample("v9.0.0");
+            updater.status = Status::Downloading(release.clone());
+            updater.spawn("test-download-crash", |done, _| {
+                done.store(123, Ordering::Relaxed);
+                panic!("simulated download failure");
+            });
+            wait_for_worker(&updater);
+            assert_eq!(updater.progress(), Some((123, release.size)));
+            if cancelled { updater.cancel_download(); }
+            updater.tick(false);
+            assert!(updater.progress().is_none());
+            assert!(updater.worker.is_none());
+            if cancelled {
+                assert_eq!(updater.status(), &Status::Available(release));
+            } else {
+                assert!(matches!(updater.status(), Status::Failed(error) if error.contains("try again")));
+            }
+        }
+    }
+
+    #[test]
+    fn pending_update_download_stays_responsive_and_cancellable() {
+        let mut updater = Updater::new(false, || {});
+        let release = Release::sample("v9.0.0");
+        updater.status = Status::Downloading(release.clone());
+        let (release_worker, wait) = crossbeam_channel::bounded::<()>(0);
+        let downloaded = release.clone();
+        updater.spawn("test-download-cancel", move |_, cancel| {
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+            assert!(cancel.load(Ordering::Relaxed));
+            Event::Downloaded(downloaded, Err(anyhow::anyhow!("download cancelled")))
+        });
+        updater.tick(false);
+        assert_eq!(updater.status(), &Status::Downloading(release.clone()));
+        updater.cancel_download();
+        release_worker.send(()).unwrap();
+        wait_for_worker(&updater);
+        updater.tick(false);
+        assert_eq!(updater.status(), &Status::Available(release));
+        assert!(updater.worker.is_none());
+    }
+
+    #[test]
+    fn completed_update_download_preserves_the_verified_release() {
+        let mut updater = Updater::new(false, || {});
+        let release = Release::sample("v9.0.0");
+        updater.status = Status::Downloading(release.clone());
+        let downloaded = release.clone();
+        updater.spawn("test-download-done", move |_, _| Event::Downloaded(downloaded, Ok(())));
+        wait_for_worker(&updater);
+        updater.tick(false);
+        assert_eq!(updater.status(), &Status::Ready(release));
+        assert!(updater.progress().is_none());
+        assert!(updater.worker.is_none());
     }
 
     #[test]
