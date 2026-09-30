@@ -323,8 +323,11 @@ pub enum Status {
     UpToDate,
     Available(Release),
     Downloading(Release),
+    /// Keep the release and its error available for an explicit retry.
+    DownloadFailed { release: Release, error: String },
     /// Downloaded and verified; restarting installs it.
     Ready(Release),
+    /// The release check failed before a download was offered.
     Failed(String),
 }
 
@@ -398,7 +401,7 @@ impl Updater {
                 Event::Downloaded(release, Err(_)) if self.cancel.load(Ordering::Relaxed) => {
                     Status::Available(release)
                 }
-                Event::Downloaded(_, Err(e)) => Status::Failed(format!("{e:#}")),
+                Event::Downloaded(release, Err(e)) => Status::DownloadFailed { release, error: format!("{e:#}") },
             };
         }
         let idle = matches!(self.status, Status::Idle | Status::UpToDate | Status::Failed(_));
@@ -416,14 +419,14 @@ impl Updater {
         self.spawn("openmic-update-check", |_, _| Event::Checked(check(&agent(), &feed())));
     }
 
-    /// Download and verify the available release.
+    /// Download and verify the available release, or retry a failed download.
     pub fn download(&mut self) {
-        let Status::Available(release) = &self.status else { return };
+        let (Status::Available(release) | Status::DownloadFailed { release, .. }) = &self.status else { return };
         let release = release.clone();
         let paths = match Paths::current() {
             Ok(paths) => paths,
             Err(e) => {
-                self.status = Status::Failed(format!("{e:#}"));
+                self.status = Status::DownloadFailed { release, error: format!("{e:#}") };
                 return;
             }
         };
@@ -470,7 +473,10 @@ impl Updater {
             Err(error) => {
                 let message = format!("Could not start update task: {error}");
                 logfile::warn(&message);
-                self.status = Status::Failed(message);
+                self.status = match &self.status {
+                    Status::Downloading(release) => Status::DownloadFailed { release: release.clone(), error: message },
+                    _ => Status::Failed(message),
+                };
                 (self.wake)();
             }
         }
@@ -866,9 +872,30 @@ mod tests {
             if cancelled {
                 assert_eq!(updater.status(), &Status::Available(release));
             } else {
-                assert!(matches!(updater.status(), Status::Failed(error) if error.contains("try again")));
+                assert!(matches!(updater.status(), Status::DownloadFailed { release: retained, error }
+                    if retained == &release && error.contains("try again")));
             }
         }
+    }
+
+    #[test]
+    fn failed_update_download_can_retry_without_losing_the_release_or_error() {
+        let mut updater = Updater::new(true, || {});
+        // A malformed URI fails before networking or any executable writes.
+        let release = Release { sha_url: "http://[invalid".into(), ..Release::sample("v9.0.0") };
+        updater.status = Status::DownloadFailed { release: release.clone(), error: "earlier failure".into() };
+        updater.done.store(123, Ordering::Relaxed);
+        updater.cancel.store(true, Ordering::Relaxed);
+        updater.download();
+        assert_eq!(updater.status(), &Status::Downloading(release.clone()));
+        assert_eq!(updater.progress(), Some((0, release.size)));
+        assert!(!updater.cancel.load(Ordering::Relaxed), "retry clears the previous cancellation");
+        wait_for_worker(&updater);
+        updater.tick(true);
+        assert!(matches!(updater.status(), Status::DownloadFailed { release: retained, error }
+            if retained == &release && error.contains("checksum")));
+        assert!(updater.worker.is_none(), "an automatic check must not replace a failed download");
+        assert!(updater.progress().is_none());
     }
 
     #[test]

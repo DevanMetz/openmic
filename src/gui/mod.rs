@@ -1935,14 +1935,54 @@ mod tests {
     }
 
     #[test]
+    fn failed_update_download_keeps_a_visible_retry_after_the_check_timer_expires() {
+        use crate::update::{Release, Status};
+        for checked_at in [None, Some(Instant::now() - Duration::from_secs(60))] {
+            let mut app = App::stopped(Settings::default());
+            app.page = Page::Soundboard;
+            app.update_checked_at = checked_at;
+            app.updater.set_status_for_test(Status::DownloadFailed {
+                release: Release::sample("v9.0.0"), error: "Connection interrupted".into(),
+            });
+            let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+            let error = visible(&texts, "Update download failed").expect("the failure must stay visible");
+            let retry = visible(&texts, "Retry update").expect("the failed release can be retried directly");
+            let title = &texts.iter().find(|(text, rect)| text == "Soundboard" && rect.left() >= SIDEBAR_WIDTH).unwrap().1;
+            assert!(error.top() < 60.0 && retry.top() < 60.0);
+            assert!(title.right() < error.left() && error.right() < retry.left(), "header controls overlap");
+            assert!(visible(&texts, "Couldn't check for updates").is_none());
+            assert!(visible(&texts, "Clean voice").is_none());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn snapshot_failed_update_download() {
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            let mut app = App::stopped(Settings::default());
+            app.page = Page::Soundboard;
+            app.updater.set_status_for_test(crate::update::Status::DownloadFailed {
+                release: crate::update::Release::sample("v9.0.0"), error: "Connection interrupted".into(),
+            });
+            snapshot::snapshot(&mut app, &format!("update-download-failed-{theme}"), egui::vec2(700.0, 420.0), 1.0, dark);
+        }
+    }
+
+    #[test]
     fn release_notes_open_inside_the_app() {
-        let mut app = App::stopped(Settings::default());
-        app.updater.set_status_for_test(crate::update::Status::Available(crate::update::Release::sample("v9.0.0")));
-        app.show_release_notes = true;
-        let (texts, _) = render(&mut app, egui::vec2(760.0, 880.0));
-        assert!(visible(&texts, "What's new in v9.0.0").is_some());
-        assert!(visible(&texts, "Fixes").is_some());
-        assert!(visible(&texts, "Faster updates, see the docs").is_some(), "inline Markdown is plain text");
+        use crate::update::{Release, Status};
+        for status in [
+            Status::Available(Release::sample("v9.0.0")),
+            Status::DownloadFailed { release: Release::sample("v9.0.0"), error: "Connection interrupted".into() },
+        ] {
+            let mut app = App::stopped(Settings::default());
+            app.updater.set_status_for_test(status);
+            app.show_release_notes = true;
+            let (texts, _) = render(&mut app, egui::vec2(760.0, 880.0));
+            assert!(visible(&texts, "What's new in v9.0.0").is_some());
+            assert!(visible(&texts, "Fixes").is_some());
+            assert!(visible(&texts, "Faster updates, see the docs").is_some(), "inline Markdown is plain text");
+        }
     }
 
     #[test]

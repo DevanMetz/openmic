@@ -80,6 +80,15 @@ impl App {
                 }
                 ui.label(RichText::new(format!("{} available", release.tag)).color(GREEN));
             }
+            Status::DownloadFailed { release, error } => {
+                if ui.button("Retry update")
+                    .on_hover_text(format!("Download and verify {} again", release.tag))
+                    .clicked()
+                {
+                    self.updater.download();
+                }
+                ui.label(RichText::new("Update download failed").color(AMBER)).on_hover_text(error);
+            }
             Status::Checking => {
                 ui.weak("Checking for updates…");
                 ui.spinner();
@@ -105,7 +114,8 @@ impl App {
     /// The available release's notes, in a window over the app.
     pub(super) fn draw_release_notes(&mut self, ctx: &egui::Context) {
         let release = match self.updater.status() {
-            Status::Available(release) | Status::Downloading(release) | Status::Ready(release) => release.clone(),
+            Status::Available(release) | Status::Downloading(release) | Status::DownloadFailed { release, .. }
+                | Status::Ready(release) => release.clone(),
             _ => return,
         };
         if !self.show_release_notes {
