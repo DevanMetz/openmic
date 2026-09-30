@@ -90,6 +90,16 @@ impl Hotkeys {
         self.bindings = bindings;
         refused
     }
+
+    /// Whether the last registration attempted this exact binding but
+    /// could not activate it. An edit not yet passed to `set` is pending.
+    pub fn was_refused(&self, shortcut: &str, command: &Command) -> bool {
+        self.bindings.iter().any(|(text, action)| text == shortcut && action == command)
+            && match shortcut.parse::<HotKey>() {
+                Ok(key) => self.actions.lock().bindings.get(&key.id()) != Some(command),
+                Err(_) => true,
+            }
+    }
 }
 
 /// The shortcut for `key` pressed with `mods`, as "Ctrl+Shift+M".

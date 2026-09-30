@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::{App, Binding, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
+use super::{App, Binding, Command, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
 use crate::dictation::SpeechModel;
 use crate::widgets;
 
@@ -172,6 +172,13 @@ impl App {
             && !self.hotkey_status.0.is_empty()
         {
             ui.label(RichText::new(&self.hotkey_status.0).color(self.hotkey_status.1));
+        }
+        if self.capturing.is_none()
+            && let Some(shortcut) = &self.settings.hotkeys.dictate
+            && let Some(hotkeys) = &self.hotkeys
+            && hotkeys.was_refused(shortcut, &Command::Dictate)
+        {
+            ui.colored_label(AMBER, "This shortcut is unavailable. Choose another combination.");
         }
         ui.add_space(8.0);
         self.draw_speech_card(ui);
