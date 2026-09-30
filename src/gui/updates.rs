@@ -59,7 +59,8 @@ impl App {
                     .on_hover_text("Downloaded and checked against the release's SHA-256 checksum");
             }
             Status::Downloading(release) => {
-                if ui.small_button("Cancel").clicked() {
+                let cancelling = self.updater.download_cancelling();
+                if ui.add_enabled(!cancelling, egui::Button::new(if cancelling { "Cancelling…" } else { "Cancel" }).small()).clicked() {
                     self.updater.cancel_download();
                 }
                 let (done, total) = self.updater.progress().unwrap_or_default();

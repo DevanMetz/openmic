@@ -452,6 +452,10 @@ impl Updater {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
+    pub fn download_cancelling(&self) -> bool {
+        matches!(self.status, Status::Downloading(_)) && self.cancel.load(Ordering::Relaxed)
+    }
+
     /// Put the downloaded version in place and start it. The caller then
     /// quits; the new copy waits for that before it opens any devices.
     pub fn install(&mut self) -> Result<()> {
@@ -939,11 +943,14 @@ mod tests {
         });
         updater.tick(false);
         assert_eq!(updater.status(), &Status::Downloading(release.clone()));
+        assert!(!updater.download_cancelling());
         updater.cancel_download();
+        assert!(updater.download_cancelling(), "show cancellation while the worker is still stopping");
         release_worker.send(()).unwrap();
         wait_for_worker(&updater);
         updater.tick(false);
         assert_eq!(updater.status(), &Status::Available(release));
+        assert!(!updater.download_cancelling());
         assert!(updater.worker.is_none());
     }
 
@@ -955,8 +962,10 @@ mod tests {
         let downloaded = release.clone();
         updater.spawn("test-download-done", move |_, _| Event::Downloaded(downloaded, Ok(())));
         wait_for_worker(&updater);
+        updater.cancel_download(); // a completed verified download is still ready
         updater.tick(false);
         assert_eq!(updater.status(), &Status::Ready(release));
+        assert!(!updater.download_cancelling());
         assert!(updater.progress().is_none());
         assert!(updater.worker.is_none());
     }
