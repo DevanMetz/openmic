@@ -144,6 +144,10 @@ impl App {
         if let Some(result) = result {
             import.job = None;
             let path = import.files.pop_front().expect("an import job has a path");
+            let result = result.and_then(|clip| {
+                clip.validate_source(&path)?;
+                Ok(clip)
+            });
             match result {
                 Ok(clip) => {
                     self.cache_clip(path.clone(), clip);
@@ -1629,6 +1633,39 @@ mod tests {
         assert_eq!(app.settings.sounds, [pad]);
         assert!(app.dirty_since.is_none());
         assert_eq!(app.sound_status, ("Could not read: missing.wav".into(), RED));
+    }
+
+    #[test]
+    fn changed_or_removed_files_are_not_added_from_stale_import_results() {
+        for removed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = wav(dir.path(), "edited.wav", 0.1);
+            let stale = CachedClip::read(&path, &AtomicBool::new(false)).unwrap();
+            let mut app = App::stopped(Default::default());
+            let (done, job) = crossbeam_channel::bounded(1);
+            app.clip_import = Some(ClipImport {
+                files: [path.clone()].into(), job: Some(job), total: 1,
+                added: 0, invalid: Vec::new(), cancel: Arc::default(),
+            });
+            if removed {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"changed while importing").unwrap();
+            }
+            assert!(done.send(Ok(stale)).is_ok());
+            let ctx = egui::Context::default();
+            app.poll_clip_import(&ctx);
+            assert!(app.settings.sounds.is_empty() && app.dirty_since.is_none());
+            assert!(app.clip_import.is_none() && !app.clip_cache.contains_key(&path));
+            assert_eq!(app.sound_status, ("Could not read: edited.wav".into(), RED));
+
+            wav(dir.path(), "edited.wav", 0.6);
+            app.import_sounds(vec![path.clone()], &ctx);
+            finish_import(&mut app, &ctx);
+            assert_eq!(app.settings.sounds, [Pad::new(path.clone())]);
+            assert_eq!(app.cached_clip(&path).unwrap().samples.len(), 28_800, "retry imports the replacement duration");
+            assert_eq!(app.sound_status, ("Added 1 clip".into(), GREEN));
+        }
     }
 
     #[test]

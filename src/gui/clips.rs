@@ -60,6 +60,16 @@ impl CachedClip {
         }
         Ok(Self { samples: Arc::new(samples), peaks: Arc::new(peaks), bytes: metadata.len(), modified: metadata.modified().ok() })
     }
+
+    /// A queued decode must still describe the file when the UI accepts it.
+    pub(super) fn validate_source(&self, path: &Path) -> anyhow::Result<()> {
+        let metadata = std::fs::metadata(path).with_context(|| format!("read {}", path.display()))?;
+        anyhow::ensure!(
+            self.bytes == metadata.len() && self.modified == metadata.modified().ok(),
+            "Clip changed while loading; try again",
+        );
+        Ok(())
+    }
 }
 
 impl App {
@@ -76,10 +86,7 @@ impl App {
 
     pub(super) fn cached_clip(&mut self, path: &Path) -> Option<&CachedClip> {
         let cached = self.clip_cache.get(path)?;
-        let valid = std::fs::metadata(path).is_ok_and(|metadata| {
-            cached.bytes == metadata.len() && cached.modified == metadata.modified().ok()
-        });
-        if !valid { self.forget_clip(path); }
+        if cached.validate_source(path).is_err() { self.forget_clip(path); }
         self.clip_cache.get(path)
     }
 
@@ -239,6 +246,10 @@ impl App {
         if let Some(result) = result {
             pending.job = None;
             let request = pending.requests.pop_front().expect("a decoder has a clip request");
+            let result = result.and_then(|clip| {
+                clip.validate_source(&request.path)?;
+                Ok(clip)
+            });
             match result {
                 Ok(clip) => {
                     let samples = Arc::clone(&clip.samples);
@@ -650,6 +661,40 @@ mod tests {
         app.play_clip(0, &ctx);
         finish(&mut app, &ctx);
         assert_eq!(app.playing, [clip_key(&path)]);
+    }
+
+    #[test]
+    fn changed_or_removed_files_cannot_play_or_publish_a_stale_waveform() {
+        for removed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = wav(dir.path(), "edited.wav");
+            let mut app = app_with(std::slice::from_ref(&path));
+            app.trim_clip = Some(TrimClip { path: path.clone(), error: None });
+            let stale = CachedClip::read(&path, &AtomicBool::new(false)).unwrap();
+            let (done, _) = delayed(&mut app, std::slice::from_ref(&path));
+            let replacement = || {
+                crate::record::Recorder::from_samples_for_test(&[0.5; 240])
+                    .finish().unwrap().unwrap().save_wav(&path).unwrap();
+            };
+            if removed { std::fs::remove_file(&path).unwrap(); } else { replacement(); }
+            assert!(done.send(Ok(stale)).is_ok());
+            let ctx = egui::Context::default();
+            app.poll_clip_loads(&ctx);
+            assert!(app.clip_loads.is_none());
+            assert!(app.engine.as_ref().unwrap().take_clips().is_empty(), "do not play an earlier file version");
+            assert!(!app.clip_cache.contains_key(&path), "do not publish a stale waveform");
+            assert!(app.trim_clip.as_ref().unwrap().error.is_some());
+            assert_eq!(app.sound_status.1, RED);
+
+            if removed { replacement(); }
+            app.play_clip(0, &ctx);
+            finish(&mut app, &ctx);
+            let clips = app.engine.as_ref().unwrap().take_clips();
+            assert_eq!(clips.len(), 1);
+            assert_eq!(clips[0].samples().len(), 120, "retry reads the replacement file");
+            assert!(clips[0].samples().iter().all(|sample| (*sample - 0.5).abs() < 0.001));
+            assert!(app.trim_clip.as_ref().unwrap().error.is_none());
+        }
     }
 
     #[test]
