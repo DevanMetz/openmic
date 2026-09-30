@@ -764,7 +764,7 @@ fn type_text(text: &str) -> Result<()> {
         .any(|key| unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0)
     {
         if started.elapsed() > Duration::from_secs(3) {
-            bail!("Release Ctrl, Alt and Shift so the text can be typed");
+            bail!("Release Ctrl, Alt, Shift and Windows keys so the text can be typed");
         }
         thread::sleep(Duration::from_millis(20));
     }

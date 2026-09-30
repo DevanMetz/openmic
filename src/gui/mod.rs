@@ -1112,7 +1112,7 @@ impl App {
                 dictation::Event::Transcribed { text, typing_error } => {
                     self.last_dictation = text;
                     match typing_error {
-                        Some(error) => (short(&format!("Copy the transcript below: {error}")), AMBER),
+                        Some(error) => (format!("Copy the transcript below: {error}"), AMBER),
                         None => ("Typed".into(), GREEN),
                     }
                 }
