@@ -23,6 +23,14 @@ pub(super) enum Version {
     Cleaned,
 }
 
+struct Cleaning {
+    result: Receiver<ProcessedRecording>,
+    raw: Arc<Vec<f32>>,
+    params: Params,
+    then_play: bool,
+    report_status: bool,
+}
+
 #[derive(Default)]
 pub(super) struct MicTest {
     recording: Option<(Recorder, Instant)>,
@@ -31,7 +39,7 @@ pub(super) struct MicTest {
     /// The cleaned take, its settings, and the model state that produced it.
     cleaned: Option<(Arc<Vec<f32>>, Params, ModelState)>,
     /// Cleaning in the background, and whether to play it when done.
-    cleaning: Option<(Receiver<ProcessedRecording>, Params, bool)>,
+    cleaning: Option<Cleaning>,
     player: Option<(Player, Version)>,
     status: Option<Status>,
 }
@@ -78,9 +86,8 @@ impl App {
 
     pub(super) fn start_mic_test(&mut self) {
         self.stop_test();
-        // An older take must never start playing during the new recording,
-        // or replace its cleaned preview when the old worker finishes.
-        self.mic_test.cleaning = None;
+        // Keep track of the worker until it finishes so a new take cannot
+        // start a competing cleaner. Its source identifies stale results.
         match Recorder::start(Source::Microphone, &self.settings.microphone) {
             Ok(recorder) => {
                 self.mic_test.recording = Some((recorder, Instant::now()));
@@ -96,26 +103,30 @@ impl App {
         if then_play {
             self.mic_test.status = Some(("Applying your settings…".into(), CYAN));
         }
-        if let Some((_, _, play_when_ready)) = &mut self.mic_test.cleaning {
-            // Reuse work already in progress. play_test rechecks the settings
-            // when it completes, and cleans again if they have changed.
-            *play_when_ready |= then_play;
+        if let Some(cleaning) = &mut self.mic_test.cleaning {
+            // Finish existing work first. Completion rechecks the take and,
+            // when playing, the settings before using its result.
+            cleaning.then_play |= then_play;
+            cleaning.report_status = true;
             return;
         }
         let (done, job) = crossbeam_channel::bounded(1);
+        let samples = Arc::clone(&raw);
         let spawned = std::thread::Builder::new().name("openmic-mic-test".into()).spawn(move || {
-            let _ = done.send(Cleaner::process_recording(&raw, &params));
+            let _ = done.send(Cleaner::process_recording(&samples, &params));
         });
         match spawned {
-            Ok(_) => self.mic_test.cleaning = Some((job, params, then_play)),
+            Ok(_) => self.mic_test.cleaning = Some(Cleaning { result: job, raw, params, then_play, report_status: true }),
             Err(e) => self.mic_test.status = Some((short(&format!("{e:#}")), RED)),
         }
     }
 
     fn stop_test(&mut self) {
         self.mic_test.player = None;
-        if let Some((_, _, then_play)) = &mut self.mic_test.cleaning {
-            *then_play = false;
+        if let Some(cleaning) = &mut self.mic_test.cleaning {
+            cleaning.then_play = false;
+            // Completion must not replace a newer recording/playback status.
+            cleaning.report_status = false;
         }
     }
 
@@ -179,23 +190,38 @@ impl App {
             }
         }
         let test = &mut self.mic_test;
-        if let Some((job, params, then_play)) = &test.cleaning {
-            match job.try_recv() {
-                Ok((cleaned, model)) => {
-                    let (params, then_play) = (*params, *then_play);
-                    test.cleaned = Some((Arc::new(cleaned), params, model));
-                    test.cleaning = None;
-                    if then_play {
-                        self.play_test(Version::Cleaned);
-                    } else if test.used_fallback() {
-                        test.status = Some(("Cleaned uses RNNoise; DeepFilterNet unavailable".into(), AMBER));
+        let finished = test.cleaning.as_ref().and_then(|cleaning| match cleaning.result.try_recv() {
+            Err(TryRecvError::Empty) => None,
+            result => Some(result),
+        });
+        if let Some(result) = finished {
+            let cleaning = test.cleaning.take().expect("checked above");
+            if !test.raw.as_ref().is_some_and(|raw| Arc::ptr_eq(raw, &cleaning.raw)) {
+                // A newer take is waiting. Never cache or play the old result,
+                // and only start the next cleaner after this one has finished.
+                if !test.recording() {
+                    self.clean_test(cleaning.then_play);
+                    if let Some(next) = &mut self.mic_test.cleaning {
+                        next.report_status = cleaning.report_status;
                     }
                 }
-                Err(TryRecvError::Disconnected) => {
-                    test.cleaning = None;
-                    test.status = Some(("Could not clean the mic test; click Cleaned to try again".into(), RED));
+            } else {
+                match result {
+                    Ok((cleaned, model)) => {
+                        test.cleaned = Some((Arc::new(cleaned), cleaning.params, model));
+                        if !test.recording() {
+                            if cleaning.then_play {
+                                self.play_test(Version::Cleaned);
+                            } else if cleaning.report_status && test.used_fallback() {
+                                test.status = Some(("Cleaned uses RNNoise; DeepFilterNet unavailable".into(), AMBER));
+                            }
+                        }
+                    }
+                    Err(_) if cleaning.report_status && !test.recording() => {
+                        test.status = Some(("Could not clean the mic test; click Cleaned to try again".into(), RED));
+                    }
+                    Err(_) => {}
                 }
-                Err(TryRecvError::Empty) => {}
             }
         }
         let error = self.mic_test.player.as_ref().and_then(|(player, _)| player.take_error());
@@ -243,7 +269,7 @@ impl App {
             if self.mic_test.raw.is_some() && !self.mic_test.recording() {
                 for (version, label) in [(Version::Raw, "⏵ Raw"), (Version::Cleaned, "⏵ Cleaned")] {
                     let playing = self.mic_test.player.as_ref().is_some_and(|(_, v)| *v == version)
-                        || (version == Version::Cleaned && self.mic_test.cleaning.as_ref().is_some_and(|(_, _, then_play)| *then_play));
+                        || (version == Version::Cleaned && self.mic_test.cleaning.as_ref().is_some_and(|cleaning| cleaning.then_play));
                     if ui.selectable_label(playing, label)
                         .on_hover_text(if playing { "Stop preview" } else { "Play preview" })
                         .clicked()
@@ -273,6 +299,14 @@ impl App {
 mod tests {
     use super::*;
     use crate::config::Settings;
+
+    fn pending_cleanup(app: &mut App, then_play: bool) -> crossbeam_channel::Sender<ProcessedRecording> {
+        let params = app.test_params();
+        let raw = Arc::clone(app.mic_test.raw.get_or_insert_with(|| Arc::new(vec![0.1; 480])));
+        let (done, job) = crossbeam_channel::bounded(1);
+        app.mic_test.cleaning = Some(Cleaning { result: job, raw, params, then_play, report_status: true });
+        done
+    }
 
     #[test]
     fn the_test_never_plays_into_vb_cable_or_discords_output() {
@@ -359,8 +393,7 @@ mod tests {
         let mut app = App::stopped(Settings::default());
         let raw = Arc::new(vec![0.1; 480]);
         app.mic_test.raw = Some(Arc::clone(&raw));
-        let (done, job) = crossbeam_channel::bounded(1);
-        app.mic_test.cleaning = Some((job, app.test_params(), true));
+        let done = pending_cleanup(&mut app, true);
         drop(done); // a worker that exits without delivering its result
 
         app.poll_mic_test();
@@ -379,8 +412,7 @@ mod tests {
             let raw = Arc::new(vec![0.1; 480]);
             app.mic_test.raw = Some(Arc::clone(&raw));
             let params = app.test_params();
-            let (done, job) = crossbeam_channel::bounded(1);
-            app.mic_test.cleaning = Some((job, params, false));
+            let done = pending_cleanup(&mut app, false);
             done.send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
 
             app.poll_mic_test();
@@ -409,25 +441,111 @@ mod tests {
         let mut app = App::stopped(Settings::default());
         app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
         let params = app.test_params();
-        let (done, job) = crossbeam_channel::bounded(1);
-        app.mic_test.cleaning = Some((job, params, false));
+        let done = pending_cleanup(&mut app, false);
 
         app.clean_test(true);
         app.settings.strength = 0.5;
         app.clean_test(true);
 
         assert!(done.send((vec![0.2; 480], ModelState::DeepFilter)).is_ok(), "clicks reuse pending work instead of spawning competing cleaners");
-        let (_, running_params, then_play) = app.mic_test.cleaning.as_ref().unwrap();
-        assert_eq!(*running_params, params, "the result keeps the settings it was actually cleaned with");
-        assert!(*then_play, "request playback once the result is ready");
+        let cleaning = app.mic_test.cleaning.as_ref().unwrap();
+        assert_eq!(cleaning.params, params, "the result keeps the settings it was actually cleaned with");
+        assert!(cleaning.then_play, "request playback once the result is ready");
+    }
+
+    #[test]
+    fn an_old_cleaner_cannot_interrupt_a_new_recording() {
+        for recording_fails in [false, true] {
+            for failed in [false, true] {
+                let mut app = App::stopped(Settings::default());
+                let done = pending_cleanup(&mut app, true);
+                app.stop_test();
+                let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+                if recording_fails { recorder.report_error_for_test("Microphone disconnected"); }
+                app.mic_test.recording = Some((recorder, Instant::now()));
+                app.mic_test.status = Some(("Speak normally…".into(), AMBER));
+                app.poll_mic_test();
+                if failed {
+                    drop(done);
+                } else {
+                    done.send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
+                }
+
+                app.poll_mic_test();
+
+                assert_eq!(app.mic_test.recording(), !recording_fails);
+                assert!(app.mic_test.cleaning.is_none() && app.mic_test.player.is_none());
+                assert_eq!(app.mic_test.status, Some(if recording_fails {
+                    ("Microphone disconnected".into(), RED)
+                } else {
+                    ("Speak normally…".into(), AMBER)
+                }));
+                assert_eq!(app.mic_test.cleaned.is_none(), failed, "a useful old preview is kept if recording fails");
+                assert!(!app.settings.setup.tested, "old work must not start playback");
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_take_waits_for_the_previous_cleaner_and_discards_its_result() {
+        for failed in [false, true] {
+            let mut app = App::stopped(Settings { model: crate::dsp::Model::Rnnoise, ..Settings::default() });
+            let done = pending_cleanup(&mut app, true);
+            let old_raw = Arc::clone(app.mic_test.raw.as_ref().unwrap());
+            app.stop_test();
+            app.mic_test.recording = Some((Recorder::from_samples_for_test(&[0.25; 480]), Instant::now() - TEST_LENGTH));
+
+            app.poll_mic_test();
+
+            let raw = Arc::clone(app.mic_test.raw.as_ref().unwrap());
+            assert!(!Arc::ptr_eq(&raw, &old_raw), "the new take was recorded");
+            assert!(Arc::ptr_eq(&app.mic_test.cleaning.as_ref().unwrap().raw, &old_raw),
+                "the old worker remains tracked until it finishes");
+            if failed {
+                drop(done);
+            } else {
+                done.send((vec![0.9; 480], ModelState::DeepFilterFailed)).unwrap();
+            }
+
+            app.poll_mic_test();
+
+            assert!(app.mic_test.cleaned.is_none(), "an old result must not be cached for the new take");
+            assert_eq!(app.mic_test.status, Some(("Now compare: Raw, then Cleaned".into(), GREEN)));
+            let cleaning = app.mic_test.cleaning.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&cleaning.raw, &raw), "the latest take is cleaned next");
+            assert!(!cleaning.then_play && app.mic_test.player.is_none(), "recording again cancels queued playback");
+            let (samples, model) = cleaning.result.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(samples.len(), raw.len());
+            assert_eq!(model, ModelState::Rnnoise);
+        }
+    }
+
+    #[test]
+    fn recording_again_skips_a_take_still_waiting_for_the_old_cleaner() {
+        let mut app = App::stopped(Settings::default());
+        let done = pending_cleanup(&mut app, true);
+        let waiting = Arc::new(vec![0.2; 480]);
+        app.mic_test.raw = Some(Arc::clone(&waiting));
+        app.clean_test(false);
+        app.stop_test();
+        app.mic_test.recording = Some((Recorder::from_samples_for_test(&[0.25; 480]), Instant::now()));
+        app.mic_test.status = Some(("Speak normally…".into(), AMBER));
+        done.send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
+
+        app.poll_mic_test();
+
+        assert!(app.mic_test.recording());
+        assert!(app.mic_test.cleaning.is_none(), "wait for the new recording instead of cleaning an intermediate take");
+        assert!(app.mic_test.cleaned.is_none() && app.mic_test.player.is_none());
+        assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &waiting), "keep the previous take until recording succeeds");
+        assert_eq!(app.mic_test.status, Some(("Speak normally…".into(), AMBER)));
     }
 
     #[test]
     fn stopping_a_preview_cancels_queued_playback_but_keeps_the_cleaned_take() {
         let mut app = App::stopped(Settings::default());
         let params = app.test_params();
-        let (done, job) = crossbeam_channel::bounded(1);
-        app.mic_test.cleaning = Some((job, params, true));
+        let done = pending_cleanup(&mut app, true);
 
         app.stop_test();
         done.send((vec![0.25; 480], ModelState::DeepFilter)).unwrap();
@@ -445,9 +563,7 @@ mod tests {
     fn the_cleaned_button_can_cancel_playback_while_cleanup_is_running() {
         let mut app = App::stopped(Settings::default());
         app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
-        let params = app.test_params();
-        let (done, job) = crossbeam_channel::bounded(1);
-        app.mic_test.cleaning = Some((job, params, false));
+        let done = pending_cleanup(&mut app, false);
         let ctx = egui::Context::default();
         let draw = |app: &mut App, events| {
             ctx.run_ui(egui::RawInput {
@@ -469,7 +585,7 @@ mod tests {
                     egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
                 ]);
             }
-            assert_eq!(app.mic_test.cleaning.as_ref().unwrap().2, expected, "clicking again cancels pending playback");
+            assert_eq!(app.mic_test.cleaning.as_ref().unwrap().then_play, expected, "clicking again cancels pending playback");
         }
         done.send((vec![0.25; 480], ModelState::DeepFilter)).unwrap();
         app.poll_mic_test();
@@ -484,8 +600,7 @@ mod tests {
     fn snapshot_pending_mic_preview() {
         let mut app = App::stopped(Settings::default());
         app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
-        let (_done, job) = crossbeam_channel::bounded(1);
-        app.mic_test.cleaning = Some((job, app.test_params(), true));
+        let _done = pending_cleanup(&mut app, true);
         app.mic_test.status = Some(("Applying your settings…".into(), CYAN));
         let path = super::super::snapshot::snapshot(&mut app, "mic-preview-pending", egui::vec2(760.0, 1100.0), 1.0, true);
         println!("SNAPSHOT {}", path.display());
