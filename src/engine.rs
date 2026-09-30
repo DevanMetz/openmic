@@ -292,25 +292,35 @@ where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    let channels = usize::from(config.channels);
-    let queue = Arc::clone(queue);
-    let waker = Arc::clone(waker);
     Ok(device.build_input_stream(
         *config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
-            for frame in data.chunks(channels) {
-                let mono = frame.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / channels as f32;
-                while queue.push(mono).is_err() {
-                    queue.pop();
-                }
-            }
-            if let Some(thread) = waker.get() {
-                thread.unpark();
-            }
-        },
+        input_callback::<T>(usize::from(config.channels), Arc::clone(queue), Arc::clone(waker)),
         on_error,
         None,
     )?)
+}
+
+fn input_callback<T>(channels: usize, queue: Arc<ArrayQueue<f32>>, waker: Arc<OnceLock<Thread>>)
+    -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    move |data, _| {
+        for frame in data.chunks(channels) {
+            // Invalid device samples must not poison the resampler or the
+            // persistent filter state. Sum in f64 before clipping the mix.
+            let sum: f64 = frame.iter().map(|&s| s.to_sample::<f32>())
+                .filter(|s| s.is_finite()).map(f64::from).sum();
+            let mono = (sum / channels as f64).clamp(-1.0, 1.0) as f32;
+            while queue.push(mono).is_err() {
+                queue.pop();
+            }
+        }
+        if let Some(thread) = waker.get() {
+            thread.unpark();
+        }
+    }
 }
 
 fn output_stream<T>(
@@ -692,6 +702,41 @@ fn rms_db(samples: impl ExactSizeIterator<Item = f32>) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_device_samples_do_not_poison_later_microphone_audio() {
+        let queue = Arc::new(ArrayQueue::new(1024));
+        let mut callback = input_callback::<f32>(2, Arc::clone(&queue), Arc::default());
+        let info = cpal::InputCallbackInfo::new(cpal::InputStreamTimestamp {
+            callback: cpal::StreamInstant::ZERO,
+            capture: cpal::StreamInstant::ZERO,
+        });
+        callback(&[
+            f32::NAN, 0.5,
+            f32::INFINITY, 0.5,
+            f32::NEG_INFINITY, -0.5,
+            f32::MAX, f32::MAX,
+            -f32::MAX, -f32::MAX,
+            f32::MAX, -f32::MAX,
+            0.5, 0.25,
+        ], &info);
+        let captured: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
+        assert_eq!(captured, [0.25, 0.25, -0.25, 1.0, -1.0, 0.0, 0.375]);
+
+        let mut resampler = Resampler::new(44_100, SR);
+        let mut filter = crate::dsp::HighPass::new(crate::dsp::HIGHPASS_HZ);
+        resampler.push(&captured);
+        for _ in 0..3 {
+            callback(&[0.25; FRAME * 2], &info);
+            let captured: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
+            assert_eq!(captured, [0.25; FRAME]);
+            resampler.push(&captured);
+            let mut frame = [0.0; FRAME];
+            assert_eq!(resampler.pull(&mut frame), FRAME);
+            filter.process(&mut frame);
+            assert!(frame.iter().all(|s| s.is_finite()), "later audio must survive a bad device sample");
+        }
+    }
 
     #[test]
     fn worker_exit_is_reported_once_without_hiding_processing_errors() {
