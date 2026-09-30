@@ -76,20 +76,27 @@ fn main() -> eframe::Result<()> {
 const NATURAL_SIZE: (f32, f32) = (760.0, 880.0);
 const MIN_SIZE: (f32, f32) = (700.0, 420.0);
 
-/// The natural size, shortened to fit the screen: at 150% scaling a 1080p
-/// laptop has only about 690 points of height to spare.
+/// Fit the saved or natural size to the current screen's work area.
 fn initial_size(saved: Option<[f32; 2]>) -> [f32; 2] {
-    // The size the window had last time, if any.
-    let (width, height) = saved.map_or(NATURAL_SIZE, |[w, h]| (w.max(MIN_SIZE.0), h.max(MIN_SIZE.1)));
-    match work_area_height() {
-        Some(available) => [width, height.min(available - 40.0).max(MIN_SIZE.1)],
+    fit_window_size(saved, work_area_size())
+}
+
+fn fit_window_size(saved: Option<[f32; 2]>, available: Option<[f32; 2]>) -> [f32; 2] {
+    let [width, height] = saved.unwrap_or([NATURAL_SIZE.0, NATURAL_SIZE.1]);
+    let width = if width.is_finite() { width.max(MIN_SIZE.0) } else { NATURAL_SIZE.0 };
+    let height = if height.is_finite() { height.max(MIN_SIZE.1) } else { NATURAL_SIZE.1 };
+    match available {
+        Some([max_width, max_height]) => [
+            width.min(max_width - 40.0).max(MIN_SIZE.0),
+            height.min(max_height - 40.0).max(MIN_SIZE.1),
+        ],
         None => [width, height],
     }
 }
 
-/// Height of the primary screen's work area (minus the taskbar), in points.
+/// Size of the primary screen's work area (minus the taskbar), in points.
 #[cfg(windows)]
-fn work_area_height() -> Option<f32> {
+fn work_area_size() -> Option<[f32; 2]> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::HiDpi::GetDpiForSystem;
     use windows::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW};
@@ -106,10 +113,34 @@ fn work_area_height() -> Option<f32> {
     }
     // SAFETY: no arguments; returns the system DPI (96 = 100%).
     let dpi = unsafe { GetDpiForSystem() };
-    (dpi > 0).then(|| (area.bottom - area.top) as f32 * 96.0 / dpi as f32)
+    (dpi > 0).then(|| [
+        (area.right - area.left) as f32 * 96.0 / dpi as f32,
+        (area.bottom - area.top) as f32 * 96.0 / dpi as f32,
+    ])
 }
 
 #[cfg(not(windows))]
-fn work_area_height() -> Option<f32> {
+fn work_area_size() -> Option<[f32; 2]> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restored_windows_fit_smaller_screens_in_both_directions() {
+        assert_eq!(fit_window_size(Some([2200.0, 1300.0]), Some([1280.0, 720.0])), [1240.0, 680.0]);
+        assert_eq!(fit_window_size(None, Some([1024.0, 768.0])), [760.0, 728.0]);
+        assert_eq!(fit_window_size(Some([744.0, 842.0]), Some([1920.0, 1080.0])), [744.0, 842.0]);
+    }
+
+    #[test]
+    fn restored_sizes_remain_usable_when_preferences_or_screen_queries_fail() {
+        assert_eq!(fit_window_size(Some([0.0, 50.0]), None), [MIN_SIZE.0, MIN_SIZE.1]);
+        assert_eq!(fit_window_size(None, Some([600.0, 400.0])), [MIN_SIZE.0, MIN_SIZE.1]);
+        for invalid in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert_eq!(fit_window_size(Some([invalid, invalid]), None), [NATURAL_SIZE.0, NATURAL_SIZE.1]);
+        }
+    }
 }
