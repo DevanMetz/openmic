@@ -24,13 +24,17 @@ pub(super) struct PadRename {
 
 #[derive(Default)]
 pub(super) struct ClipImport {
-    /// The first path belongs to the current job until its result is collected.
+    /// The first path belongs to the current job unless it was cancelled.
     files: VecDeque<PathBuf>,
     job: Option<Receiver<anyhow::Result<CachedClip>>>,
     cancel: Arc<AtomicBool>,
     total: usize,
     added: usize,
     invalid: Vec<String>,
+}
+
+impl ClipImport {
+    pub(super) fn has_pending_files(&self) -> bool { !self.files.is_empty() }
 }
 
 impl Drop for ClipImport {
@@ -143,24 +147,31 @@ impl App {
         });
         if let Some(result) = result {
             import.job = None;
-            let path = import.files.pop_front().expect("an import job has a path");
-            let result = result.and_then(|clip| {
-                clip.validate_source(&path)?;
-                Ok(clip)
-            });
-            match result {
-                Ok(clip) => {
-                    self.cache_clip(path.clone(), clip);
-                    if !self.settings.sounds.iter().any(|pad| pad.path == path) {
-                        self.settings.sounds.push(Pad::new(path));
-                        self.pad_filter.clear();
-                        self.touch();
-                        import.added += 1;
+            if import.cancel.load(Ordering::Relaxed) {
+                // New files can queue while cancellation finishes. The old result
+                // must not consume one of them or overwrite the cancellation status.
+                import.cancel = Arc::default();
+                if import.files.is_empty() { return; }
+            } else {
+                let path = import.files.pop_front().expect("an import job has a path");
+                let result = result.and_then(|clip| {
+                    clip.validate_source(&path)?;
+                    Ok(clip)
+                });
+                match result {
+                    Ok(clip) => {
+                        self.cache_clip(path.clone(), clip);
+                        if !self.settings.sounds.iter().any(|pad| pad.path == path) {
+                            self.settings.sounds.push(Pad::new(path));
+                            self.pad_filter.clear();
+                            self.touch();
+                            import.added += 1;
+                        }
                     }
-                }
-                Err(error) => {
-                    crate::logfile::error(format_args!("could not import {}: {error:#}", path.display()));
-                    import.invalid.push(file_name(&path));
+                    Err(error) => {
+                        crate::logfile::error(format_args!("could not import {}: {error:#}", path.display()));
+                        import.invalid.push(file_name(&path));
+                    }
                 }
             }
         }
@@ -198,9 +209,14 @@ impl App {
     }
 
     fn cancel_clip_import(&mut self) {
-        if self.clip_import.take().is_some() {
-            self.sound_status = ("Import cancelled · clips already added are kept".into(), AMBER);
-        }
+        let Some(import) = &mut self.clip_import else { return };
+        import.cancel.store(true, Ordering::Relaxed);
+        import.files.clear();
+        import.total = 0;
+        import.added = 0;
+        import.invalid.clear();
+        if import.job.is_none() { self.clip_import = None; }
+        self.sound_status = ("Import cancelled · clips already added are kept".into(), AMBER);
     }
 
     pub(super) fn import_dropped_sounds(&mut self, ctx: &egui::Context) {
@@ -717,13 +733,19 @@ impl App {
         ui.weak("Drop audio files to add clips. Click a pad to play, pause or resume.");
         if let Some(import) = &self.clip_import {
             let mut cancel = false;
+            let cancelling = import.cancel.load(Ordering::Relaxed);
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(format!("Adding clips · {} of {}", import.total - import.files.len(), import.total));
-                cancel = ui.button("Cancel import").clicked();
+                ui.label(if cancelling {
+                    "Finishing cancellation…".into()
+                } else {
+                    format!("Adding clips · {} of {}", import.total - import.files.len(), import.total)
+                });
+                cancel = ui.add_enabled(import.has_pending_files(), egui::Button::new("Cancel import")).clicked();
             });
             if let Some(path) = import.files.front() {
-                ui.add(egui::Label::new(RichText::new(file_name(path)).weak()).truncate());
+                let name = if cancelling { format!("Next: {}", file_name(path)) } else { file_name(path) };
+                ui.add(egui::Label::new(RichText::new(name).weak()).truncate());
             }
             if cancel {
                 self.cancel_clip_import();
@@ -1809,15 +1831,54 @@ mod tests {
         }
 
         assert!(cancel.load(Ordering::Relaxed));
-        assert!(app.clip_import.is_none() && app.update_blocker().is_none());
+        assert!(app.clip_import.is_some() && app.update_blocker().is_none());
+        assert!(board(&mut app, &ctx, Vec::new()).iter().any(|text| text == "Finishing cancellation…"));
         assert_eq!(app.settings.sounds, [pad]);
-        assert!(done.send(Err(anyhow::anyhow!("late result"))).is_err());
+        assert!(done.send(Err(anyhow::anyhow!("late result"))).is_ok());
         app.poll_clip_import(&ctx);
+        assert!(app.clip_import.is_none());
         assert!(app.sound_status.0.starts_with("Import cancelled"));
 
         app.import_sounds(vec![pending], &ctx);
         finish_import(&mut app, &ctx);
         assert_eq!(app.settings.sounds.len(), 2, "a cancelled file can be imported again");
+    }
+
+    #[test]
+    fn a_new_import_waits_for_cancelled_work_and_keeps_its_own_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = wav(dir.path(), "old.wav", 0.1);
+        let next = wav(dir.path(), "next.wav", 0.2);
+        let ctx = egui::Context::default();
+        for disconnected in [false, true] {
+            let mut app = App::stopped(Default::default());
+            let (done, job) = crossbeam_channel::bounded(1);
+            let cancel = Arc::default();
+            app.clip_import = Some(ClipImport {
+                files: [old.clone()].into(), job: Some(job), cancel: Arc::clone(&cancel),
+                total: 3, added: 1, invalid: vec!["earlier failure.wav".into()],
+            });
+            for _ in 0..3 {
+                app.cancel_clip_import();
+                app.import_sounds(vec![next.clone(), next.clone()], &ctx);
+                let import = app.clip_import.as_ref().unwrap();
+                assert!(Arc::ptr_eq(&cancel, &import.cancel) && cancel.load(Ordering::Relaxed));
+                assert_eq!((import.files.len(), import.files.front()), (1, Some(&next)));
+                assert_eq!((import.total, import.added), (1, 0));
+                assert!(import.invalid.is_empty());
+                assert!(app.settings.sounds.is_empty() && app.update_blocker().is_some());
+            }
+            if !disconnected {
+                assert!(done.send(CachedClip::read(&old, &AtomicBool::new(false))).is_ok());
+            }
+            drop(done);
+            finish_import(&mut app, &ctx);
+            assert_eq!(app.settings.sounds, [Pad::new(next.clone())]);
+            assert!(!app.clip_cache.contains_key(&old), "ignore a cancelled import's late success");
+            assert!(app.clip_cache.contains_key(&next));
+            assert_eq!(app.sound_status, ("Added 1 clip".into(), GREEN));
+            assert!(app.update_blocker().is_none());
+        }
     }
 
     #[test]

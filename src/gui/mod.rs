@@ -868,7 +868,7 @@ impl App {
             Some("Wait for speech to text to finish")
         } else if self.dictation.download_progress().is_some() {
             Some("Wait for the speech model download to finish or cancel it")
-        } else if self.clip_import.is_some() {
+        } else if self.clip_import.as_ref().is_some_and(sound_tab::ClipImport::has_pending_files) {
             Some("Wait for clip imports to finish or cancel them")
         } else {
             None
