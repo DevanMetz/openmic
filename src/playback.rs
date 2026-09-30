@@ -76,10 +76,17 @@ impl Player {
         let len = audio.len();
         let (report, errors) = crossbeam_channel::bounded(1);
         let stream = match supported.sample_format() {
+            SampleFormat::I8 => build::<i8>(&device, &config, &audio, &progress, &report),
+            SampleFormat::U8 => build::<u8>(&device, &config, &audio, &progress, &report),
             SampleFormat::F32 => build::<f32>(&device, &config, &audio, &progress, &report),
             SampleFormat::I16 => build::<i16>(&device, &config, &audio, &progress, &report),
             SampleFormat::U16 => build::<u16>(&device, &config, &audio, &progress, &report),
+            SampleFormat::I24 => build::<cpal::I24>(&device, &config, &audio, &progress, &report),
+            SampleFormat::U24 => build::<cpal::U24>(&device, &config, &audio, &progress, &report),
             SampleFormat::I32 => build::<i32>(&device, &config, &audio, &progress, &report),
+            SampleFormat::U32 => build::<u32>(&device, &config, &audio, &progress, &report),
+            SampleFormat::I64 => build::<i64>(&device, &config, &audio, &progress, &report),
+            SampleFormat::U64 => build::<u64>(&device, &config, &audio, &progress, &report),
             SampleFormat::F64 => build::<f64>(&device, &config, &audio, &progress, &report),
             other => Err(anyhow!("unsupported output format {other}")),
         }?;
@@ -247,6 +254,23 @@ mod tests {
             callback: cpal::StreamInstant::from_millis(callback_ms),
             playback: cpal::StreamInstant::from_millis(playback_ms),
         })
+    }
+
+    #[test]
+    fn integer_preview_formats_keep_levels_channels_and_trailing_silence() {
+        let audio = Arc::new(vec![-1.0, 0.0, 1.0]);
+        let mut signed = [1i8; 8];
+        output_callback::<i8>(Arc::clone(&audio), 2, 48_000, Arc::default())(
+            &mut signed, &output_time(0, 20),
+        );
+        assert_eq!(signed, [i8::MIN, i8::MIN, 0, 0, i8::MAX, i8::MAX, 0, 0]);
+
+        let mut unsigned = [1u8; 8];
+        output_callback::<u8>(audio, 2, 48_000, Arc::default())(
+            &mut unsigned, &output_time(0, 20),
+        );
+        assert_eq!(unsigned, [0, 0, 128, 128, u8::MAX, u8::MAX, 128, 128],
+            "silence must use the unsigned midpoint, including after the clip ends");
     }
 
     #[test]
