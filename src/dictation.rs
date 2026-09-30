@@ -141,6 +141,7 @@ struct Download {
     done: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
+    thread: thread::JoinHandle<Result<()>>,
 }
 
 impl Dictation {
@@ -157,11 +158,18 @@ impl Dictation {
 
     pub fn poll(&mut self) -> Option<Event> {
         self.reap_worker();
-        let event = self.events.1.try_recv().ok()?;
-        if matches!(event, Event::Downloaded(_) | Event::DownloadFailed(_)) {
-            self.download = None;
+        if let Ok(event) = self.events.1.try_recv() {
+            return Some(event);
         }
-        Some(event)
+        if !self.download.as_ref().is_some_and(|download| download.thread.is_finished()) {
+            return None;
+        }
+        let download = self.download.take().unwrap();
+        Some(match download.thread.join() {
+            Ok(Ok(())) => Event::Downloaded(download.model),
+            Ok(Err(error)) => Event::DownloadFailed(format!("{error:#}")),
+            Err(_) => Event::DownloadFailed("Speech model download stopped; try downloading again".into()),
+        })
     }
 
     /// A take is being transcribed.
@@ -179,25 +187,22 @@ impl Dictation {
         if self.download.is_some() {
             return;
         }
-        let download = Download {
-            model,
-            done: Arc::default(),
-            total: Arc::default(),
-            cancel: Arc::default(),
+        let (done, total, cancel) = (Arc::default(), Arc::default(), Arc::default());
+        let spawned = {
+            let (done, total, cancel) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
+            let wake = Arc::clone(&self.wake);
+            thread::Builder::new().name("openmic-model-download".into()).spawn(move || {
+                let result = download_model(model, &done, &total, &cancel);
+                wake();
+                result
+            })
         };
-        let (done, total, cancel) =
-            (Arc::clone(&download.done), Arc::clone(&download.total), Arc::clone(&download.cancel));
-        let (events, wake) = (self.events.0.clone(), Arc::clone(&self.wake));
-        let spawned = thread::Builder::new().name("openmic-model-download".into()).spawn(move || {
-            let event = match download_model(model, &done, &total, &cancel) {
-                Ok(()) => Event::Downloaded(model),
-                Err(e) => Event::DownloadFailed(format!("{e:#}")),
-            };
-            let _ = events.send(event);
-            wake();
-        });
-        if spawned.is_ok() {
-            self.download = Some(download);
+        match spawned {
+            Ok(thread) => self.download = Some(Download { model, done, total, cancel, thread }),
+            Err(error) => {
+                let _ = self.events.0.send(Event::DownloadFailed(format!("Could not start model download: {error}")));
+                (self.wake)();
+            }
         }
     }
 
@@ -788,10 +793,10 @@ mod tests {
         crate::record::Recorder::from_samples_for_test(&[0.2; 96]).finish().unwrap().unwrap()
     }
 
-    fn wait_for_worker_exit(dictation: &Dictation) {
+    fn wait_for_thread<T>(worker: &thread::JoinHandle<T>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !dictation.worker.as_ref().unwrap().thread.is_finished() {
-            assert!(std::time::Instant::now() < deadline, "dictation worker did not exit");
+        while !worker.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "background worker did not exit");
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -814,7 +819,7 @@ mod tests {
             dictation.transcribe(SpeechModel::TinyEn, short_take());
             assert_eq!(dictation.pending.load(Ordering::Relaxed), 2);
             release.send(()).unwrap();
-            wait_for_worker_exit(&dictation);
+            wait_for_thread(&dictation.worker.as_ref().unwrap().thread);
 
             if poll_before_retry {
                 assert!(matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again")));
@@ -860,11 +865,74 @@ mod tests {
         let thread = thread::spawn(move || drop(queue));
         dictation.worker = Some(TranscriptionWorker { jobs, thread });
         dictation.events.0.send(Event::Transcribed { text: "Keep these words".into(), typing_error: None }).unwrap();
-        wait_for_worker_exit(&dictation);
+        wait_for_thread(&dictation.worker.as_ref().unwrap().thread);
         assert!(matches!(dictation.poll(), Some(Event::Transcribed { text, .. }) if text == "Keep these words"));
         assert!(dictation.worker.is_none());
         assert!(!dictation.busy());
         assert!(dictation.poll().is_none());
+    }
+
+    fn test_download(thread: thread::JoinHandle<Result<()>>) -> Download {
+        Download {
+            model: SpeechModel::TinyEn, done: Arc::default(), total: Arc::default(),
+            cancel: Arc::default(), thread,
+        }
+    }
+
+    #[test]
+    fn completed_downloads_clear_progress_and_keep_their_result() {
+        let mut dictation = Dictation::new(|| {});
+        for succeeds in [true, false] {
+            let thread = thread::spawn(move || {
+                if succeeds { Ok(()) } else { bail!("connection interrupted") }
+            });
+            wait_for_thread(&thread);
+            dictation.download = Some(test_download(thread));
+            dictation.events.0.send(Event::Nothing).unwrap();
+            assert!(matches!(dictation.poll(), Some(Event::Nothing)));
+            assert!(dictation.download_progress().is_some());
+            if succeeds {
+                assert!(matches!(dictation.poll(), Some(Event::Downloaded(SpeechModel::TinyEn))));
+            } else {
+                assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "connection interrupted"));
+            }
+            assert!(dictation.download_progress().is_none());
+            assert!(dictation.poll().is_none(), "completion must only be reported once");
+        }
+    }
+
+    #[test]
+    fn crashed_download_reports_failure_and_clears_progress() {
+        let mut dictation = Dictation::new(|| {});
+        let thread = thread::spawn(|| panic!("simulated download failure"));
+        wait_for_thread(&thread);
+        dictation.download = Some(test_download(thread));
+        assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error.contains("try downloading again")));
+        assert!(dictation.download_progress().is_none());
+        assert!(dictation.poll().is_none());
+    }
+
+    #[test]
+    fn running_download_remains_cancellable_after_an_earlier_start_failure() {
+        let mut dictation = Dictation::new(|| {});
+        let (release, stop) = crossbeam_channel::bounded::<()>(0);
+        let cancel = Arc::<AtomicBool>::default();
+        let cancelled = Arc::clone(&cancel);
+        let thread = thread::spawn(move || {
+            let _ = stop.recv();
+            check_download_cancelled(&cancelled)
+        });
+        dictation.download = Some(Download { cancel, ..test_download(thread) });
+        dictation.events.0.send(Event::DownloadFailed("earlier startup failed".into())).unwrap();
+        assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "earlier startup failed"));
+        assert!(dictation.download_progress().is_some());
+        assert!(dictation.poll().is_none());
+        dictation.cancel_download();
+        assert!(dictation.download.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        drop(release);
+        wait_for_thread(&dictation.download.as_ref().unwrap().thread);
+        assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "download cancelled"));
+        assert!(dictation.download_progress().is_none());
     }
 
     #[test]
