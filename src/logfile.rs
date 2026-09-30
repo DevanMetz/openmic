@@ -48,7 +48,8 @@ fn open(dir: &Path) -> std::io::Result<File> {
     fs::create_dir_all(dir)?;
     let path = dir.join(FILE_NAME);
     if fs::metadata(&path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
-        fs::rename(&path, dir.join(OLD_FILE_NAME))?;
+        // A locked archive must not prevent appending to a writable log.
+        let _ = fs::rename(&path, dir.join(OLD_FILE_NAME));
     }
     OpenOptions::new().create(true).append(true).open(path)
 }
@@ -152,5 +153,29 @@ mod tests {
         writeln!(file, "fresh").unwrap();
         assert_eq!(fs::read_to_string(dir.path().join(FILE_NAME)).unwrap(), "fresh\n");
         assert_eq!(fs::metadata(dir.path().join(OLD_FILE_NAME)).unwrap().len(), ROTATE_BYTES + 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_archive_does_not_disable_the_current_log() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join(FILE_NAME);
+        let archived = dir.path().join(OLD_FILE_NAME);
+        fs::write(&current, vec![b'x'; ROTATE_BYTES as usize + 1]).unwrap();
+        fs::write(&archived, b"earlier log").unwrap();
+        let held = OpenOptions::new().read(true).share_mode(1).open(&archived).unwrap();
+
+        let mut file = open(dir.path()).unwrap();
+        writeln!(file, "still logging").unwrap();
+        drop(file);
+        assert!(fs::read_to_string(&current).unwrap().ends_with("still logging\n"));
+        assert_eq!(fs::read(&archived).unwrap(), b"earlier log");
+        drop(held);
+
+        drop(open(dir.path()).unwrap());
+        assert_eq!(fs::metadata(&current).unwrap().len(), 0);
+        assert!(fs::read_to_string(&archived).unwrap().ends_with("still logging\n"));
     }
 }
