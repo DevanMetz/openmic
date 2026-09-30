@@ -76,7 +76,7 @@ fn on_com_thread<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'stat
     std::thread::Builder::new()
         .name("openmic-default-mic".into())
         .spawn(move || {
-            imp::com_init()?;
+            let _apartment = imp::com_init()?;
             f()
         })
         .context("start default microphone helper")?
@@ -95,7 +95,7 @@ mod imp {
         DEVICE_STATE_ACTIVE,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
         STGM_READ,
     };
 
@@ -120,10 +120,22 @@ mod imp {
 
     const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
-    pub fn com_init() -> Result<()> {
+    /// Each successful initialization is released on the same thread.
+    pub struct ComApartment(std::marker::PhantomData<*mut ()>);
+
+    impl Drop for ComApartment {
+        fn drop(&mut self) {
+            // SAFETY: constructed only after successful initialization;
+            // the non-Send guard outlives all COM objects used by the helper.
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    pub fn com_init() -> Result<ComApartment> {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
             .ok()
-            .context("initialise COM")
+            .context("initialise COM")?;
+        Ok(ComApartment(std::marker::PhantomData))
     }
 
     fn enumerator() -> Result<IMMDeviceEnumerator> {
@@ -177,8 +189,10 @@ mod imp {
     use super::{Role, SavedDefaults};
     use anyhow::{anyhow, Result};
 
-    pub fn com_init() -> Result<()> {
-        Ok(())
+    pub struct ComApartment;
+
+    pub fn com_init() -> Result<ComApartment> {
+        Ok(ComApartment)
     }
     pub fn cable_capture_id() -> Result<Option<String>> {
         Ok(None)
