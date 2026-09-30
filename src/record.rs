@@ -177,37 +177,48 @@ impl Recorder {
         };
 
         let path = take_path();
+        // Own cleanup before creating the file or starting the worker, so
+        // every fallible startup step can use the same Drop path.
+        let mut recorder = Self {
+            stream: None,
+            writer: None,
+            path: Some(path.clone()),
+            stop: Arc::default(),
+            peaks: Arc::new(Mutex::new(PeakTracker::new(sample_rate, channels))),
+            bytes: Arc::default(),
+            sample_rate,
+            channels,
+            started: Instant::now(),
+            full: Arc::default(),
+            skipped: Arc::default(),
+            skipped_reported: false,
+            error: Arc::default(),
+        };
         let wav = WavWriter::create(&path, sample_rate, channels)?;
         let queue = Arc::new(ArrayQueue::<f32>::new(
             (sample_rate as usize * channels as usize * QUEUE_SECONDS).max(1),
         ));
-        let stop = Arc::new(AtomicBool::new(false));
-        let peaks = Arc::new(Mutex::new(PeakTracker::new(sample_rate, channels)));
-        let bytes = Arc::new(AtomicU64::new(0));
-        let full = Arc::new(AtomicBool::new(false));
-        let skipped = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
 
-        let writer = {
+        recorder.writer = Some({
             let (queue, stop, peaks, bytes, full, error) = (
                 Arc::clone(&queue),
-                Arc::clone(&stop),
-                Arc::clone(&peaks),
-                Arc::clone(&bytes),
-                Arc::clone(&full),
-                Arc::clone(&error),
+                Arc::clone(&recorder.stop),
+                Arc::clone(&recorder.peaks),
+                Arc::clone(&recorder.bytes),
+                Arc::clone(&recorder.full),
+                Arc::clone(&recorder.error),
             );
             thread::Builder::new()
                 .name("openmic-recorder".into())
                 .spawn(move || write_loop(wav, &queue, &stop, &peaks, &bytes, &full, &error))
                 .context("start recording writer")?
-        };
+        });
 
         macro_rules! build_stream {
             ($sample:ty) => {{
                 let queue = Arc::clone(&queue);
-                let skipped = Arc::clone(&skipped);
-                let error = Arc::clone(&error);
+                let skipped = Arc::clone(&recorder.skipped);
+                let error = Arc::clone(&recorder.error);
                 device.build_input_stream(
                     config,
                     move |data: &[$sample], _: &cpal::InputCallbackInfo| {
@@ -248,21 +259,6 @@ impl Recorder {
                 cpal::ErrorKind::UnsupportedConfig,
                 format!("unsupported recording format {other}"),
             )),
-        };
-        let mut recorder = Self {
-            stream: None,
-            writer: Some(writer),
-            path: Some(path),
-            stop,
-            peaks,
-            bytes,
-            sample_rate,
-            channels,
-            started: Instant::now(),
-            full,
-            skipped,
-            skipped_reported: false,
-            error,
         };
         // On failure, dropping `recorder` stops the writer and deletes the file.
         let stream = stream.context("open recording stream")?;
