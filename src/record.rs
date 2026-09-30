@@ -49,6 +49,7 @@ pub struct Recorder {
     full: Arc<AtomicBool>,
     /// The writer fell more than [`QUEUE_SECONDS`] behind and audio was lost.
     skipped: Arc<AtomicBool>,
+    skipped_reported: bool,
     error: Arc<Mutex<Option<String>>>,
 }
 
@@ -60,7 +61,7 @@ pub struct Take {
     frames: u64,
     /// Peak level per 10 ms block, for the waveform.
     peaks: Vec<f32>,
-    /// Capture failed, but the audio that reached disk could be kept.
+    /// Capture lost audio or failed, but the audio on disk could be kept.
     warning: Option<String>,
 }
 
@@ -120,13 +121,18 @@ impl Recorder {
             stream: None, writer: Some(thread::spawn(move || Ok(data_bytes))), path: Some(path),
             stop: Arc::default(), peaks: Arc::new(Mutex::new(peaks)), bytes: Arc::new(AtomicU64::new(data_bytes)),
             sample_rate: 48_000, channels: 2, started: Instant::now(),
-            full: Arc::default(), skipped: Arc::default(), error: Arc::default(),
+            full: Arc::default(), skipped: Arc::default(), skipped_reported: false, error: Arc::default(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn report_error_for_test(&self, message: &str) {
         *self.error.lock() = Some(message.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_skipped_for_test(&self) {
+        self.skipped.store(true, Ordering::Relaxed);
     }
 
     /// An empty `device_name` means the Windows default device for that source.
@@ -255,6 +261,7 @@ impl Recorder {
             started: Instant::now(),
             full,
             skipped,
+            skipped_reported: false,
             error,
         };
         // On failure, dropping `recorder` stops the writer and deletes the file.
@@ -286,8 +293,13 @@ impl Recorder {
     }
 
     /// Whether audio was dropped because the disk fell behind (reported once).
-    pub fn take_skipped(&self) -> bool {
-        self.skipped.swap(false, Ordering::Relaxed)
+    pub fn take_skipped(&mut self) -> bool {
+        if self.skipped.load(Ordering::Relaxed) && !self.skipped_reported {
+            self.skipped_reported = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Peak level of the most recent `count` 10 ms blocks, oldest first.
@@ -300,12 +312,20 @@ impl Recorder {
         let data_bytes = self.shutdown()?;
         let path = self.path.take().context("recording already finished")?;
         let frame_bytes = u64::from(self.channels) * 2;
+        let mut warning = self.error.lock().take();
+        if self.skipped.load(Ordering::Relaxed) {
+            let skipped = "Some audio was skipped because the disk fell behind";
+            warning = Some(match warning {
+                Some(error) => format!("{error}; {skipped}"),
+                None => skipped.into(),
+            });
+        }
         let take = Take {
             path,
             sample_rate: self.sample_rate,
             frames: data_bytes / frame_bytes,
             peaks: self.peaks.lock().recent(usize::MAX),
-            warning: self.error.lock().take(),
+            warning,
         };
         Ok((take.frames > 0).then_some(take)) // an empty take deletes itself
     }
@@ -802,6 +822,7 @@ mod tests {
             started: Instant::now(),
             full: Arc::new(AtomicBool::new(false)),
             skipped: Arc::new(AtomicBool::new(false)),
+            skipped_reported: false,
             error,
         };
         assert!(recorder.error().is_none());
@@ -817,6 +838,34 @@ mod tests {
         assert_eq!(recorder.error().as_deref(), Some("microphone disconnected"));
         let take = recorder.finish().unwrap().unwrap();
         assert_eq!(take.warning(), Some("microphone disconnected"));
+        assert_eq!(take.samples().unwrap().len(), 240);
+    }
+
+    #[test]
+    fn skipped_audio_stays_on_the_finished_take_after_the_ui_reports_it() {
+        for report_during_capture in [false, true] {
+            let mut recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+            assert!(!recorder.take_skipped());
+            recorder.report_skipped_for_test();
+            if report_during_capture {
+                assert!(recorder.take_skipped());
+                assert!(!recorder.take_skipped(), "report the active warning once per take");
+            }
+            let take = recorder.finish().unwrap().unwrap();
+            assert!(take.warning().unwrap().contains("audio was skipped"));
+            assert_eq!(take.samples().unwrap().len(), 240, "keep all captured samples");
+        }
+    }
+
+    #[test]
+    fn skipped_audio_does_not_hide_a_capture_failure() {
+        let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+        recorder.report_skipped_for_test();
+        recorder.report_error_for_test("microphone disconnected");
+        let take = recorder.finish().unwrap().unwrap();
+        let warning = take.warning().unwrap();
+        assert!(warning.contains("microphone disconnected"));
+        assert!(warning.contains("audio was skipped"));
         assert_eq!(take.samples().unwrap().len(), 240);
     }
 

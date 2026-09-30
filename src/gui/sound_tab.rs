@@ -298,7 +298,7 @@ impl App {
         } else if self.recorder.as_ref().is_some_and(Recorder::is_full) {
             self.stop_recording();
             self.record_status = ("Reached the 4 GB WAV size limit; your take is ready".into(), AMBER);
-        } else if self.recorder.as_ref().is_some_and(Recorder::take_skipped) {
+        } else if self.recorder.as_mut().is_some_and(Recorder::take_skipped) {
             self.record_status = ("The disk fell behind, so a moment of audio was skipped".into(), AMBER);
         }
     }
@@ -1258,6 +1258,23 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn stopping_after_an_audio_gap_keeps_the_take_and_its_warning() {
+        let mut app = App::stopped(Default::default());
+        let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+        recorder.report_skipped_for_test();
+        app.recorder = Some(recorder);
+        app.poll_recording();
+        assert!(app.recorder.is_some(), "an overrun warns without ending capture");
+        assert!(app.record_status.0.contains("skipped"));
+        app.stop_recording();
+        assert!(app.recorder.is_none());
+        assert!(app.record_status.0.starts_with("Partial take ready"));
+        assert!(app.record_status.0.contains("audio was skipped"));
+        assert_eq!(app.record_status.1, AMBER);
+        assert_eq!(app.take.as_ref().unwrap().samples().unwrap().len(), 240);
+    }
 
     #[test]
     fn sound_pad_play_remove_and_strip_button_have_separate_hit_targets() {

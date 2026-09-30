@@ -1396,6 +1396,19 @@ mod tests {
     }
 
     #[test]
+    fn dictation_does_not_type_a_take_that_skipped_audio() {
+        let mut app = App::stopped(Settings::default());
+        let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
+        recorder.report_skipped_for_test();
+        app.dictating = Some(recorder);
+        app.stop_dictation();
+        assert!(app.dictating.is_none());
+        assert!(!app.dictation.busy());
+        assert!(app.dictation_status.0.contains("audio was skipped"));
+        assert_eq!(app.dictation_status.1, RED);
+    }
+
+    #[test]
     fn quit_and_window_close_preserve_active_and_unsaved_recordings() {
         for active in [true, false] {
             for window_close in [true, false] {
