@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use eframe::egui::{self, RichText};
 
 use super::{short, App, Status, AMBER, CYAN, GREEN, MUTED, RED};
-use crate::denoise::Cleaner;
+use crate::denoise::{Cleaner, ModelState, ProcessedRecording};
 use crate::dsp::Params;
 use crate::playback::{self, Player};
 use crate::record::{Recorder, Source};
@@ -28,10 +28,10 @@ pub(super) struct MicTest {
     recording: Option<(Recorder, Instant)>,
     /// The take as recorded (mono, DSP rate).
     raw: Option<Arc<Vec<f32>>>,
-    /// The take cleaned, and the settings it was cleaned with.
-    cleaned: Option<(Arc<Vec<f32>>, Params)>,
+    /// The cleaned take, its settings, and the model state that produced it.
+    cleaned: Option<(Arc<Vec<f32>>, Params, ModelState)>,
     /// Cleaning in the background, and whether to play it when done.
-    cleaning: Option<(Receiver<Vec<f32>>, Params, bool)>,
+    cleaning: Option<(Receiver<ProcessedRecording>, Params, bool)>,
     player: Option<(Player, Version)>,
     status: Option<Status>,
 }
@@ -43,6 +43,12 @@ impl MicTest {
 
     pub(super) fn busy(&self) -> bool {
         self.recording.is_some() || self.cleaning.is_some() || self.player.is_some()
+    }
+
+    fn used_fallback(&self) -> bool {
+        self.cleaned.as_ref().is_some_and(|(_, params, model)| {
+            !params.bypass && *model == ModelState::DeepFilterFailed
+        })
     }
 }
 
@@ -116,7 +122,7 @@ impl App {
         let samples = match version {
             Version::Raw => self.mic_test.raw.clone(),
             Version::Cleaned => match &self.mic_test.cleaned {
-                Some((cleaned, params)) if *params == self.test_params() => Some(Arc::clone(cleaned)),
+                Some((cleaned, params, _)) if *params == self.test_params() => Some(Arc::clone(cleaned)),
                 // Settings changed since it was cleaned: clean again, then play.
                 _ => {
                     self.clean_test(true);
@@ -128,12 +134,14 @@ impl App {
         match Player::play(&self.test_output(), &samples) {
             Ok(player) => {
                 self.mic_test.player = Some((player, version));
+                let fallback = version == Version::Cleaned && self.mic_test.used_fallback();
                 self.mic_test.status = Some((
                     match version {
                         Version::Raw => "Playing your raw microphone".into(),
+                        Version::Cleaned if fallback => "Playing RNNoise fallback; DeepFilterNet unavailable".into(),
                         Version::Cleaned => "Playing what Discord hears".into(),
                     },
-                    GREEN,
+                    if fallback { AMBER } else { GREEN },
                 ));
             }
             Err(e) => self.mic_test.status = Some((short(&format!("{e:#}")), RED)),
@@ -171,12 +179,14 @@ impl App {
         let test = &mut self.mic_test;
         if let Some((job, params, then_play)) = &test.cleaning {
             match job.try_recv() {
-                Ok(cleaned) => {
+                Ok((cleaned, model)) => {
                     let (params, then_play) = (*params, *then_play);
-                    test.cleaned = Some((Arc::new(cleaned), params));
+                    test.cleaned = Some((Arc::new(cleaned), params, model));
                     test.cleaning = None;
                     if then_play {
                         self.play_test(Version::Cleaned);
+                    } else if test.used_fallback() {
+                        test.status = Some(("Cleaned uses RNNoise; DeepFilterNet unavailable".into(), AMBER));
                     }
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -198,7 +208,11 @@ impl App {
         self.mic_test.player = None;
         match result {
             Ok(()) => {
-                self.mic_test.status = Some(("Tune the settings and listen again".into(), MUTED));
+                self.mic_test.status = Some(if self.mic_test.used_fallback() {
+                    ("Cleaned uses RNNoise; DeepFilterNet unavailable".into(), AMBER)
+                } else {
+                    ("Tune the settings and listen again".into(), MUTED)
+                });
                 if !self.settings.setup.tested {
                     self.settings.setup.tested = true;
                     self.touch();
@@ -287,9 +301,10 @@ mod tests {
     fn a_recording_is_cleaned_to_the_same_length() {
         let p = Params { model: crate::dsp::Model::Rnnoise, ..Params::default() };
         let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
-        let cleaned = Cleaner::process_recording(&tone, &p);
+        let (cleaned, model) = Cleaner::process_recording(&tone, &p);
         assert_eq!(cleaned.len(), tone.len());
-        let muted = Cleaner::process_recording(&tone, &Params { mute: true, ..p });
+        assert_eq!(model, ModelState::Rnnoise);
+        let (muted, _) = Cleaner::process_recording(&tone, &Params { mute: true, ..p });
         assert!(muted.iter().all(|s| *s == 0.0), "mute would silence a test: test_params clears it");
     }
 
@@ -301,7 +316,7 @@ mod tests {
             let cleaned = Arc::new(vec![0.05; 480]);
             if had_preview {
                 app.mic_test.raw = Some(Arc::clone(&raw));
-                app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params()));
+                app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params(), ModelState::DeepFilter));
             }
             let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
             recorder.report_skipped_for_test();
@@ -342,6 +357,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fallback_preview_keeps_its_audio_and_explains_the_model_used() {
+        for bypass in [false, true] {
+            let mut app = App::stopped(Settings { bypass, ..Settings::default() });
+            let raw = Arc::new(vec![0.1; 480]);
+            app.mic_test.raw = Some(Arc::clone(&raw));
+            let params = app.test_params();
+            let (done, job) = crossbeam_channel::bounded(1);
+            app.mic_test.cleaning = Some((job, params, false));
+            done.send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
+
+            app.poll_mic_test();
+            assert!(!app.mic_test.busy(), "collecting a preview must not start playback");
+            assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+            let (samples, cleaned_params, model) = app.mic_test.cleaned.as_ref().unwrap();
+            assert_eq!(samples.as_slice(), &[0.05; 480]);
+            assert_eq!(*cleaned_params, params);
+            assert_eq!(*model, ModelState::DeepFilterFailed);
+            assert_eq!(app.mic_test.used_fallback(), !bypass,
+                "bypass audio does not depend on the denoising model");
+
+            if !bypass {
+                let (message, color) = app.mic_test.status.as_ref().unwrap();
+                assert!(message.contains("RNNoise") && message.contains("DeepFilterNet unavailable"));
+                assert_eq!(*color, AMBER);
+            }
+            app.finish_test_playback(Ok(()));
+            assert_eq!(app.mic_test.status.as_ref().unwrap().1, if bypass { MUTED } else { AMBER },
+                "successful playback must not erase the fallback information");
+        }
+    }
+
+    #[test]
     fn cleaned_playback_reuses_the_running_cleaner() {
         let mut app = App::stopped(Settings::default());
         app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
@@ -353,7 +400,7 @@ mod tests {
         app.settings.strength = 0.5;
         app.clean_test(true);
 
-        assert!(done.send(vec![0.2; 480]).is_ok(), "clicks reuse pending work instead of spawning competing cleaners");
+        assert!(done.send((vec![0.2; 480], ModelState::DeepFilter)).is_ok(), "clicks reuse pending work instead of spawning competing cleaners");
         let (_, running_params, then_play) = app.mic_test.cleaning.as_ref().unwrap();
         assert_eq!(*running_params, params, "the result keeps the settings it was actually cleaned with");
         assert!(*then_play, "request playback once the result is ready");
@@ -367,12 +414,12 @@ mod tests {
         app.mic_test.cleaning = Some((job, params, true));
 
         app.stop_test();
-        done.send(vec![0.25; 480]).unwrap();
+        done.send((vec![0.25; 480], ModelState::DeepFilter)).unwrap();
         app.poll_mic_test();
 
         assert!(!app.mic_test.busy());
         assert!(app.mic_test.status.is_none(), "a cancelled preview never opens an audio device");
-        let (samples, cleaned_params) = app.mic_test.cleaned.as_ref().unwrap();
+        let (samples, cleaned_params, _) = app.mic_test.cleaned.as_ref().unwrap();
         assert_eq!(samples.as_slice(), &[0.25; 480]);
         assert_eq!(*cleaned_params, params);
         assert!(!app.settings.setup.tested, "cancelling is not a successful listen");
@@ -408,7 +455,7 @@ mod tests {
             }
             assert_eq!(app.mic_test.cleaning.as_ref().unwrap().2, expected, "clicking again cancels pending playback");
         }
-        done.send(vec![0.25; 480]).unwrap();
+        done.send((vec![0.25; 480], ModelState::DeepFilter)).unwrap();
         app.poll_mic_test();
         assert!(!app.mic_test.busy());
         assert_eq!(app.mic_test.status, Some(("Playback stopped".into(), MUTED)));
@@ -434,7 +481,7 @@ mod tests {
         let raw = Arc::new(vec![0.1; 480]);
         let cleaned = Arc::new(vec![0.05; 480]);
         app.mic_test.raw = Some(Arc::clone(&raw));
-        app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params()));
+        app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params(), ModelState::DeepFilter));
 
         app.finish_test_playback(Err("Headphones disconnected".into()));
 

@@ -16,6 +16,9 @@ pub enum ModelState {
     DeepFilterFailed = 3,
 }
 
+/// Cleaned mono samples and the model state that produced the preview.
+pub type ProcessedRecording = (Vec<f32>, ModelState);
+
 impl ModelState {
     pub fn from_u32(v: u32) -> Self {
         match v {
@@ -177,8 +180,9 @@ impl Cleaner {
         assert!(self.prepare_offline(), "DeepFilterNet failed to load");
     }
 
-    /// Run a whole recording (mono, DSP rate) through the chain with `p`.
-    pub fn process_recording(samples: &[f32], p: &Params) -> Vec<f32> {
+    /// Run a whole recording (mono, DSP rate) through the chain with `p`,
+    /// retaining the actual model state so a fallback preview can be labeled.
+    pub fn process_recording(samples: &[f32], p: &Params) -> ProcessedRecording {
         let mut cleaner = Self::new();
         if p.model == Model::DeepFilter {
             cleaner.prepare_offline();
@@ -190,7 +194,7 @@ impl Cleaner {
             out.extend_from_slice(&cleaner.process(&frame, p).0);
         }
         out.truncate(samples.len());
-        out
+        (out, cleaner.state(p))
     }
 }
 
