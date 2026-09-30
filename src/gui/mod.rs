@@ -392,12 +392,12 @@ impl App {
         Params {
             model: s.model,
             strength: s.strength.clamp(0.0, 1.0),
-            input_gain: dsp::db_to_gain(s.input_gain_db),
-            output_gain: dsp::db_to_gain(s.output_gain_db),
+            input_gain: dsp::db_to_gain(s.input_gain_db.clamp(*dsp::INPUT_GAIN_RANGE.start(), *dsp::INPUT_GAIN_RANGE.end())),
+            output_gain: dsp::db_to_gain(s.output_gain_db.clamp(*dsp::OUTPUT_GAIN_RANGE.start(), *dsp::OUTPUT_GAIN_RANGE.end())),
             monitor_gain: s.monitor_volume.clamp(0.0, 1.0),
             sound_gain: s.sound_volume.clamp(0.0, 1.0),
             gate_enabled: s.gate,
-            gate_threshold_db: s.gate_threshold_db,
+            gate_threshold_db: s.gate_threshold_db.clamp(*dsp::GATE_THRESHOLD_RANGE.start(), *dsp::GATE_THRESHOLD_RANGE.end()),
             highpass: s.highpass,
             highpass_hz: s.highpass_hz.clamp(*dsp::HIGHPASS_RANGE.start(), *dsp::HIGHPASS_RANGE.end()),
             voice_gate: s.voice_gate,
@@ -1411,6 +1411,31 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn loaded_decibel_controls_stay_within_the_supported_audio_range() {
+        for (db, input_db, output_db, gate_db) in [
+            (1e30, 24.0, 12.0, -20.0),
+            (-1e30, -12.0, -24.0, -80.0),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "input_gain_db": db, "output_gain_db": db, "gate_threshold_db": db,
+            })).unwrap();
+            let app = App::stopped(settings);
+            let params = app.params();
+            assert!(params.input_gain.is_finite() && params.output_gain.is_finite());
+            assert_eq!(params.input_gain, dsp::db_to_gain(input_db));
+            assert_eq!(params.output_gain, dsp::db_to_gain(output_db));
+            assert_eq!(params.gate_threshold_db, gate_db);
+        }
+        let app = App::stopped(Settings {
+            input_gain_db: 6.0, output_gain_db: -6.0, gate_threshold_db: -50.0, ..Settings::default()
+        });
+        let params = app.params();
+        assert_eq!(params.input_gain, dsp::db_to_gain(6.0));
+        assert_eq!(params.output_gain, dsp::db_to_gain(-6.0));
+        assert_eq!(params.gate_threshold_db, -50.0);
     }
 
     #[test]

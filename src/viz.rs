@@ -7,13 +7,10 @@
 use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Id, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 
 use crate::config::Settings;
-use crate::dsp::{self, Model, HIGHPASS_HZ, HIGHPASS_RANGE, VOICE_THRESHOLD};
+use crate::dsp::{self, Model, GATE_THRESHOLD_RANGE, HIGHPASS_HZ, HIGHPASS_RANGE, INPUT_GAIN_RANGE, OUTPUT_GAIN_RANGE, VOICE_THRESHOLD};
 use crate::engine::{ScopeFrame, SCOPE_FRAMES};
 use crate::gui::{AMBER, CYAN, GREEN, RED, VIOLET};
 
-const INPUT_GAIN: std::ops::RangeInclusive<f32> = -12.0..=24.0;
-const OUTPUT_GAIN: std::ops::RangeInclusive<f32> = -24.0..=12.0;
-const GATE_THRESHOLD: std::ops::RangeInclusive<f32> = -80.0..=-20.0;
 const VOICE_RANGE: std::ops::RangeInclusive<f32> = 0.05..=0.95;
 /// The bottom of the level pictures, dBFS.
 const FLOOR_DB: f32 = -70.0;
@@ -201,8 +198,8 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
             idle(p, r, "Start OpenMic to see your voice live", weak);
         }
     });
-    changed.settings |= drag_by(&input.picture, &mut s.input_gain_db, 0.25, INPUT_GAIN)
-        | step_by(&mut s.input_gain_db, input.notches, 0.5, INPUT_GAIN)
+    changed.settings |= drag_by(&input.picture, &mut s.input_gain_db, 0.25, INPUT_GAIN_RANGE)
+        | step_by(&mut s.input_gain_db, input.notches, 0.5, INPUT_GAIN_RANGE)
         | reset_on_double_click(&input.picture, &mut s.input_gain_db, 0.0);
 
     // ---- Remove rumble ---------------------------------------------------
@@ -327,8 +324,8 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
     changed.settings |= drag_to(&input.picture, input.picture.rect, &mut s.gate_threshold_db, |pos, rect| {
         let r = rect.shrink2(Vec2::new(4.0, 2.0));
         let db = FLOOR_DB * (pos.y - r.top()) / r.height();
-        db.round().clamp(*GATE_THRESHOLD.start(), *GATE_THRESHOLD.end())
-    }) | step_by(&mut s.gate_threshold_db, input.notches, 1.0, GATE_THRESHOLD)
+        db.round().clamp(*GATE_THRESHOLD_RANGE.start(), *GATE_THRESHOLD_RANGE.end())
+    }) | step_by(&mut s.gate_threshold_db, input.notches, 1.0, GATE_THRESHOLD_RANGE)
         | reset_on_double_click(&input.picture, &mut s.gate_threshold_db, -50.0);
 
     // ---- To Discord --------------------------------------------------------
@@ -349,8 +346,8 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
             idle(p, r, "what Discord hears, after everything above", weak);
         }
     });
-    changed.settings |= drag_by(&input.picture, &mut s.output_gain_db, 0.25, OUTPUT_GAIN)
-        | step_by(&mut s.output_gain_db, input.notches, 0.5, OUTPUT_GAIN)
+    changed.settings |= drag_by(&input.picture, &mut s.output_gain_db, 0.25, OUTPUT_GAIN_RANGE)
+        | step_by(&mut s.output_gain_db, input.notches, 0.5, OUTPUT_GAIN_RANGE)
         | reset_on_double_click(&input.picture, &mut s.output_gain_db, 0.0);
 
     // ---- Hear yourself (headphone monitor) --------------------------------
@@ -478,18 +475,18 @@ mod tests {
     #[test]
     fn wheel_steps_land_on_the_grid_and_respect_limits() {
         let mut gain = 3.37;
-        assert!(step_by(&mut gain, 1.0, 0.5, INPUT_GAIN));
+        assert!(step_by(&mut gain, 1.0, 0.5, INPUT_GAIN_RANGE));
         assert_eq!(gain, 4.0, "snaps a dragged value onto the 0.5 dB grid");
-        step_by(&mut gain, -3.0, 0.5, INPUT_GAIN);
+        step_by(&mut gain, -3.0, 0.5, INPUT_GAIN_RANGE);
         assert_eq!(gain, 2.5);
         let mut top = 24.0;
-        assert!(!step_by(&mut top, 1.0, 0.5, INPUT_GAIN), "clamped at the maximum");
+        assert!(!step_by(&mut top, 1.0, 0.5, INPUT_GAIN_RANGE), "clamped at the maximum");
         let mut threshold = 0.6;
         step_by(&mut threshold, 1.0, 0.01, 0.05..=0.95);
         assert!((threshold - 0.61).abs() < 1e-6);
         assert!(!step_by(&mut threshold, 0.0, 0.01, 0.05..=0.95), "no wheel, no change");
         gain = 3.37;
-        assert!(!step_by(&mut gain, 0.25, 0.5, INPUT_GAIN), "a partial notch cannot snap a dragged value");
+        assert!(!step_by(&mut gain, 0.25, 0.5, INPUT_GAIN_RANGE), "a partial notch cannot snap a dragged value");
     }
 
     #[test]

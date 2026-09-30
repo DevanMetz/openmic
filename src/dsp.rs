@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 pub const SR: u32 = 48_000;
 pub const FRAME: usize = 480; // 10 ms at 48 kHz, the RNNoise frame size
 
+/// Decibel limits shared by the voice controls and loaded DSP parameters.
+pub const INPUT_GAIN_RANGE: std::ops::RangeInclusive<f32> = -12.0..=24.0;
+pub const OUTPUT_GAIN_RANGE: std::ops::RangeInclusive<f32> = -24.0..=12.0;
+pub const GATE_THRESHOLD_RANGE: std::ops::RangeInclusive<f32> = -80.0..=-20.0;
+
 /// Which neural denoiser cleans the voice.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Model {
