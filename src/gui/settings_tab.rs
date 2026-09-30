@@ -206,7 +206,7 @@ impl App {
                                 };
                                 ui.selectable_value(&mut self.settings.speech_model, model, text);
                             }
-                        });
+                        }).response.on_hover_text("Applies to the next recording");
                     if self.settings.speech_model != before {
                         self.touch();
                     }
@@ -278,12 +278,20 @@ impl App {
                 self.dictation.start_download(model);
                 self.dictation_status = (format!("Downloading {}…", model.label()), CYAN);
             }
-        } else if ui.button("Remove").on_hover_text("Delete the downloaded model").clicked() {
-            self.dictation_status = match model.remove() {
-                Ok(()) => ("Model removed".into(), MUTED),
-                // Windows locks a model that's loaded.
-                Err(_) => ("In use: restart OpenMic to remove this model".into(), RED),
-            };
+        } else {
+            let in_use = self.dictation.busy()
+                || self.dictating.as_ref().is_some_and(|recording| recording.model == model);
+            if ui.add_enabled(!in_use, egui::Button::new("Remove"))
+                .on_hover_text("Delete the downloaded model")
+                .on_disabled_hover_text("Finish dictation before removing a speech model")
+                .clicked()
+            {
+                self.dictation_status = match model.remove() {
+                    Ok(()) => ("Model removed".into(), MUTED),
+                    // Windows locks a model that's loaded.
+                    Err(_) => ("In use: restart OpenMic to remove this model".into(), RED),
+                };
+            }
         }
     }
 }

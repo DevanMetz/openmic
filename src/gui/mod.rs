@@ -144,6 +144,8 @@ struct CachedClip {
 
 struct DictationRecording {
     recorder: Recorder,
+    /// Model selected and checked before this take started.
+    model: dictation::SpeechModel,
     /// Stop the way this take started, even if the preference changes.
     hold_to_talk: bool,
 }
@@ -1042,7 +1044,9 @@ impl App {
         // An empty choice falls back to the Windows default microphone.
         match Recorder::start(Source::Microphone, &self.settings.microphone) {
             Ok(recorder) => {
-                self.dictating = Some(DictationRecording { recorder, hold_to_talk: self.settings.dictation_hold });
+                self.dictating = Some(DictationRecording {
+                    recorder, model: self.settings.speech_model, hold_to_talk: self.settings.dictation_hold,
+                });
                 self.dictation_status = ("Listening…".into(), AMBER);
             }
             Err(e) => {
@@ -1054,19 +1058,27 @@ impl App {
 
     /// Stop recording and type what was said.
     fn stop_dictation(&mut self) {
-        let Some(recording) = self.dictating.take() else { return };
+        if let Some((model, take)) = self.finish_dictation() {
+            self.dictation.transcribe(model, take);
+        }
+    }
+
+    /// Finish and validate a take before handing it to the transcription worker.
+    fn finish_dictation(&mut self) -> Option<(dictation::SpeechModel, Take)> {
+        let recording = self.dictating.take()?;
         self.dictation_status = match recording.recorder.finish() {
             Ok(Some(take)) => {
                 if let Some(warning) = take.warning() {
                     self.dictation_status = (short(&format!("Dictation stopped: {warning}")), RED);
-                    return;
+                    return None;
                 }
-                self.dictation.transcribe(self.settings.speech_model, take);
-                ("Transcribing…".into(), CYAN)
+                self.dictation_status = ("Transcribing…".into(), CYAN);
+                return Some((recording.model, take));
             }
             Ok(None) => ("Nothing was heard".into(), MUTED),
             Err(e) => (short(&format!("{e:#}")), RED),
         };
+        None
     }
 
     /// End the current take without queueing transcription or typing.
@@ -1426,7 +1438,7 @@ mod tests {
         let mut app = App::stopped(Settings::default());
         let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
         recorder.report_skipped_for_test();
-        app.dictating = Some(DictationRecording { recorder, hold_to_talk: true });
+        app.dictating = Some(DictationRecording { recorder, model: app.settings.speech_model, hold_to_talk: true });
         app.stop_dictation();
         assert!(app.dictating.is_none());
         assert!(!app.dictation.busy());
@@ -1440,7 +1452,7 @@ mod tests {
         for hold_to_talk in [true, false] {
             let mut app = App::stopped(Settings { dictation_hold: hold_to_talk, ..Settings::default() });
             app.dictating = Some(DictationRecording {
-                recorder: Recorder::from_samples_for_test(&[]), hold_to_talk,
+                recorder: Recorder::from_samples_for_test(&[]), model: app.settings.speech_model, hold_to_talk,
             });
             app.settings.dictation_hold = !hold_to_talk;
             let (ignored, stops) = if hold_to_talk {
@@ -1464,7 +1476,7 @@ mod tests {
         app.last_dictation = "Previous transcript".into();
         for hold_to_talk in [true, false] {
             app.dictating = Some(DictationRecording {
-                recorder: Recorder::from_samples_for_test(&[0.25; 96]), hold_to_talk,
+                recorder: Recorder::from_samples_for_test(&[0.25; 96]), model: app.settings.speech_model, hold_to_talk,
             });
             app.discard_dictation();
             assert!(app.dictating.is_none());
@@ -1476,6 +1488,24 @@ mod tests {
             assert!(app.dictating.is_none());
             assert!(!app.dictation.busy(), "a late key release must not transcribe the discarded take");
         }
+    }
+
+    #[test]
+    fn finished_dictation_keeps_its_original_model_after_the_preference_changes() {
+        let mut app = App::stopped(Settings::default());
+        app.dictating = Some(DictationRecording {
+            recorder: Recorder::from_samples_for_test(&[0.25; 96]),
+            model: dictation::SpeechModel::TinyEn,
+            hold_to_talk: false,
+        });
+        app.settings.speech_model = dictation::SpeechModel::Small;
+
+        let (model, take) = app.finish_dictation().expect("take prepared for transcription");
+        assert_eq!(model, dictation::SpeechModel::TinyEn);
+        assert_eq!(take.samples().unwrap().len(), 48);
+        assert!(app.dictating.is_none());
+        assert_eq!(app.settings.speech_model, dictation::SpeechModel::Small,
+            "keep the new preference for the next recording");
     }
 
     #[test]

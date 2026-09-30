@@ -142,6 +142,8 @@ On the **Dictation** page, pick a model under **Speech to text** and click **Dow
 
 While listening, **Discard recording** on the Dictation page stops the current take without transcribing or typing it. This also works if its shortcut has been cleared or reassigned; the previous transcript stays available to copy.
 
+Changes to the speech model or hold/toggle behavior apply to the next recording. A take keeps the model it started with, and models needed by active dictation cannot be removed from the page.
+
 ## Logs
 
 OpenMic writes `openmic.log` in its settings folder (`%APPDATA%\OpenMic\OpenMic\config`): startup, processing starts and stops, lost and reconnected devices, audio warnings, default-mic changes, update activity and crashes. Past 1 MB it is renamed to `openmic.old.log` at the next launch. Open the folder from **Settings → Open log folder** and attach the log to a bug report.
