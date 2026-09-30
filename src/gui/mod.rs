@@ -1026,7 +1026,7 @@ impl App {
             return;
         }
         if !self.settings.speech_model.is_downloaded() {
-            self.dictation_status = ("Download a speech model under Settings first".into(), AMBER);
+            self.dictation_status = ("Download a speech model on the Dictation page first".into(), AMBER);
             return;
         }
         // An empty choice falls back to the Windows default microphone.

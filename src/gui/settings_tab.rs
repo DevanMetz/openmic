@@ -208,7 +208,7 @@ impl App {
                         self.touch();
                     }
                 });
-                ui.weak("Your words are typed into the app you're using. Set the shortcut under Hotkeys.");
+                ui.weak("Your words are typed into the app you're using. Set your Shortcut above.");
 
                 let working = self.dictating.is_some() || self.dictation.busy();
                 if working || !self.dictation_status.0.is_empty() {
