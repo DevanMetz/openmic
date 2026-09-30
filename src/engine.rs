@@ -150,7 +150,10 @@ impl OutQueue {
     }
 
     fn target(&self) -> usize {
-        self.base_target.max(2 * self.period.load(Ordering::Relaxed))
+        // Large device callbacks must not leave priming waiting for more
+        // samples than this queue can ever hold.
+        self.base_target.max(self.period.load(Ordering::Relaxed).saturating_mul(2))
+            .min(self.samples.capacity())
     }
 
     fn push(&self, s: f32) {
@@ -840,6 +843,28 @@ mod tests {
         assert!(is_transient(&ErrorKind::RealtimeDenied.into()));
         assert!(!is_transient(&ErrorKind::DeviceNotAvailable.into()));
         assert!(!is_transient(&ErrorKind::StreamInvalidated.into()));
+    }
+
+    #[test]
+    fn large_device_callbacks_can_prime_within_the_queue_capacity() {
+        for extra in [0, 128] {
+            let queue = OutQueue::new(48_000);
+            let capacity = queue.samples.capacity();
+            let frames = if extra == 0 { capacity / 2 + 1 } else { capacity + extra };
+            let mut output = vec![1.0f32; frames * 2];
+            for _ in 0..capacity {
+                queue.push(0.25);
+            }
+            queue.fill(&mut output, 2);
+
+            assert_eq!(queue.target(), capacity, "the priming target must be reachable");
+            let played = frames.min(capacity);
+            assert!(output[..played * 2].iter().all(|sample| *sample == 0.25),
+                "a full queue must play, even when two device periods would not fit");
+            assert!(output[played * 2..].iter().all(|sample| *sample == 0.0), "pad an oversized callback with silence");
+            assert_eq!(queue.samples.len(), capacity - played);
+            assert_eq!(queue.primed.load(Ordering::Relaxed), frames <= capacity);
+        }
     }
 
     #[test]
