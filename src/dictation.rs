@@ -108,6 +108,7 @@ const MIN_SECONDS: f32 = 0.3;
 #[derive(Debug)]
 pub enum Event {
     Downloaded(SpeechModel),
+    DownloadCancelled,
     DownloadFailed(String),
     /// Keep recognized words available to copy even if Windows refuses typing.
     Transcribed { text: String, typing_error: Option<String> },
@@ -167,6 +168,7 @@ impl Dictation {
         let download = self.download.take().unwrap();
         Some(match download.thread.join() {
             Ok(Ok(())) => Event::Downloaded(download.model),
+            Ok(Err(_)) if download.cancel.load(Ordering::Relaxed) => Event::DownloadCancelled,
             Ok(Err(error)) => Event::DownloadFailed(format!("{error:#}")),
             Err(_) => Event::DownloadFailed("Speech model download stopped; try downloading again".into()),
         })
@@ -210,6 +212,10 @@ impl Dictation {
         if let Some(d) = &self.download {
             d.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    pub fn download_cancelling(&self) -> bool {
+        self.download.as_ref().is_some_and(|download| download.cancel.load(Ordering::Relaxed))
     }
 
     /// Transcribe `take` and type the words into the focused app.
@@ -907,8 +913,21 @@ mod tests {
         let thread = thread::spawn(|| panic!("simulated download failure"));
         wait_for_thread(&thread);
         dictation.download = Some(test_download(thread));
+        dictation.cancel_download(); // a crash must not be hidden by a late cancellation
         assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error.contains("try downloading again")));
         assert!(dictation.download_progress().is_none());
+        assert!(dictation.poll().is_none());
+    }
+
+    #[test]
+    fn a_finished_download_stays_successful_after_a_late_cancellation() {
+        let mut dictation = Dictation::new(|| {});
+        let thread = thread::spawn(|| Ok(()));
+        wait_for_thread(&thread);
+        dictation.download = Some(test_download(thread));
+        dictation.cancel_download();
+        assert!(matches!(dictation.poll(), Some(Event::Downloaded(SpeechModel::TinyEn))));
+        assert!(dictation.download_progress().is_none() && !dictation.download_cancelling());
         assert!(dictation.poll().is_none());
     }
 
@@ -926,13 +945,16 @@ mod tests {
         dictation.events.0.send(Event::DownloadFailed("earlier startup failed".into())).unwrap();
         assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "earlier startup failed"));
         assert!(dictation.download_progress().is_some());
+        assert!(!dictation.download_cancelling());
         assert!(dictation.poll().is_none());
         dictation.cancel_download();
-        assert!(dictation.download.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert!(dictation.download_cancelling());
         drop(release);
         wait_for_thread(&dictation.download.as_ref().unwrap().thread);
-        assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "download cancelled"));
+        assert!(matches!(dictation.poll(), Some(Event::DownloadCancelled)));
         assert!(dictation.download_progress().is_none());
+        assert!(!dictation.download_cancelling());
+        assert!(dictation.poll().is_none(), "cancellation is reported once");
     }
 
     #[test]

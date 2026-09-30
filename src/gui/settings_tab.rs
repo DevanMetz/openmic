@@ -276,8 +276,10 @@ impl App {
                     .text(format!("{} MB", done / 1_000_000)),
             )
             .on_hover_text(format!("Downloading {}", downloading.label()));
-            if ui.button("Cancel").clicked() {
+            let cancelling = self.dictation.download_cancelling();
+            if ui.add_enabled(!cancelling, egui::Button::new(if cancelling { "Cancelling…" } else { "Cancel" })).clicked() {
                 self.dictation.cancel_download();
+                self.dictation_status = ("Cancelling model download…".into(), MUTED);
             }
         } else if !model.is_downloaded() {
             if ui.button("Download").on_hover_text("Downloads once from Hugging Face").clicked() {

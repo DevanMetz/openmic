@@ -1102,6 +1102,7 @@ impl App {
         while let Some(event) = self.dictation.poll() {
             self.dictation_status = match event {
                 dictation::Event::Downloaded(model) => (format!("{} is ready", model.label()), GREEN),
+                dictation::Event::DownloadCancelled => ("Model download cancelled".into(), MUTED),
                 dictation::Event::DownloadFailed(e) => {
                     logfile::warn(format_args!("speech model download failed: {e}"));
                     (short(&e), RED)
