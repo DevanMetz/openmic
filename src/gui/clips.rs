@@ -219,6 +219,10 @@ impl App {
     fn play_decoded_clip(&mut self, pad: &Pad, samples: &Arc<Vec<f32>>) {
         let Some(engine) = &self.engine else { return };
         let clip = Clip::new(clip_key(&pad.path), Arc::clone(samples), pad.volume).with_trim(pad.start, pad.end);
+        if clip.samples().is_empty() {
+            self.sound_status = (format!("No audio in the trim for {}. Right-click the pad to adjust it.", pad.display_name()), AMBER);
+            return;
+        }
         engine.play_sound(clip, self.settings.overlap_clips);
         self.sound_status = (format!("Playing · {}", pad.display_name()), GREEN);
         self.sync_clip_progress();
@@ -585,6 +589,35 @@ mod tests {
         app.play_clip(0, &ctx);
         assert!(app.clip_loads.is_none(), "cached clips start without a worker");
         assert_eq!(app.playing, [clip_key(&path)]);
+    }
+
+    #[test]
+    fn an_empty_trim_explains_the_silent_pad_and_can_be_corrected() {
+        let path = PathBuf::from("shortened.wav");
+        let samples = Arc::new(vec![0.25; dsp::SR as usize]);
+        for (start, end) in [(2.0, None), (0.5, Some(0.5))] {
+            let mut app = app_with(std::slice::from_ref(&path));
+            app.settings.overlap_clips = false;
+            app.engine.as_ref().unwrap().play_sound(Clip::new(7, Arc::clone(&samples), 1.0), false);
+            app.sync_clip_progress();
+            let before = app.engine.as_ref().unwrap().clip_progress();
+            let pad = Pad { start, end, ..app.settings.sounds[0].clone() };
+            app.play_decoded_clip(&pad, &samples);
+            app.sync_clip_progress();
+
+            assert_eq!(app.engine.as_ref().unwrap().clip_progress(), before, "an empty pad must not interrupt a playing clip");
+            assert!(app.sound_status.0.contains("No audio in the trim for shortened"));
+            assert!(app.sound_status.0.contains("Right-click the pad"));
+            assert_eq!(app.sound_status.1, AMBER);
+
+            let corrected = Pad { start: 0.25, end: Some(0.75), ..pad };
+            app.play_decoded_clip(&corrected, &samples);
+            assert_eq!(app.sound_status, ("Playing · shortened".into(), GREEN));
+            let clips = app.engine.as_ref().unwrap().take_clips();
+            assert_eq!(clips.len(), 1);
+            assert_eq!(clips[0].key, clip_key(&path));
+            assert_eq!(clips[0].samples().len(), 24_000);
+        }
     }
 
     #[test]
