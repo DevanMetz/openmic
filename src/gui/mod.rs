@@ -865,6 +865,8 @@ impl App {
             Some("Save or discard your recording first")
         } else if self.dictating.is_some() || self.dictation.busy() {
             Some("Wait for speech to text to finish")
+        } else if self.dictation.download_progress().is_some() {
+            Some("Wait for the speech model download to finish or cancel it")
         } else if self.clip_import.is_some() {
             Some("Wait for clip imports to finish or cancel them")
         } else {
