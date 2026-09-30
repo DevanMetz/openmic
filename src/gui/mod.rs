@@ -1383,9 +1383,9 @@ fn is_modifier(key: egui::Key) -> bool {
 fn on_a_monitor([x, y]: [i32; 2]) -> bool {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
-    // A little inside the corner, where the title bar is.
+    // A point inside the main title bar or the strip's microphone.
     // SAFETY: a pure query on a point.
-    !unsafe { MonitorFromPoint(POINT { x: x + 40, y: y + 20 }, MONITOR_DEFAULTTONULL) }.is_invalid()
+    !unsafe { MonitorFromPoint(POINT { x: x.saturating_add(16), y: y.saturating_add(16) }, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
 #[cfg(not(windows))]

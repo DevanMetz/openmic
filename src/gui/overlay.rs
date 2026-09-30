@@ -203,7 +203,7 @@ impl App {
             .with_always_on_top()
             .with_taskbar(false);
         let meter = self.meter();
-        let saved = self.settings.overlay_position;
+        let saved = self.settings.overlay_position.filter(|&px| super::on_a_monitor(px));
         let placement = &mut self.overlay_placement;
         let (actions, seen) =
             ctx.show_viewport_immediate(ViewportId::from_hash_of("openmic-level-meter"), builder, |ui, _| {
@@ -662,6 +662,27 @@ mod tests {
         }
         assert_eq!(Placement::default().step(None, outer, Some(1.0)), (None, false));
         assert_eq!(Placement::default().step(Some([1, 1]), None, Some(1.0)), (None, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_strip_saved_off_every_monitor_keeps_its_default_position() {
+        for saved in [[-100_000, -100_000], [i32::MAX, i32::MAX]] {
+            let mut app = App::stopped(Settings { collapsed: true, overlay_position: Some(saved), ..Settings::default() });
+            let ctx = egui::Context::default();
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(DEFAULT_WIDTH, HEIGHT));
+            let mut input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+            let info = input.viewports.get_mut(&ViewportId::ROOT).unwrap();
+            info.outer_rect = Some(rect);
+            info.native_pixels_per_point = Some(1.0);
+            let output = ctx.run_ui(input, |ui| app.show_overlay(ui.ctx()));
+            assert!(app.overlay_placement.placed, "the strip was shown");
+            assert!(
+                output.viewport_output.into_values().flat_map(|v| v.commands)
+                    .all(|command| !matches!(command, ViewportCommand::OuterPosition(_))),
+                "an off-screen saved position must not move the strip"
+            );
+        }
     }
 
     #[test]
