@@ -18,6 +18,14 @@ const RESULT_SHOWN: Duration = Duration::from_secs(8);
 pub(super) const UPDATED_SHOWN: Duration = Duration::from_secs(30);
 
 impl App {
+    pub(super) fn poll_updates(&mut self) {
+        self.updater.tick(self.settings.check_for_updates);
+        if self.manual_update_check && !matches!(self.updater.status(), Status::Checking) {
+            self.manual_update_check = false;
+            self.update_checked_at = Some(Instant::now());
+        }
+    }
+
     /// The version beside the title; clicking it checks for updates now.
     pub(super) fn draw_version(&mut self, ui: &mut egui::Ui) {
         let status = self.updater.status();
@@ -27,7 +35,8 @@ impl App {
             .on_hover_text(if idle { "Check for updates" } else { "Update in progress" });
         if idle && button.clicked() {
             self.update_error = None;
-            self.update_checked_at = Some(Instant::now());
+            self.manual_update_check = true;
+            self.update_checked_at = None;
             self.updater.check();
         }
     }

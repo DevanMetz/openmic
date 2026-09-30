@@ -234,7 +234,9 @@ pub struct App {
     updater: Updater,
     /// When this launch started, if it is a freshly installed update.
     updated_at: Option<Instant>,
-    /// When the user last clicked the version to check for updates.
+    /// A manual check is waiting for its result.
+    manual_update_check: bool,
+    /// When the last manual check's result became available.
     update_checked_at: Option<Instant>,
     /// The "What's new" window is open.
     show_release_notes: bool,
@@ -374,6 +376,7 @@ impl App {
             confirm_quit: false,
             updater: Updater::new(false, || {}),
             updated_at: None,
+            manual_update_check: false,
             update_checked_at: None,
             show_release_notes: false,
             strip_suppressed: false,
@@ -1138,7 +1141,7 @@ impl App {
         self.poll_dictation();
         self.poll_mic_test();
         self.poll_clip_import(ctx);
-        self.updater.tick(self.settings.check_for_updates);
+        self.poll_updates();
         self.sync_default_mic();
         if (cable_input(&self.outputs).is_none() || self.waiting_for_device)
             && self.last_device_poll.elapsed() >= DEVICE_POLL
@@ -2199,6 +2202,46 @@ mod tests {
             let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} not shown"));
             assert!(rect.top() < 60.0, "{needle} belongs in the title row: {rect:?}");
             assert!(visible(&texts, "Clean voice").is_none(), "the tagline gives way to {needle}");
+        }
+    }
+
+    #[test]
+    fn manual_update_results_get_their_display_time_after_checking_finishes() {
+        use crate::update::Status;
+        for (status, message) in [
+            (Status::UpToDate, "is up to date"),
+            (Status::Failed("Connection timed out".into()), "Couldn't check for updates"),
+        ] {
+            let mut app = App::stopped(Settings::default());
+            app.manual_update_check = true;
+            app.updater.set_status_for_test(Status::Checking);
+            app.poll_updates();
+            assert!(app.manual_update_check && app.update_checked_at.is_none(),
+                "the result timer must not run during a slow check");
+
+            let completed = Instant::now();
+            app.updater.set_status_for_test(status.clone());
+            app.poll_updates();
+            assert!(!app.manual_update_check);
+            let shown_at = app.update_checked_at.unwrap();
+            assert!(shown_at >= completed);
+            let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+            assert!(visible(&texts, message).is_some(), "{message} must be shown when the result arrives");
+            app.poll_updates();
+            assert_eq!(app.update_checked_at, Some(shown_at), "polling must not extend the result forever");
+
+            let expired = Instant::now() - Duration::from_secs(60);
+            app.update_checked_at = Some(expired);
+            let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+            assert!(visible(&texts, message).is_none());
+
+            app.updater.set_status_for_test(Status::Checking);
+            app.poll_updates();
+            app.updater.set_status_for_test(status);
+            app.poll_updates();
+            assert_eq!(app.update_checked_at, Some(expired), "an automatic check must not restart the manual timer");
+            let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+            assert!(visible(&texts, message).is_none(), "automatic check results stay quiet");
         }
     }
 
