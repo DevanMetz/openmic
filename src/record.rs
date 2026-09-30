@@ -118,7 +118,7 @@ impl Recorder {
         let mut peaks = PeakTracker::new(48_000, 2);
         peaks.push(samples);
         Self {
-            stream: None, writer: Some(thread::spawn(move || Ok(data_bytes))), path: Some(path),
+            stream: None, writer: None, path: Some(path),
             stop: Arc::default(), peaks: Arc::new(Mutex::new(peaks)), bytes: Arc::new(AtomicU64::new(data_bytes)),
             sample_rate: 48_000, channels: 2, started: Instant::now(),
             full: Arc::default(), skipped: Arc::default(), skipped_reported: false, error: Arc::default(),
@@ -289,7 +289,10 @@ impl Recorder {
     /// A capture failure. Keep it until finish so a recovered take carries
     /// its warning even after the UI has noticed and stopped the recording.
     pub fn error(&self) -> Option<String> {
-        self.error.lock().clone()
+        self.error.lock().clone().or_else(|| {
+            self.writer.as_ref().is_some_and(|writer| writer.is_finished())
+                .then(|| "Recording writer stopped unexpectedly".into())
+        })
     }
 
     /// Whether audio was dropped because the disk fell behind (reported once).
@@ -336,10 +339,17 @@ impl Recorder {
         self.stream.take(); // dropping a cpal Stream stops it
         self.stop.store(true, Ordering::Relaxed);
         match self.writer.take() {
-            Some(writer) => writer
-                .join()
-                .map_err(|_| anyhow::anyhow!("recording writer crashed"))?,
-            None => Ok(0),
+            Some(writer) => match writer.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    self.error.lock().get_or_insert_with(|| "Recording writer stopped unexpectedly".into());
+                    let path = self.path.as_deref().context("recording already finished")?;
+                    let file = OpenOptions::new().read(true).write(true).open(path)
+                        .context("open recording after writer failure")?;
+                    recover_recording(file, self.channels)
+                }
+            },
+            None => Ok(self.bytes()),
         }
     }
 }
@@ -483,20 +493,25 @@ impl WavWriter {
     /// Discarding the remaining buffer lets the header be patched without
     /// retrying the failed append (which may need space the disk doesn't have).
     fn recover(self) -> Result<u64> {
-        let (mut file, _) = self.out.into_parts();
-        let length = file.metadata().context("read recording size")?.len();
-        let frame_bytes = u64::from(self.channels) * 2;
-        let data_bytes = length.saturating_sub(44) / frame_bytes * frame_bytes;
-        if data_bytes == 0 {
-            bail!("recording could not be saved: no complete audio frames reached disk");
-        }
-        file.set_len(44 + data_bytes).context("trim incomplete recording frame")?;
-        file.seek(SeekFrom::Start(4))?;
-        file.write_all(&(36 + data_bytes as u32).to_le_bytes())?;
-        file.seek(SeekFrom::Start(40))?;
-        file.write_all(&(data_bytes as u32).to_le_bytes()).context("repair recording header")?;
-        Ok(data_bytes)
+        let (file, _) = self.out.into_parts();
+        recover_recording(file, self.channels)
     }
+}
+
+/// Repair the header using only complete frames that actually reached disk.
+fn recover_recording(mut file: File, channels: u16) -> Result<u64> {
+    let length = file.metadata().context("read recording size")?.len();
+    let frame_bytes = u64::from(channels) * 2;
+    let data_bytes = length.saturating_sub(44) / frame_bytes * frame_bytes;
+    if data_bytes == 0 {
+        bail!("recording could not be saved: no complete audio frames reached disk");
+    }
+    file.set_len(44 + data_bytes).context("trim incomplete recording frame")?;
+    file.seek(SeekFrom::Start(4))?;
+    file.write_all(&(36 + data_bytes as u32).to_le_bytes())?;
+    file.seek(SeekFrom::Start(40))?;
+    file.write_all(&(data_bytes as u32).to_le_bytes()).context("repair recording header")?;
+    Ok(data_bytes)
 }
 
 /// A fresh temporary file for a take in progress.
@@ -791,6 +806,44 @@ mod tests {
         assert_eq!(samples.len(), 4);
         assert!(samples.iter().all(|sample| (*sample - 0.5).abs() < 0.001));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn crashed_writer_is_reported_and_keeps_recoverable_audio() {
+        for count in [0, 8] {
+            let mut recorder = Recorder::from_samples_for_test(&vec![0.5; count]);
+            let path = recorder.path.clone().unwrap();
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+            // A crashed writer has not finalized the data size in its header.
+            file.seek(SeekFrom::Start(40)).unwrap();
+            file.write_all(&0u32.to_le_bytes()).unwrap();
+            file.seek(SeekFrom::End(0)).unwrap();
+            file.write_all(&[0]).unwrap(); // incomplete frame must be dropped
+            drop(file);
+            recorder.writer = Some(thread::spawn(|| panic!("simulated recording writer failure")));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !recorder.writer.as_ref().unwrap().is_finished() {
+                assert!(Instant::now() < deadline, "writer did not exit");
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(recorder.error().as_deref(), Some("Recording writer stopped unexpectedly"));
+
+            let result = recorder.finish();
+            if count == 0 {
+                assert!(result.is_err(), "an empty file cannot be recovered");
+                assert!(!path.exists());
+            } else {
+                let take = result.unwrap().expect("recover complete audio frames");
+                assert_eq!(take.warning(), Some("Recording writer stopped unexpectedly"));
+                assert_eq!(take.frames, 4);
+                assert_eq!(fs::metadata(&path).unwrap().len(), 44 + 16);
+                let samples = take.samples().unwrap();
+                assert_eq!(samples.len(), 4);
+                assert!(samples.iter().all(|sample| (*sample - 0.5).abs() < 0.001));
+                drop(take);
+                assert!(!path.exists());
+            }
+        }
     }
 
     #[test]
