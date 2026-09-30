@@ -536,9 +536,21 @@ impl Engine {
         self.reports.lost.lock().take()
     }
 
-    /// Pop a fatal processing error, if any.
-    pub fn take_error(&self) -> Option<String> {
-        self.reports.fatal.lock().take()
+    /// Pop a fatal processing error, including an unexpectedly exited worker.
+    pub fn take_error(&mut self) -> Option<String> {
+        let exited = if self.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            // Join only a finished worker, so polling never waits for DSP.
+            let worker = self.worker.take().unwrap();
+            let _ = worker.join();
+            !self.stop.load(Ordering::Relaxed)
+        } else {
+            false
+        };
+        // Read after joining so a detailed error written just before exit
+        // takes precedence over the fallback message.
+        self.reports.fatal.lock().take().or_else(|| {
+            exited.then(|| "Audio processing stopped unexpectedly; click Start to retry".into())
+        })
     }
 
     pub fn stop(mut self) {
@@ -675,6 +687,45 @@ fn rms_db(samples: impl ExactSizeIterator<Item = f32>) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_exit_is_reported_once_without_hiding_processing_errors() {
+        for outcome in ["panic", "return", "reported error", "shutdown"] {
+            let mut engine = Engine::for_test();
+            let reports = Arc::clone(&engine.reports);
+            if outcome == "shutdown" {
+                engine.stop.store(true, Ordering::Relaxed);
+            }
+            engine.worker = Some(thread::spawn(move || match outcome {
+                "panic" => panic!("simulated DSP worker failure"),
+                "reported error" => *reports.fatal.lock() = Some("processing frame failed".into()),
+                _ => {}
+            }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !engine.worker.as_ref().unwrap().is_finished() {
+                assert!(std::time::Instant::now() < deadline, "worker did not exit");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let error = engine.take_error();
+            match outcome {
+                "reported error" => assert_eq!(error.as_deref(), Some("processing frame failed")),
+                "shutdown" => assert!(error.is_none(), "a requested stop is not a failure"),
+                _ => assert!(error.unwrap().contains("click Start to retry")),
+            }
+            assert!(engine.worker.is_none());
+            assert!(engine.take_error().is_none(), "report the exit only once");
+        }
+    }
+
+    #[test]
+    fn polling_a_live_worker_does_not_wait_for_its_exit() {
+        let mut engine = Engine::for_test();
+        let (release, wait) = crossbeam_channel::bounded::<()>(0);
+        engine.worker = Some(thread::spawn(move || { let _ = wait.recv_timeout(Duration::from_secs(3)); }));
+        assert!(engine.take_error().is_none());
+        assert!(engine.worker.is_some(), "keep the active worker");
+        drop(release);
+    }
 
     #[test]
     fn a_short_mic_backlog_is_left_alone_and_a_long_one_trimmed() {

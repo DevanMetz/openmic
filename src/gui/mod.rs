@@ -599,7 +599,7 @@ impl App {
     }
 
     fn poll_engine(&mut self) {
-        let err = self.engine.as_ref().and_then(Engine::take_error);
+        let err = self.engine.as_mut().and_then(Engine::take_error);
         if let Some(e) = err {
             logfile::error(format_args!("processing failed: {e}"));
             self.stop_engine(false);
