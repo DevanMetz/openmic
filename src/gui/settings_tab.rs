@@ -239,6 +239,13 @@ impl App {
                         ui.label(RichText::new(&self.dictation_status.0).color(self.dictation_status.1));
                     });
                 }
+                if self.dictating.is_some()
+                    && ui.button("Discard recording")
+                        .on_hover_text("Stop listening and discard this take; nothing from it will be typed")
+                        .clicked()
+                {
+                    self.discard_dictation();
+                }
                 if !self.last_dictation.is_empty() {
                     ui.horizontal(|ui| {
                         if ui.small_button("Copy").clicked() {

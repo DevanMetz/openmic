@@ -1069,6 +1069,13 @@ impl App {
         };
     }
 
+    /// End the current take without queueing transcription or typing.
+    fn discard_dictation(&mut self) {
+        if self.dictating.take().is_some() {
+            self.dictation_status = ("Dictation recording discarded".into(), MUTED);
+        }
+    }
+
     fn poll_dictation(&mut self) {
         if let Some(e) = self.dictating.as_ref().and_then(|recording| recording.recorder.error()) {
             self.dictating = None;
@@ -1448,6 +1455,26 @@ mod tests {
             assert!(!app.dictation.busy(), "the empty fixture never loads a speech model");
             assert_eq!(app.dictation_status.0, "Nothing was heard");
             assert_eq!(app.settings.dictation_hold, !hold_to_talk, "keep the preference for the next take");
+        }
+    }
+
+    #[test]
+    fn discarding_dictation_stops_capture_without_typing_or_losing_the_previous_transcript() {
+        let mut app = App::stopped(Settings::default());
+        app.last_dictation = "Previous transcript".into();
+        for hold_to_talk in [true, false] {
+            app.dictating = Some(DictationRecording {
+                recorder: Recorder::from_samples_for_test(&[0.25; 96]), hold_to_talk,
+            });
+            app.discard_dictation();
+            assert!(app.dictating.is_none());
+            assert!(!app.dictation.busy(), "discarded audio must never reach the transcription worker");
+            assert_eq!(app.last_dictation, "Previous transcript");
+            assert_eq!(app.dictation_status.0, "Dictation recording discarded");
+
+            app.run_command(&egui::Context::default(), Command::DictateReleased);
+            assert!(app.dictating.is_none());
+            assert!(!app.dictation.busy(), "a late key release must not transcribe the discarded take");
         }
     }
 
