@@ -427,8 +427,16 @@ impl App {
                 });
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Device").weak());
-                    match self.record_source {
-                        Source::Microphone => {
+                    let recorded_device = self.recorder.as_ref().map(Recorder::device_name)
+                        .or_else(|| self.take.as_ref().map(|take| take.device_name()));
+                    match (self.record_source, recorded_device) {
+                        (_, Some(name)) => {
+                            ui.add_sized(
+                                [ui.available_width().min(520.0), 18.0],
+                                egui::Label::new(name).truncate(),
+                            ).on_hover_text(name);
+                        }
+                        (Source::Microphone, None) => {
                             let name = if self.settings.microphone.is_empty() {
                                 "Windows default microphone"
                             } else {
@@ -439,7 +447,7 @@ impl App {
                                 egui::Label::new(name).truncate(),
                             );
                         }
-                        Source::Computer => {
+                        (Source::Computer, None) => {
                             let label = if self.record_output.is_empty() {
                                 "Windows default output".to_owned()
                             } else {
@@ -1264,6 +1272,39 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn recording_and_take_labels_keep_the_device_that_was_opened() {
+        for source in [Source::Microphone, Source::Computer] {
+            let mut app = App::stopped(Default::default());
+            app.page = super::super::Page::Record;
+            app.record_source = source;
+            let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+            let recorded_device = recorder.device_name().to_owned();
+            app.recorder = Some(recorder);
+            app.settings.microphone = "Next microphone".into();
+            app.record_output = "Next playback device".into();
+            let next_device = match source {
+                Source::Microphone => app.settings.microphone.clone(),
+                Source::Computer => app.record_output.clone(),
+            };
+            let ctx = egui::Context::default();
+
+            for finished in [false, true] {
+                if finished {
+                    app.stop_recording();
+                    assert_eq!(app.take.as_ref().unwrap().device_name(), recorded_device);
+                }
+                let texts = board(&mut app, &ctx, Vec::new());
+                assert!(texts.contains(&recorded_device), "show the captured device while recording and after stopping");
+                assert!(!texts.contains(&next_device), "a new routing choice belongs to the next take");
+            }
+            app.take = None;
+            let texts = board(&mut app, &ctx, Vec::new());
+            assert!(texts.contains(&next_device), "return to the selected route once the take is discarded");
+            assert!(!texts.contains(&recorded_device));
+        }
+    }
 
     #[test]
     fn stopping_after_an_audio_gap_keeps_the_take_and_its_warning() {

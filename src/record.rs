@@ -38,6 +38,8 @@ pub enum Source {
 pub struct Recorder {
     stream: Option<Stream>,
     writer: Option<JoinHandle<Result<u64>>>,
+    /// The device actually opened, even when the caller selected a default.
+    device_name: String,
     /// The file being written; removed if the recorder is dropped unfinished.
     path: Option<PathBuf>,
     stop: Arc<AtomicBool>,
@@ -57,6 +59,7 @@ pub struct Recorder {
 /// added to the soundboard, or discarded (dropped).
 pub struct Take {
     path: PathBuf,
+    device_name: String,
     sample_rate: u32,
     frames: u64,
     /// Peak level per 10 ms block, for the waveform.
@@ -119,6 +122,7 @@ impl Recorder {
         peaks.push(samples);
         Self {
             stream: None, writer: None, path: Some(path),
+            device_name: "Test recording device".into(),
             stop: Arc::default(), peaks: Arc::new(Mutex::new(peaks)), bytes: Arc::new(AtomicU64::new(data_bytes)),
             sample_rate: 48_000, channels: 2, started: Instant::now(),
             full: Arc::default(), skipped: Arc::default(), skipped_reported: false, error: Arc::default(),
@@ -188,6 +192,7 @@ impl Recorder {
         let mut recorder = Self {
             stream: None,
             writer: None,
+            device_name: device.to_string(),
             path: Some(path.clone()),
             stop: Arc::default(),
             peaks: Arc::new(Mutex::new(PeakTracker::new(sample_rate, channels))),
@@ -274,6 +279,10 @@ impl Recorder {
         Ok(recorder)
     }
 
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
@@ -327,6 +336,7 @@ impl Recorder {
         }
         let take = Take {
             path,
+            device_name: std::mem::take(&mut self.device_name),
             sample_rate: self.sample_rate,
             frames: data_bytes / frame_bytes,
             peaks: self.peaks.lock().recent(usize::MAX),
@@ -552,6 +562,10 @@ fn copy_recording(source: &mut impl Read, to: &Path) -> Result<()> {
 }
 
 impl Take {
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
     }
@@ -868,6 +882,7 @@ mod tests {
         let recorder = Recorder {
             stream: None,
             writer: Some(writer),
+            device_name: "Test recording device".into(),
             path: Some(path),
             stop,
             peaks: Arc::new(Mutex::new(PeakTracker::new(48_000, 2))),
