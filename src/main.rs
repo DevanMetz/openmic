@@ -29,10 +29,11 @@ use eframe::egui;
 fn main() -> eframe::Result<()> {
     // After an update, wait for the old copy to quit before claiming the
     // single-instance lock and the audio devices.
-    let updated = update::finish_update();
+    let updated = update::wait_for_previous_version();
     let Ok(instance) = instance::acquire() else {
         return Ok(()); // the running copy shows its window instead
     };
+    update::finish_update();
     logfile::init();
     logfile::info(format_args!(
         "OpenMic v{}{} started{}",

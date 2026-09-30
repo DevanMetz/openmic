@@ -282,21 +282,30 @@ fn roll_back(paths: &Paths) {
 
 /// Run at startup, before taking the single-instance lock. After an update,
 /// wait for the old copy to finish quitting (it restores the default mic
-/// and saves settings on the way out), then tidy its leftovers. Returns
-/// whether this launch is the new version starting up.
-pub fn finish_update() -> bool {
+/// and saves settings on the way out). Returns whether this launch is the
+/// new version starting up. This must not touch the running copy's files.
+pub fn wait_for_previous_version() -> bool {
     let mut args = std::env::args().skip_while(|a| a != AFTER_UPDATE_ARG).skip(1);
     let predecessor = args.next().and_then(|pid| pid.parse::<u32>().ok());
     if let Some(pid) = predecessor {
         wait_for_exit(pid, Duration::from_secs(20));
     }
-    if let Ok(paths) = Paths::current() {
-        // Present only after an update, or one that was never installed.
-        let _ = fs::remove_file(&paths.old);
-        let _ = fs::remove_file(&paths.staged);
-        let _ = fs::remove_file(paths.staged.with_extension("part"));
-    }
     predecessor.is_some()
+}
+
+/// Only the copy that acquired the single-instance lock may clean up.
+/// A second launch must leave a running download or staged update intact.
+pub fn finish_update() {
+    if let Ok(paths) = Paths::current() {
+        cleanup_update_files(&paths);
+    }
+}
+
+fn cleanup_update_files(paths: &Paths) {
+    // Present only after an update, or one that was never installed.
+    let _ = fs::remove_file(&paths.old);
+    let _ = fs::remove_file(&paths.staged);
+    let _ = fs::remove_file(paths.staged.with_extension("part"));
 }
 
 #[cfg(windows)]
@@ -824,6 +833,24 @@ mod tests {
         fs::write(&paths.exe, "old").unwrap();
         assert!(replace(&paths).is_err());
         assert_eq!(fs::read_to_string(&paths.exe).unwrap(), "old");
+    }
+
+    #[test]
+    fn startup_cleanup_only_removes_this_executables_update_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_exe(dir.path().join("openmic.exe"));
+        fs::write(&paths.exe, b"running executable").unwrap();
+        let leftovers = [&paths.old, &paths.staged, &paths.staged.with_extension("part")];
+        for path in leftovers { fs::write(path, b"earlier update").unwrap(); }
+        let another_exe = Paths::for_exe(dir.path().join("other.exe"));
+        fs::write(&another_exe.staged, b"another executable's update").unwrap();
+
+        cleanup_update_files(&paths);
+        assert_eq!(fs::read(&paths.exe).unwrap(), b"running executable");
+        for path in leftovers { assert!(!path.exists()); }
+        assert_eq!(fs::read(&another_exe.staged).unwrap(), b"another executable's update");
+        cleanup_update_files(&paths); // missing leftovers do not block startup
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     fn wait_for_worker(updater: &Updater) {
