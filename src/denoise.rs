@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 
 use crate::dsp::{apply_processing, HighPass, Model, Params, VoiceGate, FRAME, HIGHPASS_HZ};
 
@@ -426,8 +426,10 @@ impl DeepFilterWorker {
             };
         }
         self.seq += 1;
-        if self.requests.try_send((self.seq, *dry, strength)).is_err() {
-            return Ok(None); // worker backed up; skip rather than block
+        match self.requests.try_send((self.seq, *dry, strength)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Ok(None), // worker backed up; skip rather than block
+            Err(TrySendError::Disconnected(_)) => return Err("DeepFilterNet worker exited".into()),
         }
         loop {
             match self.replies.recv_timeout(timeout) {
@@ -447,6 +449,35 @@ impl DeepFilterWorker {
 mod tests {
     use super::*;
     use crate::dsp::SR;
+
+    #[test]
+    fn an_exited_deepfilter_worker_marks_the_rnnoise_fallback() {
+        let (requests, request_rx) = crossbeam_channel::bounded(1);
+        let (_reply_tx, replies) = crossbeam_channel::bounded(1);
+        drop(request_rx);
+        let mut cleaner = Cleaner::new();
+        cleaner.deep = Some(DeepFilterWorker { requests, replies, seq: 0, ready: true });
+
+        assert!(cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none());
+        assert!(cleaner.deep_failed);
+        assert!(cleaner.deep.is_none(), "discard the unusable worker");
+        assert_eq!(cleaner.state(&Params { model: Model::DeepFilter, ..Params::default() }),
+            ModelState::DeepFilterFailed);
+        assert!(cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none(), "keep fallback stable without spawning another worker");
+    }
+
+    #[test]
+    fn a_full_deepfilter_queue_is_temporary_backpressure() {
+        let (requests, request_rx) = crossbeam_channel::bounded(1);
+        let (_reply_tx, replies) = crossbeam_channel::bounded(1);
+        requests.send((0, [0.0; FRAME], 1.0)).unwrap();
+        let mut worker = DeepFilterWorker { requests, replies, seq: 0, ready: true };
+
+        assert!(matches!(worker.process(&[0.0; FRAME], 1.0, Duration::ZERO), Ok(None)));
+        assert!(worker.ready, "a busy worker remains usable");
+        assert_eq!(request_rx.try_recv().unwrap().0, 0, "keep the earlier queued frame when skipping the new one");
+    }
+
     // Deterministic xorshift RNG so the test needs no rand dependency.
     struct XorShift(u64);
     impl XorShift {
