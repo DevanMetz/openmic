@@ -502,6 +502,7 @@ impl App {
         self.cancel_pending_playback(None);
         self.waiting_for_device = false;
         self.reconnecting = false;
+        self.warn_until = None;
         if let Some(engine) = self.engine.take() {
             engine.stop();
             logfile::info("processing stopped");
@@ -1691,6 +1692,25 @@ mod tests {
         app.waiting_for_device = true;
         app.stop_engine(true);
         assert!(!app.reconnecting && !app.running());
+    }
+
+    #[test]
+    fn stopping_processing_does_not_replay_a_previous_engines_warning() {
+        for announce in [true, false] {
+            let mut app = App::stopped(Settings::default());
+            app.engine = Some(Engine::for_test());
+            app.warn_until = Some(("output buffer underrun".into(), Instant::now()));
+            app.stop_engine(announce);
+            assert!(app.warn_until.is_none());
+            if !announce {
+                // Fatal errors supply their own result after stopping streams.
+                app.status = ("Processing failed".into(), RED);
+            }
+            let stopped_status = app.status.clone();
+            app.poll_engine();
+            assert_eq!(app.status, stopped_status);
+            assert!(!app.running());
+        }
     }
 
     #[test]
