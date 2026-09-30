@@ -123,12 +123,17 @@ struct Job {
 
 /// Download and transcription threads, and their progress.
 pub struct Dictation {
-    jobs: Option<Sender<Job>>,
+    worker: Option<TranscriptionWorker>,
     events: (Sender<Event>, Receiver<Event>),
     wake: Arc<dyn Fn() + Send + Sync>,
     /// Takes queued or being transcribed.
     pending: Arc<AtomicU64>,
     download: Option<Download>,
+}
+
+struct TranscriptionWorker {
+    jobs: Sender<Job>,
+    thread: thread::JoinHandle<()>,
 }
 
 struct Download {
@@ -142,7 +147,7 @@ impl Dictation {
     /// `wake` is called whenever an [`Event`] is ready.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
-            jobs: None,
+            worker: None,
             events: crossbeam_channel::unbounded(),
             wake: Arc::new(wake),
             pending: Arc::default(),
@@ -151,6 +156,7 @@ impl Dictation {
     }
 
     pub fn poll(&mut self) -> Option<Event> {
+        self.reap_worker();
         let event = self.events.1.try_recv().ok()?;
         if matches!(event, Event::Downloaded(_) | Event::DownloadFailed(_)) {
             self.download = None;
@@ -203,19 +209,41 @@ impl Dictation {
 
     /// Transcribe `take` and type the words into the focused app.
     pub fn transcribe(&mut self, model: SpeechModel, take: Take) {
-        let jobs = self.jobs.get_or_insert_with(|| {
+        self.reap_worker();
+        if self.worker.is_none() {
             let (jobs, queue) = crossbeam_channel::unbounded();
             let (events, wake, pending) =
                 (self.events.0.clone(), Arc::clone(&self.wake), Arc::clone(&self.pending));
-            let _ = thread::Builder::new()
+            let spawned = thread::Builder::new()
                 .name("openmic-dictation".into())
                 .spawn(move || transcribe_loop(&queue, &events, &*wake, &pending));
-            jobs
-        });
+            match spawned {
+                Ok(thread) => self.worker = Some(TranscriptionWorker { jobs, thread }),
+                Err(error) => {
+                    let _ = self.events.0.send(Event::Failed(format!("Could not start speech-to-text: {error}")));
+                    (self.wake)();
+                    return;
+                }
+            }
+        }
         self.pending.fetch_add(1, Ordering::Relaxed);
-        if jobs.send(Job { model, take }).is_err() {
-            self.pending.fetch_sub(1, Ordering::Relaxed);
-            let _ = self.events.0.send(Event::Failed("speech-to-text stopped".into()));
+        if self.worker.as_ref().unwrap().jobs.send(Job { model, take }).is_err() {
+            // The receiver is gone, so this worker cannot change pending again.
+            self.discard_worker();
+        }
+    }
+
+    fn reap_worker(&mut self) {
+        if self.worker.as_ref().is_some_and(|worker| worker.thread.is_finished()) {
+            self.discard_worker();
+        }
+    }
+
+    fn discard_worker(&mut self) {
+        self.worker = None;
+        if self.pending.swap(0, Ordering::Relaxed) > 0 {
+            let _ = self.events.0.send(Event::Failed("Speech-to-text stopped; record again to retry".into()));
+            (self.wake)();
         }
     }
 }
@@ -754,6 +782,90 @@ fn type_text(_text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn short_take() -> Take {
+        // Too short to load a speech model or type into the focused app.
+        crate::record::Recorder::from_samples_for_test(&[0.2; 96]).finish().unwrap().unwrap()
+    }
+
+    fn wait_for_worker_exit(dictation: &Dictation) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !dictation.worker.as_ref().unwrap().thread.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "dictation worker did not exit");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn crashed_worker_reports_lost_takes_once_and_accepts_new_work() {
+        for poll_before_retry in [true, false] {
+            let wakes = Arc::new(AtomicU64::new(0));
+            let wake_count = Arc::clone(&wakes);
+            let mut dictation = Dictation::new(move || { wake_count.fetch_add(1, Ordering::Relaxed); });
+            let (jobs, queue) = crossbeam_channel::unbounded();
+            let (release, stop) = crossbeam_channel::bounded::<()>(0);
+            let thread = thread::spawn(move || {
+                let _ = stop.recv();
+                drop(queue);
+                panic!("simulated transcription failure");
+            });
+            dictation.worker = Some(TranscriptionWorker { jobs, thread });
+            dictation.transcribe(SpeechModel::TinyEn, short_take());
+            dictation.transcribe(SpeechModel::TinyEn, short_take());
+            assert_eq!(dictation.pending.load(Ordering::Relaxed), 2);
+            release.send(()).unwrap();
+            wait_for_worker_exit(&dictation);
+
+            if poll_before_retry {
+                assert!(matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again")));
+                assert!(!dictation.busy());
+                assert!(dictation.worker.is_none());
+                assert!(dictation.poll().is_none());
+                assert_eq!(wakes.load(Ordering::Relaxed), 1);
+            }
+            dictation.transcribe(SpeechModel::TinyEn, short_take());
+            if !poll_before_retry {
+                assert!(matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again")));
+            }
+            assert!(matches!(dictation.events.1.recv_timeout(Duration::from_secs(3)), Ok(Event::Nothing)));
+            assert!(!dictation.busy());
+            assert!(dictation.poll().is_none(), "failure must only be reported once");
+            let worker = dictation.worker.take().unwrap();
+            drop(worker.jobs);
+            worker.thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn disconnected_queue_clears_all_pending_work_before_the_thread_finishes() {
+        let mut dictation = Dictation::new(|| {});
+        let (jobs, queue) = crossbeam_channel::unbounded();
+        drop(queue);
+        let (release, stop) = crossbeam_channel::bounded::<()>(0);
+        let thread = thread::spawn(move || { let _ = stop.recv(); });
+        dictation.worker = Some(TranscriptionWorker { jobs, thread });
+        dictation.pending.store(2, Ordering::Relaxed);
+        dictation.transcribe(SpeechModel::TinyEn, short_take());
+        assert!(!dictation.busy());
+        assert!(dictation.worker.is_none());
+        assert!(matches!(dictation.poll(), Some(Event::Failed(_))));
+        assert!(dictation.poll().is_none());
+        drop(release);
+    }
+
+    #[test]
+    fn idle_worker_exit_preserves_completed_transcripts() {
+        let mut dictation = Dictation::new(|| panic!("no failure needs reporting"));
+        let (jobs, queue) = crossbeam_channel::unbounded();
+        let thread = thread::spawn(move || drop(queue));
+        dictation.worker = Some(TranscriptionWorker { jobs, thread });
+        dictation.events.0.send(Event::Transcribed { text: "Keep these words".into(), typing_error: None }).unwrap();
+        wait_for_worker_exit(&dictation);
+        assert!(matches!(dictation.poll(), Some(Event::Transcribed { text, .. }) if text == "Keep these words"));
+        assert!(dictation.worker.is_none());
+        assert!(!dictation.busy());
+        assert!(dictation.poll().is_none());
+    }
 
     #[test]
     fn failed_typing_keeps_the_recognized_words() {
