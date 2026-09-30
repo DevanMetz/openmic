@@ -42,7 +42,6 @@ pub fn choose_routes(
         s.monitor_output = outputs
             .iter()
             .find(|n| Some(*n) != cable)
-            .or(outputs.first())
             .cloned()
             .unwrap_or_default();
     }
@@ -74,6 +73,25 @@ mod tests {
         choose_routes(&mut s, &names(&["Mic (USB)"]), &outputs, false, false);
         assert_eq!(s.output, "", "would feed the mic back out of the speakers");
         assert_eq!(s.monitor_output, "Speakers (Realtek)");
+    }
+
+    #[test]
+    fn an_automatic_monitor_waits_for_an_output_other_than_the_cable() {
+        let mut s = Settings::default();
+        let inputs = names(&["USB mic"]);
+        let cable = "CABLE Input (VB-Audio Virtual Cable)";
+        let only_cable = names(&[cable]);
+        choose_routes(&mut s, &inputs, &only_cable, false, false);
+        assert_eq!(s.output, cable);
+        assert!(s.monitor_output.is_empty(), "do not create a route the engine must reject");
+
+        choose_routes(&mut s, &inputs, &names(&[cable, "Headphones"]), false, false);
+        assert_eq!(s.monitor_output, "Headphones", "fill the unset monitor when a separate output appears");
+        choose_routes(&mut s, &inputs, &only_cable, false, false);
+        assert_eq!(s.monitor_output, "Headphones", "background polling preserves a saved monitor that is temporarily absent");
+        choose_routes(&mut s, &inputs, &only_cable, false, true);
+        assert!(s.monitor_output.is_empty(), "Refresh must not replace missing headphones with the voice-call output");
+        assert_eq!(s.output, cable);
     }
 
     #[test]
