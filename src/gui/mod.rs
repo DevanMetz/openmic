@@ -220,6 +220,7 @@ pub struct App {
     dictation: Dictation,
     /// Speech being recorded for dictation.
     dictating: Option<DictationRecording>,
+    /// Most recent result; live listening/transcription indicators use their own state.
     dictation_status: Status,
     /// The words most recently recognized, including when typing was blocked.
     last_dictation: String,
@@ -1047,7 +1048,7 @@ impl App {
                 self.dictating = Some(DictationRecording {
                     recorder, model: self.settings.speech_model, hold_to_talk: self.settings.dictation_hold,
                 });
-                self.dictation_status = ("Listening…".into(), AMBER);
+                self.dictation_status = (String::new(), MUTED);
             }
             Err(e) => {
                 logfile::warn(format_args!("dictation did not start: {e:#}"));
@@ -1072,7 +1073,7 @@ impl App {
                     self.dictation_status = (short(&format!("Dictation stopped: {warning}")), RED);
                     return None;
                 }
-                self.dictation_status = ("Transcribing…".into(), CYAN);
+                self.dictation_status = (String::new(), MUTED);
                 return Some((recording.model, take));
             }
             Ok(None) => ("Nothing was heard".into(), MUTED),
@@ -1831,6 +1832,32 @@ mod tests {
 
     fn visible<'a>(texts: &'a [(String, egui::Rect)], needle: &str) -> Option<&'a egui::Rect> {
         texts.iter().find(|(text, _)| text.contains(needle)).map(|(_, rect)| rect)
+    }
+
+    #[test]
+    fn completed_dictation_does_not_hide_an_active_recording() {
+        let mut app = App::stopped(Settings::default());
+        app.page = Page::Dictation;
+        app.dictating = Some(DictationRecording {
+            recorder: Recorder::from_samples_for_test(&[0.25; 96]),
+            model: app.settings.speech_model,
+            hold_to_talk: false,
+        });
+        app.dictation_status = ("Typed".into(), GREEN);
+        app.last_dictation = "Previous phrase".into();
+
+        let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+        let listening = visible(&texts, "Listening…").expect("the microphone is still recording");
+        let result = visible(&texts, "Typed").expect("the earlier phrase's result stays visible");
+        assert!(listening.bottom() < result.top());
+        assert!(visible(&texts, "Discard recording").is_some());
+        assert!(visible(&texts, "Previous phrase").is_some());
+
+        app.discard_dictation();
+        let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+        assert!(visible(&texts, "Listening…").is_none());
+        assert!(visible(&texts, "Discard recording").is_none());
+        assert!(visible(&texts, "Dictation recording discarded").is_some());
     }
 
     /// A 1080p laptop at 150% has about 690 points of height: every page

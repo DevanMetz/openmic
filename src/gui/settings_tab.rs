@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, RichText};
 
-use super::{App, Binding, Command, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
+use super::{clock_time, App, Binding, Command, AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
 use crate::dictation::SpeechModel;
 use crate::widgets;
 
@@ -230,21 +230,27 @@ impl App {
                 });
                 ui.weak("Your words are typed into the app you're using. Set your Shortcut above.");
 
-                let working = self.dictating.is_some() || self.dictation.busy();
-                if working || !self.dictation_status.0.is_empty() {
+                if let Some(recording) = &self.dictating {
                     ui.horizontal(|ui| {
-                        if working {
-                            ui.spinner();
-                        }
-                        ui.label(RichText::new(&self.dictation_status.0).color(self.dictation_status.1));
+                        ui.spinner();
+                        ui.colored_label(AMBER, format!("Listening… {}", clock_time(recording.recorder.elapsed())))
+                            .on_hover_text(format!("Using {}", recording.model.label()));
                     });
-                }
-                if self.dictating.is_some()
-                    && ui.button("Discard recording")
+                    if ui.button("Discard recording")
                         .on_hover_text("Stop listening and discard this take; nothing from it will be typed")
                         .clicked()
-                {
-                    self.discard_dictation();
+                    {
+                        self.discard_dictation();
+                    }
+                }
+                if self.dictation.busy() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.colored_label(CYAN, "Transcribing…");
+                    });
+                }
+                if !self.dictation_status.0.is_empty() {
+                    ui.label(RichText::new(&self.dictation_status.0).color(self.dictation_status.1));
                 }
                 if !self.last_dictation.is_empty() {
                     ui.horizontal(|ui| {
