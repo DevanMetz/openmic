@@ -1778,6 +1778,45 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_global_hotkeys_still_allow_clearing_saved_bindings() {
+        use eframe::App as _;
+        for (page, binding) in [
+            (Page::Settings, Binding::Mute),
+            (Page::Settings, Binding::Bypass),
+            (Page::Settings, Binding::StopClips),
+            (Page::Settings, Binding::Dictate),
+            (Page::Dictation, Binding::Dictate),
+        ] {
+            let mut app = App::stopped(Settings::default());
+            app.page = page;
+            *app.binding_slot(&binding).unwrap() = Some("Ctrl+Alt+M".into());
+            let ctx = egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
+                events, ..Default::default()
+            }, |ui| app.ui(ui, &mut frame));
+            draw(&mut app, Vec::new());
+            for label in ["Set…", "Clear"] {
+                let output = draw(&mut app, Vec::new());
+                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect().center()),
+                    _ => None,
+                }).expect("shortcut control is visible");
+                for pressed in [true, false] {
+                    draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+                assert!(app.capturing.is_none(), "unavailable hotkeys must not start capture");
+                assert_eq!(app.binding_slot(&binding).unwrap().is_none(), label == "Clear", "{page:?}: {binding:?}");
+                assert_eq!(app.dirty_since.is_some(), label == "Clear", "only clearing changes settings");
+            }
+            assert_eq!(app.hotkey_status, ("Shortcut cleared".into(), MUTED));
+        }
+    }
+
+    #[test]
     fn leaving_the_full_window_restores_shortcuts_without_changing_the_binding() {
         for (focused, hidden, minimized) in [
             (true, false, false),

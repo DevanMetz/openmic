@@ -40,18 +40,19 @@ impl App {
                             }),
                         );
                         ui.horizontal(|ui| {
-                            ui.add_enabled_ui(hotkeys_ok, |ui| {
-                                if waiting {
-                                    if ui.button("Cancel").clicked() {
-                                        self.cancel_capture();
-                                    }
-                                } else if ui.button("Set…").clicked() {
-                                    self.start_capture(binding.clone());
+                            if waiting {
+                                if ui.button("Cancel").clicked() {
+                                    self.cancel_capture();
                                 }
-                                if current.is_some() && ui.button("Clear").clicked() {
-                                    self.assign_hotkey(&binding, None);
-                                }
-                            });
+                            } else if ui.add_enabled(hotkeys_ok, egui::Button::new("Set…"))
+                                .on_disabled_hover_text("Global shortcuts are unavailable. Restart OpenMic to retry.")
+                                .clicked()
+                            {
+                                self.start_capture(binding.clone());
+                            }
+                            if current.is_some() && ui.button("Clear").clicked() {
+                                self.assign_hotkey(&binding, None);
+                            }
                         });
                         ui.end_row();
                     }
@@ -159,12 +160,13 @@ impl App {
                 if ui.button("Cancel").clicked() {
                     self.cancel_capture();
                 }
-            } else if ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Set…")).clicked() {
+            } else if ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Set…"))
+                .on_disabled_hover_text("Global shortcuts are unavailable. Restart OpenMic to retry.")
+                .clicked()
+            {
                 self.start_capture(Binding::Dictate);
             }
-            if current.is_some()
-                && ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Clear")).clicked()
-            {
+            if current.is_some() && ui.button("Clear").clicked() {
                 self.assign_hotkey(&Binding::Dictate, None);
             }
         });
