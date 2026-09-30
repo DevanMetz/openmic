@@ -56,7 +56,9 @@ impl App {
     /// The settings a test is cleaned with: yours, but never muted (a muted
     /// test would play silence).
     fn test_params(&self) -> Params {
-        Params { mute: false, ..self.params() }
+        // Monitor and soundboard controls do not affect the voice chain;
+        // keep them fixed so changing them does not invalidate its cache.
+        Params { mute: false, monitor_on: false, monitor_gain: 1.0, sound_gain: 1.0, ..self.params() }
     }
 
     /// Where the test plays: the headphone monitor if one is chosen,
@@ -295,6 +297,20 @@ mod tests {
         assert!(!p.mute);
         assert_eq!(p.strength, 0.4);
         assert_eq!(p.input_gain, crate::dsp::db_to_gain(6.0));
+    }
+
+    #[test]
+    fn preview_cache_ignores_controls_that_do_not_change_the_cleaned_audio() {
+        let mut app = App::stopped(Settings::default());
+        let before = app.test_params();
+        app.settings.monitor = true;
+        app.settings.monitor_volume = 0.25;
+        app.settings.sound_volume = 0.1;
+        app.settings.mute = true;
+        assert_eq!(app.test_params(), before, "output controls must not rerun the denoiser");
+
+        app.settings.strength = 0.5;
+        assert_ne!(app.test_params(), before, "voice changes still need a new preview");
     }
 
     #[test]
