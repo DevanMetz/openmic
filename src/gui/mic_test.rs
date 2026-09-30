@@ -150,7 +150,12 @@ impl App {
                 test.status = Some((short(&e), RED));
             } else if started.elapsed() >= TEST_LENGTH {
                 let (recorder, _) = test.recording.take().expect("checked above");
-                let take = recorder.finish().and_then(|take| take.map(|t| t.samples()).transpose());
+                let take = recorder.finish().and_then(|take| take.map(|take| {
+                    if let Some(warning) = take.warning() {
+                        anyhow::bail!("Record the mic test again: {warning}");
+                    }
+                    take.samples()
+                }).transpose());
                 match take {
                     Ok(Some(samples)) if !samples.is_empty() => {
                         test.raw = Some(Arc::new(samples));
@@ -286,6 +291,36 @@ mod tests {
         assert_eq!(cleaned.len(), tone.len());
         let muted = Cleaner::process_recording(&tone, &Params { mute: true, ..p });
         assert!(muted.iter().all(|s| *s == 0.0), "mute would silence a test: test_params clears it");
+    }
+
+    #[test]
+    fn incomplete_mic_tests_keep_the_previous_preview_and_request_another_recording() {
+        for had_preview in [false, true] {
+            let mut app = App::stopped(Settings::default());
+            let raw = Arc::new(vec![0.1; 480]);
+            let cleaned = Arc::new(vec![0.05; 480]);
+            if had_preview {
+                app.mic_test.raw = Some(Arc::clone(&raw));
+                app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params()));
+            }
+            let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
+            recorder.report_skipped_for_test();
+            app.mic_test.recording = Some((recorder, Instant::now() - TEST_LENGTH));
+            app.poll_mic_test();
+
+            assert!(!app.mic_test.busy(), "an incomplete take must not start cleaning or playback");
+            assert!(!app.settings.setup.tested && app.dirty_since.is_none());
+            let (message, color) = app.mic_test.status.as_ref().unwrap();
+            assert!(message.starts_with("Record the mic test again:"));
+            assert!(message.contains("audio was skipped"));
+            assert_eq!(*color, RED);
+            if had_preview {
+                assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                assert!(Arc::ptr_eq(&app.mic_test.cleaned.as_ref().unwrap().0, &cleaned));
+            } else {
+                assert!(app.mic_test.raw.is_none() && app.mic_test.cleaned.is_none());
+            }
+        }
     }
 
     #[test]
