@@ -43,8 +43,7 @@ impl App {
                             ui.add_enabled_ui(hotkeys_ok, |ui| {
                                 if waiting {
                                     if ui.button("Cancel").clicked() {
-                                        self.capturing = None;
-                                        self.hotkey_status = ("Shortcut unchanged".into(), super::MUTED);
+                                        self.cancel_capture();
                                     }
                                 } else if ui.button("Set…").clicked() {
                                     self.start_capture(binding.clone());
@@ -156,10 +155,24 @@ impl App {
             } else {
                 RichText::new(current.as_deref().unwrap_or("Not set")).monospace()
             });
-            if !waiting && ui.button("Set…").clicked() {
+            if waiting {
+                if ui.button("Cancel").clicked() {
+                    self.cancel_capture();
+                }
+            } else if ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Set…")).clicked() {
                 self.start_capture(Binding::Dictate);
             }
+            if current.is_some()
+                && ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Clear")).clicked()
+            {
+                self.assign_hotkey(&Binding::Dictate, None);
+            }
         });
+        if (self.capturing.as_ref() == Some(&Binding::Dictate) || self.hotkeys.is_none())
+            && !self.hotkey_status.0.is_empty()
+        {
+            ui.label(RichText::new(&self.hotkey_status.0).color(self.hotkey_status.1));
+        }
         ui.add_space(8.0);
         self.draw_speech_card(ui);
     }

@@ -964,6 +964,9 @@ impl App {
 
     /// Bind `combo` to `binding`, taking it from any other binding.
     fn assign_hotkey(&mut self, binding: &Binding, combo: Option<String>) {
+        if self.capturing.as_ref() == Some(binding) {
+            self.capturing = None;
+        }
         if let Some(combo) = &combo {
             let h = &mut self.settings.hotkeys;
             let slots = [&mut h.mute, &mut h.bypass, &mut h.stop_clips, &mut h.dictate]
@@ -999,15 +1002,11 @@ impl App {
         });
         let Some((key, modifiers)) = pressed else { return };
         if key == egui::Key::Escape {
-            self.capturing = None;
-            self.hotkey_status = ("Shortcut unchanged".into(), MUTED);
+            self.cancel_capture();
             return;
         }
         match hotkeys::combo(key, modifiers) {
-            Ok(combo) => {
-                self.capturing = None;
-                self.assign_hotkey(&binding, Some(combo));
-            }
+            Ok(combo) => self.assign_hotkey(&binding, Some(combo)),
             // Keep listening for a usable combination.
             Err(why) => self.hotkey_status = (why.into(), AMBER),
         }
@@ -1016,6 +1015,11 @@ impl App {
     fn start_capture(&mut self, binding: Binding) {
         self.capturing = Some(binding);
         self.hotkey_status = ("Press the shortcut, or Esc to cancel".into(), CYAN);
+    }
+
+    fn cancel_capture(&mut self) {
+        self.capturing = None;
+        self.hotkey_status = ("Shortcut unchanged".into(), MUTED);
     }
 
     // ---- speech to text ----------------------------------------------------
@@ -1641,6 +1645,20 @@ mod tests {
 
         app.start_capture(Binding::StopClips);
         assert!(app.hotkey_bindings().is_empty(), "keys are freed while recording one");
+    }
+
+    #[test]
+    fn clearing_a_shortcut_while_capturing_restores_the_other_global_bindings() {
+        let mut app = App::stopped(Settings::default());
+        app.assign_hotkey(&Binding::Mute, Some("Ctrl+Alt+M".into()));
+        app.assign_hotkey(&Binding::Dictate, Some("Ctrl+Alt+D".into()));
+        app.start_capture(Binding::Dictate);
+        assert!(app.hotkey_bindings().is_empty());
+
+        app.assign_hotkey(&Binding::Dictate, None);
+        assert!(app.capturing.is_none(), "Clear must end shortcut capture");
+        assert!(app.settings.hotkeys.dictate.is_none());
+        assert_eq!(app.hotkey_bindings(), vec![("Ctrl+Alt+M".into(), Command::ToggleMute)]);
     }
 
     /// Draw the whole window headlessly (as eframe does) and return every
