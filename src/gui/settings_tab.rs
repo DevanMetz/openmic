@@ -298,8 +298,10 @@ impl App {
             {
                 self.dictation_status = match model.remove() {
                     Ok(()) => ("Model removed".into(), MUTED),
-                    // Windows locks a model that's loaded.
-                    Err(_) => ("In use: restart OpenMic to remove this model".into(), RED),
+                    Err(error) => {
+                        crate::logfile::warn(format_args!("speech model removal failed: {error:#}"));
+                        (format!("Could not remove model: {}", error.root_cause()), RED)
+                    }
                 };
             }
         }

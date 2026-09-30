@@ -87,11 +87,15 @@ impl SpeechModel {
 
     /// Delete the downloaded files.
     pub fn remove(self) -> Result<()> {
-        let dir = self.dir();
-        if dir.exists() {
-            fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-        }
-        Ok(())
+        remove_model_files(&self.dir())
+    }
+}
+
+fn remove_model_files(dir: &Path) -> Result<()> {
+    match fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", dir.display())),
     }
 }
 
@@ -794,6 +798,36 @@ fn type_text(_text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_model_files_succeeds_if_the_folder_is_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model");
+        fs::create_dir(&model).unwrap();
+        fs::write(model.join("model.safetensors"), b"test model").unwrap();
+        remove_model_files(&model).unwrap();
+        assert!(!model.exists());
+        remove_model_files(&model).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_model_removal_keeps_the_file_error_and_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model");
+        fs::create_dir(&model).unwrap();
+        let weights = model.join("model.safetensors");
+        fs::write(&weights, b"test model").unwrap();
+        let held = File::options().read(true).share_mode(1).open(&weights).unwrap();
+        let error = remove_model_files(&model).unwrap_err();
+        assert!(error.to_string().contains(&model.display().to_string()));
+        assert!(error.downcast_ref::<std::io::Error>().is_some(), "preserve the cause for the UI");
+        assert_eq!(fs::read(&weights).unwrap(), b"test model");
+        drop(held);
+        remove_model_files(&model).unwrap();
+        assert!(!model.exists());
+    }
 
     fn short_take() -> Take {
         // Too short to load a speech model or type into the focused app.
