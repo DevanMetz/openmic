@@ -444,18 +444,27 @@ pub fn startup_enabled() -> bool {
 
 #[cfg(windows)]
 pub fn set_startup(enabled: bool) -> Result<()> {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    use winreg::{enums::{HKEY_CURRENT_USER, KEY_SET_VALUE}, RegKey};
 
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
-        .create_subkey(RUN_KEY)
+        .create_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
         .context("open Windows startup registry key")?;
-    let _ = key.delete_value(STARTUP_NAME);
-    let _ = key.delete_value(LEGACY_STARTUP_NAME);
+    let remove = |name: &str| -> Result<()> {
+        match key.delete_value(name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {name} from Windows startup")),
+        }
+    };
     if enabled {
         let exe = std::env::current_exe().context("locate OpenMic executable")?;
+        // Replace in place so a failed registration keeps the old entry.
         key.set_value(STARTUP_NAME, &format!("\"{}\" {MINIMIZED_ARG}", exe.display()))
             .context("register OpenMic startup")?;
+    } else {
+        remove(STARTUP_NAME)?;
     }
+    remove(LEGACY_STARTUP_NAME)?;
     Ok(())
 }
 

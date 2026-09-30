@@ -585,8 +585,9 @@ impl App {
 
     fn toggle_startup(&mut self, enabled: bool) {
         if let Err(e) = config::set_startup(enabled) {
-            logfile::error(format_args!("Windows startup not changed: {e:#}"));
-            self.settings.start_with_windows = !enabled;
+            logfile::error(format_args!("Windows startup could not be updated: {e:#}"));
+            // Removing a legacy entry can fail after the main entry changed.
+            self.settings.start_with_windows = config::startup_enabled();
             self.status = (short(&format!("{:#}", e)), RED);
         } else {
             self.status = (
