@@ -1,6 +1,6 @@
 //! Speech denoisers: RNNoise (light, also our voice detector) and DeepFilterNet 3.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
@@ -435,8 +435,10 @@ impl DeepFilterWorker {
             Err(TrySendError::Full(_)) => return Ok(None), // worker backed up; skip rather than block
             Err(TrySendError::Disconnected(_)) => return Err("DeepFilterNet worker exited".into()),
         }
+        // One deadline per frame: stale replies must not renew the wait.
+        let deadline = Instant::now() + timeout;
         loop {
-            match self.replies.recv_timeout(timeout) {
+            match self.replies.recv_deadline(deadline) {
                 Ok(DeepReply::Frame(seq, out)) if seq == self.seq => return Ok(Some(out)),
                 Ok(DeepReply::Frame(..)) | Ok(DeepReply::Ready) => continue, // stale late frame
                 Ok(DeepReply::Failed(e)) => return Err(e),
@@ -468,6 +470,26 @@ mod tests {
         assert_eq!(cleaner.state(&Params { model: Model::DeepFilter, ..Params::default() }),
             ModelState::DeepFilterFailed);
         assert!(cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none(), "keep fallback stable without spawning another worker");
+    }
+
+    #[test]
+    fn deepfilter_skips_stale_replies_and_accepts_the_current_frame() {
+        let (requests, request_rx) = crossbeam_channel::bounded(1);
+        let (reply_tx, replies) = crossbeam_channel::bounded(2);
+        let mut worker = DeepFilterWorker { requests, replies, seq: 0, ready: true };
+        reply_tx.send(DeepReply::Frame(0, [0.1; FRAME])).unwrap();
+        reply_tx.send(DeepReply::Frame(1, [0.5; FRAME])).unwrap();
+
+        // A current reply already in the queue needs no waiting allowance.
+        assert_eq!(worker.process(&[0.25; FRAME], 0.8, Duration::ZERO).unwrap(), Some([0.5; FRAME]));
+        assert_eq!(request_rx.try_recv().unwrap(), (1, [0.25; FRAME], 0.8));
+
+        reply_tx.send(DeepReply::Frame(1, [0.5; FRAME])).unwrap();
+        reply_tx.send(DeepReply::Ready).unwrap();
+        assert_eq!(worker.process(&[0.0; FRAME], 1.0, Duration::ZERO).unwrap(), None,
+            "stale replies cannot substitute for the new frame or keep the caller waiting");
+        assert_eq!(request_rx.try_recv().unwrap().0, 2);
+        assert!(worker.ready, "a missed deadline keeps the worker available for later frames");
     }
 
     #[test]
