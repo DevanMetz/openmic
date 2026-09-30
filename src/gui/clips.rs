@@ -25,7 +25,7 @@ pub(super) struct TrimClip {
 
 #[derive(Default)]
 pub(super) struct ClipLoads {
-    /// The front request belongs to the running decoder, if any.
+    /// The front request belongs to the running decoder unless it was cancelled.
     requests: VecDeque<ClipRequest>,
     job: Option<Receiver<anyhow::Result<CachedClip>>>,
     cancel: Arc<AtomicBool>,
@@ -33,10 +33,10 @@ pub(super) struct ClipLoads {
 
 impl ClipLoads {
     fn retain(&mut self, keep: impl Fn(&ClipRequest) -> bool) {
-        if self.requests.front().is_some_and(|request| !keep(request)) {
+        if self.job.is_some() && !self.cancel.load(Ordering::Relaxed)
+            && self.requests.front().is_some_and(|request| !keep(request))
+        {
             self.cancel.store(true, Ordering::Relaxed);
-            self.job = None;
-            self.cancel = Arc::default();
         }
         self.requests.retain(keep);
     }
@@ -145,11 +145,11 @@ impl App {
         }
     }
 
-    /// Keep a decoder only while playback or the open trim menu needs it.
+    /// Cancel unneeded work, but keep tracking its decoder until it finishes.
     fn prune_clip_loads(&mut self) {
         let Some(pending) = &mut self.clip_loads else { return };
         pending.retain(|request| request.play || self.trim_clip.as_ref().is_some_and(|trim| trim.path == request.path));
-        if pending.requests.is_empty() { self.clip_loads = None; }
+        if pending.requests.is_empty() && pending.job.is_none() { self.clip_loads = None; }
     }
 
     pub(super) fn cancel_pending_playback(&mut self, except: Option<&Path>) {
@@ -249,20 +249,26 @@ impl App {
         });
         if let Some(result) = result {
             pending.job = None;
-            let request = pending.requests.pop_front().expect("a decoder has a clip request");
-            let result = result.and_then(|clip| {
-                clip.validate_source(&request.path)?;
-                Ok(clip)
-            });
-            match result {
-                Ok(clip) => {
-                    let samples = Arc::clone(&clip.samples);
-                    self.cache_clip(request.path.clone(), clip);
-                    if request.play && let Some(pad) = self.settings.sounds.iter().find(|pad| pad.path == request.path).cloned() {
-                        self.play_decoded_clip(&pad, &samples);
+            if pending.cancel.load(Ordering::Relaxed) {
+                // Its request was removed. Do not consume the next queued request
+                // or let a late success/failure replace the current playback state.
+                pending.cancel = Arc::default();
+            } else {
+                let request = pending.requests.pop_front().expect("a decoder has a clip request");
+                let result = result.and_then(|clip| {
+                    clip.validate_source(&request.path)?;
+                    Ok(clip)
+                });
+                match result {
+                    Ok(clip) => {
+                        let samples = Arc::clone(&clip.samples);
+                        self.cache_clip(request.path.clone(), clip);
+                        if request.play && let Some(pad) = self.settings.sounds.iter().find(|pad| pad.path == request.path).cloned() {
+                            self.play_decoded_clip(&pad, &samples);
+                        }
                     }
+                    Err(error) => self.clip_load_failed(&request, &error),
                 }
-                Err(error) => self.clip_load_failed(&request, &error),
             }
         }
         while pending.job.is_none() && let Some(request) = pending.requests.front() {
@@ -464,7 +470,7 @@ mod tests {
                 _ => app.remove_clip(0),
             }
             assert!(cancel.load(Ordering::Relaxed));
-            assert!(late.send(Err(anyhow::anyhow!("late preview result"))).is_err());
+            assert!(late.send(Err(anyhow::anyhow!("late preview result"))).is_ok());
             finish(&mut app, &ctx);
             assert!(app.cached_clip(&paths[0]).is_none());
             assert_eq!(app.cached_clip(&paths[1]).is_some(), action == "switch");
@@ -502,7 +508,7 @@ mod tests {
         let path = wav(dir.path(), "clap.wav");
         let mut app = app_with(std::slice::from_ref(&path));
         app.engine = None;
-        let (_done, cancel) = delayed(&mut app, std::slice::from_ref(&path));
+        let (done, cancel) = delayed(&mut app, std::slice::from_ref(&path));
         let ctx = egui::Context::default();
         open_trim_menu(&mut app, &ctx, "clap");
         text_rect(&draw_board(&mut app, &ctx, Vec::new()), "Loading waveform…");
@@ -513,7 +519,10 @@ mod tests {
             key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
         }]);
         draw_board(&mut app, &ctx, Vec::new());
-        assert!(app.trim_clip.is_none() && app.clip_loads.is_none() && cancel.load(Ordering::Relaxed));
+        assert!(app.trim_clip.is_none() && !app.has_pending_playback() && cancel.load(Ordering::Relaxed));
+        assert!(app.clip_loads.is_some(), "keep tracking the cancelled decoder until it exits");
+        drop(done);
+        finish(&mut app, &ctx);
     }
 
     #[test]
@@ -631,10 +640,36 @@ mod tests {
             let (late, cancel) = delayed(&mut app, &paths[..1]);
             app.play_clip(1, &ctx);
             assert!(cancel.load(Ordering::Relaxed));
-            assert!(late.send(Err(anyhow::anyhow!("late old result"))).is_err());
+            assert!(Arc::ptr_eq(&cancel, &app.clip_loads.as_ref().unwrap().cancel), "the next decoder waits for cancellation to finish");
+            assert_eq!(app.playing.is_empty(), !cached, "cached audio can still start immediately");
+            assert!(late.send(CachedClip::read(&paths[0], &AtomicBool::new(false))).is_ok());
             finish(&mut app, &ctx);
             assert_eq!(app.playing, [clip_key(&paths[1])]);
+            assert!(!app.clip_cache.contains_key(&paths[0]), "ignore the cancelled decoder's late success");
         }
+    }
+
+    #[test]
+    fn repeated_cancellation_keeps_one_decoder_and_preserves_the_latest_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [wav(dir.path(), "one.wav"), wav(dir.path(), "two.wav")];
+        let ctx = egui::Context::default();
+        let mut app = app_with(&paths);
+        let (done, cancel) = delayed(&mut app, &paths[..1]);
+        for _ in 0..3 {
+            app.play_clip(1, &ctx);
+            app.toggle_clip(1, &ctx);
+            app.play_clip(0, &ctx);
+            let pending = app.clip_loads.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&cancel, &pending.cancel) && cancel.load(Ordering::Relaxed));
+            assert_eq!(pending.requests.len(), 1);
+            assert_eq!(pending.requests[0].path, paths[0]);
+            assert!(app.playing.is_empty());
+        }
+        drop(done); // A cancelled worker can also exit without sending a result.
+        finish(&mut app, &ctx);
+        assert_eq!(app.playing, [clip_key(&paths[0])]);
+        assert!(!app.clip_cache.contains_key(&paths[1]));
     }
 
     #[test]
@@ -672,10 +707,13 @@ mod tests {
                 _ => app.remove_clip(0),
             }
             assert!(cancel.load(Ordering::Relaxed), "{action} cancels the worker");
-            assert!(late.send(Err(anyhow::anyhow!("late result"))).is_err());
+            assert!(!app.has_pending_playback());
+            let status = app.sound_status.clone();
+            assert!(late.send(Err(anyhow::anyhow!("late result"))).is_ok());
             app.engine = Some(Engine::for_test());
             app.poll_clip_loads(&ctx);
             assert!(app.clip_loads.is_none() && app.playing.is_empty());
+            assert_eq!(app.sound_status, status, "a cancelled failure must not replace the current status");
             assert!(path.exists(), "cancelling or removing a pad keeps its file");
         }
     }
@@ -742,7 +780,7 @@ mod tests {
             app.toggle_clip(cancelled, &ctx);
             assert_eq!(cancel.load(Ordering::Relaxed), cancelled == 0, "only cancelling the running decoder sets its flag");
             if cancelled == 0 {
-                assert!(done.send(Err(anyhow::anyhow!("late cancelled result"))).is_err());
+                assert!(done.send(Err(anyhow::anyhow!("late cancelled result"))).is_ok());
             } else {
                 done.send(CachedClip::read(&paths[0], &cancel)).unwrap();
             }
@@ -760,7 +798,7 @@ mod tests {
         let path = wav(dir.path(), "pending.wav");
         let mut app = app_with(std::slice::from_ref(&path));
         app.settings.sounds[0].starred = true;
-        let (_done, cancel) = delayed(&mut app, std::slice::from_ref(&path));
+        let (done, cancel) = delayed(&mut app, std::slice::from_ref(&path));
         assert!(app.strip_contents().pads[0].3, "the strip shows a pending pad");
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
@@ -782,7 +820,10 @@ mod tests {
                 egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
             ]);
         }
-        assert!(app.clip_loads.is_none() && cancel.load(Ordering::Relaxed));
+        assert!(!app.has_pending_playback() && cancel.load(Ordering::Relaxed));
+        assert!(!app.strip_contents().pads[0].3);
+        drop(done);
+        finish(&mut app, &ctx);
     }
 
     #[test]
