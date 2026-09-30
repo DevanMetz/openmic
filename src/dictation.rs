@@ -268,6 +268,7 @@ fn transcribe_loop(queue: &Receiver<Job>, events: &Sender<Event>, wake: &dyn Fn(
             let samples = take.samples()?;
             drop(take); // deletes the temporary file
             let audio = decimate(&samples);
+            drop(samples); // free the 48 kHz copy before loading or running Whisper
             if (audio.len() as f32) < MIN_SECONDS * m::SAMPLE_RATE as f32 {
                 return Ok(String::new());
             }
