@@ -125,7 +125,7 @@ impl App {
 
     pub(super) fn forget_clip(&mut self, path: &Path) {
         self.clip_cache.remove(path);
-        self.pad_durations.remove(path);
+        self.pad_durations.forget(path);
     }
 
     pub(super) fn clip_loading(&self, path: &Path) -> bool {

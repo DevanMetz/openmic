@@ -612,7 +612,7 @@ impl App {
         if let Some(clip) = self.clip_cache.get(path) {
             return Some(clip.samples.len() as f32 / crate::dsp::SR as f32);
         }
-        *self.pad_durations.entry(path.to_owned()).or_insert_with(|| crate::decode::duration(path))
+        self.pad_durations.get(path)
     }
 
     fn toggle_star(&mut self, index: usize) {
@@ -1964,6 +1964,7 @@ mod tests {
         app.page = super::super::Page::Soundboard;
         let ctx = egui::Context::default();
         board(&mut app, &ctx, Vec::new());
+        app.pad_durations.finish(&ctx);
         let texts = board(&mut app, &ctx, Vec::new());
         assert!(texts.iter().any(|t| t == "WAV · 0.5 s"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "WAV · 2.5 s"), "the trimmed length");

@@ -2,6 +2,7 @@
 //! module; routing rules live in `routes`.
 
 mod clips;
+mod durations;
 mod mic_tab;
 mod mic_test;
 mod overlay;
@@ -162,8 +163,8 @@ pub struct App {
     playing: Vec<u64>,
     /// Progress (0..1) for playing and paused clips, by clip key.
     pad_progress: HashMap<u64, f32>,
-    /// Clip lengths in seconds, read once per file (`None`: unknown).
-    pad_durations: HashMap<PathBuf, Option<f32>>,
+    /// Clip lengths in seconds, read once per file in the background.
+    pad_durations: durations::Durations,
     /// The soundboard's search text.
     pad_filter: String,
     /// A clip name being edited, separate from its saved display name.
@@ -330,7 +331,7 @@ impl App {
             sound_status: ("Ready".into(), Color32::WHITE),
             playing: Vec::new(),
             pad_progress: HashMap::new(),
-            pad_durations: HashMap::new(),
+            pad_durations: durations::Durations::default(),
             pad_filter: String::new(),
             renaming_pad: None,
             trim_clip: None,
@@ -1134,6 +1135,7 @@ impl App {
         self.poll_engine();
         if self.hidden || self.page != Page::Soundboard { self.close_trim_editor(); }
         self.poll_clip_loads(ctx);
+        self.pad_durations.poll(ctx);
         self.poll_recording();
         self.poll_dictation();
         self.poll_mic_test();
