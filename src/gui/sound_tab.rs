@@ -572,7 +572,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Hotkey");
             ui.monospace(pad.hotkey.as_deref().unwrap_or("none"));
-            if ui.button("Set…").on_hover_text("Plays this pad from any app").clicked() {
+            if ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Set…"))
+                .on_hover_text("Plays this pad from any app")
+                .on_disabled_hover_text("Global shortcuts are unavailable; restart OpenMic to retry")
+                .clicked()
+            {
                 self.start_capture(Binding::Pad(pad.path.clone()));
                 ui.close();
             }
@@ -580,6 +584,15 @@ impl App {
                 self.assign_hotkey(&Binding::Pad(pad.path.clone()), None);
             }
         });
+        if let Some(hotkeys) = &self.hotkeys {
+            if let Some(shortcut) = &pad.hotkey
+                && hotkeys.was_refused(shortcut, &super::Command::PlayPad(pad.path.clone()))
+            {
+                ui.colored_label(AMBER, "This shortcut is unavailable. Choose another combination.");
+            }
+        } else {
+            ui.colored_label(AMBER, "Global shortcuts are unavailable. Restart OpenMic to retry.");
+        }
         let mut starred = pad.starred;
         if ui.checkbox(&mut starred, "Show on the strip").changed() {
             self.toggle_star(index);
