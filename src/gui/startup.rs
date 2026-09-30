@@ -1,4 +1,4 @@
-//! Recover failed settings loads before starting audio or saving preferences.
+//! Keep startup accessible and recover failed settings loads before starting audio.
 
 use eframe::egui::{self, RichText};
 
@@ -6,6 +6,17 @@ use super::{App, Command, DefaultMicSync, RED};
 use crate::widgets;
 
 impl App {
+    pub(super) fn set_startup_visibility(&mut self, ctx: &egui::Context, requested_hidden: bool) {
+        // A collapsed preference is not enough: Windows startup suppresses
+        // the strip, so a failed tray needs the main window as its fallback.
+        self.hidden = requested_hidden
+            && self.settings.load_error.is_none()
+            && (self.tray.is_some() || self.strip_visible());
+        if requested_hidden && !self.hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+    }
+
     pub(super) fn draw_settings_recovery(&mut self, ui: &mut egui::Ui) {
         let Some(error) = &self.settings.load_error else { return };
         let (mut retry, mut open_folder, mut quit) = (false, false, false);
@@ -88,6 +99,42 @@ mod tests {
             egui::Shape::Text(text) if text.galley.text() == name => Some(text.visual_bounding_rect()),
             _ => None,
         })
+    }
+
+    #[test]
+    fn a_failed_tray_requires_a_visible_strip_before_starting_hidden() {
+        for (collapsed, always_show_strip, suppressed, requested_hidden, hidden) in [
+            (false, false, true, true, false),
+            (true, false, true, true, false),
+            (false, true, true, true, false),
+            (true, true, true, true, false),
+            (true, false, false, true, true),
+            (false, true, false, true, true),
+            (false, false, false, true, false),
+            (true, true, false, false, false),
+        ] {
+            let mut app = App::stopped(Settings { collapsed, always_show_strip, ..Settings::default() });
+            app.strip_suppressed = suppressed;
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| app.set_startup_visibility(ui.ctx(), requested_hidden));
+            assert_eq!(app.hidden, hidden, "collapsed={collapsed}, always={always_show_strip}, suppressed={suppressed}");
+            let shown = output.viewport_output.values().flat_map(|v| &v.commands)
+                .any(|command| *command == egui::ViewportCommand::Visible(true));
+            assert_eq!(shown, requested_hidden && !hidden, "show a window that was created hidden");
+            assert!(app.dirty_since.is_none(), "the fallback does not change the saved preference");
+            assert_eq!(app.settings.collapsed, collapsed);
+        }
+    }
+
+    #[test]
+    fn settings_recovery_stays_visible_even_when_a_strip_would_be_available() {
+        let mut app = failed_app();
+        app.settings.collapsed = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| app.set_startup_visibility(ui.ctx(), true));
+        assert!(!app.hidden);
+        assert!(output.viewport_output.values().flat_map(|v| &v.commands)
+            .any(|command| *command == egui::ViewportCommand::Visible(true)));
     }
 
     #[test]

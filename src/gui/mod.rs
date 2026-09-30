@@ -288,13 +288,8 @@ impl App {
             Ok(hotkeys) => app.hotkeys = Some(hotkeys),
             Err(e) => app.hotkey_status = (short(&format!("{e:#}")), RED),
         }
-        app.hidden = start_hidden && app.settings.load_error.is_none();
         app.strip_suppressed = std::env::args().any(|arg| arg == config::MINIMIZED_ARG);
-        if start_hidden && (!app.hidden || (app.tray.is_none() && !app.settings.collapsed)) {
-            // Show load errors, or a window with no way back from the tray.
-            app.hidden = false;
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        }
+        app.set_startup_visibility(ctx, start_hidden);
 
         app.initialize_settings();
         app
