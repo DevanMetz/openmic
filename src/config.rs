@@ -254,6 +254,26 @@ impl Default for Processing {
     }
 }
 
+impl Processing {
+    fn validate(&self) -> Result<()> {
+        validate_finite(&[
+            ("strength", self.strength),
+            ("input_gain_db", self.input_gain_db),
+            ("output_gain_db", self.output_gain_db),
+            ("gate_threshold_db", self.gate_threshold_db),
+            ("highpass_hz", self.highpass_hz),
+            ("voice_threshold", self.voice_threshold),
+        ])
+    }
+}
+
+fn validate_finite(values: &[(&str, f32)]) -> Result<()> {
+    for &(name, value) in values {
+        anyhow::ensure!(value.is_finite(), "{name} must be a finite number");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
     pub name: String,
@@ -322,6 +342,25 @@ impl Settings {
 }
 
 impl Settings {
+    /// JSON numbers can overflow f32 when read. Reject those values before
+    /// use or save: serde_json would otherwise silently write them as null.
+    fn validate(&self) -> Result<()> {
+        self.processing().validate()?;
+        validate_finite(&[("monitor_volume", self.monitor_volume), ("sound_volume", self.sound_volume)])?;
+        for pad in &self.sounds {
+            validate_finite(&[("volume", pad.volume), ("start", pad.start), ("end", pad.end.unwrap_or_default())])
+                .with_context(|| format!("soundboard pad '{}'", pad.display_name()))?;
+        }
+        for preset in &self.presets {
+            preset.processing.validate().with_context(|| format!("preset '{}'", preset.name))?;
+        }
+        if let Some(width) = self.strip_width { validate_finite(&[("strip_width", width)])?; }
+        if let Some([width, height]) = self.window_size {
+            validate_finite(&[("window width", width), ("window height", height)])?;
+        }
+        Ok(())
+    }
+
     pub fn load() -> Self {
         Self::load_from(&settings_path(), &legacy_settings_paths())
     }
@@ -340,7 +379,10 @@ impl Settings {
     fn load_from(path: &Path, legacy: &[PathBuf]) -> Self {
         for source in std::iter::once(path).chain(legacy.iter().map(PathBuf::as_path)) {
             let result = match fs::read(source) {
-                Ok(bytes) => serde_json::from_slice::<Self>(&bytes).context("Parse settings"),
+                Ok(bytes) => serde_json::from_slice::<Self>(&bytes).context("Parse settings").and_then(|settings| {
+                    settings.validate().context("Validate settings")?;
+                    Ok(settings)
+                }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => Err(anyhow::Error::new(error).context("Read settings")),
             };
@@ -376,6 +418,7 @@ impl Settings {
         if let Some(error) = &self.load_error {
             anyhow::bail!("Settings were not loaded from {}; retry loading before saving", error.path.display());
         }
+        self.validate().context("Validate settings")?;
         let text = serde_json::to_string_pretty(self).context("serialize settings")?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         fs::create_dir_all(parent).context("create OpenMic settings directory")?;
@@ -613,6 +656,61 @@ mod tests {
         assert!(fresh.load_error.is_none());
         assert_eq!(fresh.sound_volume, Settings::default().sound_volume, "moving the failed file aside allows a fresh start");
         assert_eq!(fs::read(backup).unwrap(), bytes);
+    }
+
+    #[test]
+    fn overflowing_settings_numbers_are_protected_until_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for json in [
+            r#"{"input_gain_db":1e100}"#,
+            r#"{"monitor_volume":-1e100}"#,
+            r#"{"presets":[{"name":"Broken","processing":{"voice_threshold":1e100}}]}"#,
+            r#"{"sounds":[{"path":"clip.wav","volume":1e100}]}"#,
+            r#"{"sounds":[{"path":"clip.wav","start":1e100}]}"#,
+            r#"{"sounds":[{"path":"clip.wav","end":1e100}]}"#,
+            r#"{"strip_width":1e100}"#,
+            r#"{"window_size":[700,1e100]}"#,
+        ] {
+            fs::write(&path, json).unwrap();
+            let loaded = Settings::load_from(&path, &[]);
+            assert!(loaded.load_error.as_ref().unwrap().message.contains("finite number"), "{json}");
+            assert!(loaded.save_to(&path).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), json, "preserve the source instead of saving null");
+            fs::write(&path, br#"{"input_gain_db":6.0}"#).unwrap();
+            let repaired = loaded.retry_from(&path);
+            assert!(repaired.load_error.is_none());
+            assert_eq!(repaired.input_gain_db, 6.0);
+            repaired.save_to(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn nonfinite_runtime_values_never_replace_valid_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        Settings { mute: true, ..Default::default() }.save_to(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for field in ["voice", "monitor", "soundboard", "preset", "pad trim", "strip", "window"] {
+                let mut settings = Settings::default();
+                match field {
+                    "voice" => settings.gate_threshold_db = value,
+                    "monitor" => settings.monitor_volume = value,
+                    "soundboard" => settings.sound_volume = value,
+                    "preset" => settings.presets.push(Preset {
+                        name: "Broken".into(), processing: Processing { strength: value, ..Default::default() },
+                    }),
+                    "pad trim" => settings.sounds.push(Pad { end: Some(value), ..Pad::new("clip.wav".into()) }),
+                    "strip" => settings.strip_width = Some(value),
+                    _ => settings.window_size = Some([value, 420.0]),
+                }
+                let error = settings.save_to(&path).unwrap_err();
+                assert!(format!("{error:#}").contains("finite number"), "{field}: {error:#}");
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "validation happens before creating a temporary file");
+            }
+        }
     }
 
     #[test]
