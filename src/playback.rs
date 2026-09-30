@@ -40,10 +40,20 @@ pub fn is_cable(name: &str) -> bool {
     name.to_ascii_uppercase().contains("CABLE")
 }
 
+/// Check the resolved device too: the Windows default can be the same
+/// virtual output that carries processed audio into a voice call.
+fn validate_output(name: &str, processed_output: &str) -> Result<()> {
+    if is_cable(name) || name == processed_output {
+        return Err(anyhow!("Choose headphones as the monitor output; '{name}' is a voice-call output"));
+    }
+    Ok(())
+}
+
 impl Player {
     /// Play `samples` (mono at the DSP rate) on the output named `device`,
-    /// or the Windows default output when it's empty.
-    pub fn play(device: &str, samples: &[f32]) -> Result<Self> {
+    /// or the Windows default output when it's empty. The resolved device
+    /// must differ from the processed output and must not be VB-Cable.
+    pub fn play(device: &str, processed_output: &str, samples: &[f32]) -> Result<Self> {
         let host = cpal::default_host();
         let device = if device.is_empty() {
             host.default_output_device().context("no default output device")?
@@ -54,9 +64,7 @@ impl Player {
                 .with_context(|| format!("output '{device}' not found"))?
         };
         let name = device.to_string();
-        if is_cable(&name) {
-            return Err(anyhow!("'{name}' goes to Discord; choose headphones as the monitor output"));
-        }
+        validate_output(&name, processed_output)?;
         let supported = device.default_output_config().context("query the output's format")?;
         let config = StreamConfig {
             channels: supported.channels(),
@@ -173,6 +181,20 @@ mod tests {
         assert!(is_cable("CABLE Input (VB-Audio Virtual Cable)"));
         assert!(is_cable("Cable Output"));
         assert!(!is_cable("Speakers (JDS Labs Atom DAC)"));
+    }
+
+    #[test]
+    fn a_resolved_preview_device_cannot_be_the_processed_output() {
+        let processed = "Voicemeeter Input";
+        assert!(!is_cable(processed), "custom virtual devices need the route comparison too");
+        for output in [processed, "CABLE Input (VB-Audio Virtual Cable)", "Cable Output"] {
+            let error = validate_output(output, processed).unwrap_err().to_string();
+            assert!(error.starts_with("Choose headphones as the monitor output"));
+            assert!(error.contains(output));
+        }
+        assert!(validate_output("Headphones", processed).is_ok());
+        assert!(validate_output("Headphones", "").is_ok(), "a stopped app with no processed route can still preview");
+        assert!(validate_output("Headphones", "Headphones").is_err(), "protect explicit routes regardless of device branding");
     }
 
     #[test]

@@ -131,7 +131,7 @@ impl App {
             },
         };
         let Some(samples) = samples else { return };
-        match Player::play(&self.test_output(), &samples) {
+        match Player::play(&self.test_output(), &self.settings.output, &samples) {
             Ok(player) => {
                 self.mic_test.player = Some((player, version));
                 let fallback = version == Version::Cleaned && self.mic_test.used_fallback();
