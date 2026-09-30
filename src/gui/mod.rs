@@ -142,6 +142,12 @@ struct CachedClip {
     modified: Option<SystemTime>,
 }
 
+struct DictationRecording {
+    recorder: Recorder,
+    /// Stop the way this take started, even if the preference changes.
+    hold_to_talk: bool,
+}
+
 pub struct App {
     settings: Settings,
     inputs: Vec<String>,
@@ -211,7 +217,7 @@ pub struct App {
     /// Speech-to-text model download and transcription.
     dictation: Dictation,
     /// Speech being recorded for dictation.
-    dictating: Option<Recorder>,
+    dictating: Option<DictationRecording>,
     dictation_status: Status,
     /// The words most recently recognized, including when typing was blocked.
     last_dictation: String,
@@ -730,12 +736,12 @@ impl App {
             Command::Dictate => {
                 if self.dictating.is_none() {
                     self.start_dictation();
-                } else if !self.settings.dictation_hold {
+                } else if self.dictating.as_ref().is_some_and(|recording| !recording.hold_to_talk) {
                     self.stop_dictation();
                 }
             }
             Command::DictateReleased => {
-                if self.settings.dictation_hold {
+                if self.dictating.as_ref().is_some_and(|recording| recording.hold_to_talk) {
                     self.stop_dictation();
                 }
             }
@@ -1026,7 +1032,7 @@ impl App {
         // An empty choice falls back to the Windows default microphone.
         match Recorder::start(Source::Microphone, &self.settings.microphone) {
             Ok(recorder) => {
-                self.dictating = Some(recorder);
+                self.dictating = Some(DictationRecording { recorder, hold_to_talk: self.settings.dictation_hold });
                 self.dictation_status = ("Listening…".into(), AMBER);
             }
             Err(e) => {
@@ -1038,8 +1044,8 @@ impl App {
 
     /// Stop recording and type what was said.
     fn stop_dictation(&mut self) {
-        let Some(recorder) = self.dictating.take() else { return };
-        self.dictation_status = match recorder.finish() {
+        let Some(recording) = self.dictating.take() else { return };
+        self.dictation_status = match recording.recorder.finish() {
             Ok(Some(take)) => {
                 if let Some(warning) = take.warning() {
                     self.dictation_status = (short(&format!("Dictation stopped: {warning}")), RED);
@@ -1054,12 +1060,12 @@ impl App {
     }
 
     fn poll_dictation(&mut self) {
-        if let Some(e) = self.dictating.as_ref().and_then(Recorder::error) {
+        if let Some(e) = self.dictating.as_ref().and_then(|recording| recording.recorder.error()) {
             self.dictating = None;
             self.dictation_status = (short(&e), RED);
         }
         // A toggle left on by mistake shouldn't record all day.
-        if self.dictating.as_ref().is_some_and(|r| r.elapsed() >= MAX_DICTATION) {
+        if self.dictating.as_ref().is_some_and(|recording| recording.recorder.elapsed() >= MAX_DICTATION) {
             self.stop_dictation();
         }
         while let Some(event) = self.dictation.poll() {
@@ -1400,12 +1406,36 @@ mod tests {
         let mut app = App::stopped(Settings::default());
         let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
         recorder.report_skipped_for_test();
-        app.dictating = Some(recorder);
+        app.dictating = Some(DictationRecording { recorder, hold_to_talk: true });
         app.stop_dictation();
         assert!(app.dictating.is_none());
         assert!(!app.dictation.busy());
         assert!(app.dictation_status.0.contains("audio was skipped"));
         assert_eq!(app.dictation_status.1, RED);
+    }
+
+    #[test]
+    fn active_dictation_keeps_its_original_stop_behavior_when_the_mode_changes() {
+        let ctx = egui::Context::default();
+        for hold_to_talk in [true, false] {
+            let mut app = App::stopped(Settings { dictation_hold: hold_to_talk, ..Settings::default() });
+            app.dictating = Some(DictationRecording {
+                recorder: Recorder::from_samples_for_test(&[]), hold_to_talk,
+            });
+            app.settings.dictation_hold = !hold_to_talk;
+            let (ignored, stops) = if hold_to_talk {
+                (Command::Dictate, Command::DictateReleased)
+            } else {
+                (Command::DictateReleased, Command::Dictate)
+            };
+            app.run_command(&ctx, ignored);
+            assert!(app.dictating.is_some(), "the new preference must not change the current take");
+            app.run_command(&ctx, stops);
+            assert!(app.dictating.is_none(), "the original stop gesture must still work");
+            assert!(!app.dictation.busy(), "the empty fixture never loads a speech model");
+            assert_eq!(app.dictation_status.0, "Nothing was heard");
+            assert_eq!(app.settings.dictation_hold, !hold_to_talk, "keep the preference for the next take");
+        }
     }
 
     #[test]

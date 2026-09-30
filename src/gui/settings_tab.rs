@@ -198,9 +198,11 @@ impl App {
                 ui.horizontal(|ui| {
                     let mut changed = ui
                         .radio_value(&mut self.settings.dictation_hold, true, "Hold the shortcut while you speak")
+                        .on_hover_text("Applies to the next recording")
                         .changed();
                     changed |= ui
                         .radio_value(&mut self.settings.dictation_hold, false, "Press to start, again to stop")
+                        .on_hover_text("Applies to the next recording")
                         .changed();
                     if changed {
                         self.touch();
