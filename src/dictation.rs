@@ -366,7 +366,7 @@ pub(crate) fn download_agent(idle_timeout: Duration) -> ureq::Agent {
     ureq::Agent::with_parts(config, DownloadConnector(idle_timeout), ureq::unversioned::resolver::DefaultResolver::default())
 }
 
-fn check_download_cancelled(cancel: &AtomicBool) -> Result<()> {
+pub(crate) fn check_download_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         bail!("download cancelled");
     }

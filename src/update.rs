@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::dictation::{download_agent, read_download_chunk};
+use crate::dictation::{check_download_cancelled, download_agent, read_download_chunk};
 use crate::logfile;
 
 const LATEST_RELEASE: &str = "https://api.github.com/repos/DevanMetz/openmic/releases/latest";
@@ -207,18 +207,23 @@ fn download(
     cancel: &AtomicBool,
 ) -> Result<()> {
     let fetch = |url: &str, what: &str| {
-        agent
+        check_download_cancelled(cancel)?;
+        let response = agent
             .get(url)
             .call()
-            .and_then(|r| r.into_body().read_to_string())
-            .with_context(|| format!("download the update's {what}"))
+            .and_then(|r| r.into_body().read_to_string());
+        check_download_cancelled(cancel)?;
+        response.with_context(|| format!("download the update's {what}"))
     };
     let expected = parse_checksum(&fetch(&release.sha_url, "checksum")?)?;
     let signature = fetch(&release.sig_url, "signature")?;
 
     let partial = dest.with_extension("part");
     let result = (|| -> Result<()> {
-        let response = agent.get(&release.exe_url).call().context("download the update")?;
+        check_download_cancelled(cancel)?;
+        let response = agent.get(&release.exe_url).call();
+        check_download_cancelled(cancel)?;
+        let response = response.context("download the update")?;
         let mut reader = response.into_body().into_reader();
         let mut out = File::create(&partial).with_context(|| {
             format!("save the update beside OpenMic in {}", partial.parent().unwrap_or(dest).display())
@@ -244,7 +249,8 @@ fn download(
         if hash.as_slice() != expected {
             bail!("the update failed its checksum; nothing was changed");
         }
-        verify_signature(key, &release.exe_name, &hash, &signature)
+        verify_signature(key, &release.exe_name, &hash, &signature)?;
+        check_download_cancelled(cancel)
     })();
     if let Err(e) = result {
         let _ = fs::remove_file(&partial);
@@ -702,6 +708,73 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("openmic.exe.update")).unwrap(), b"new exe");
         assert_eq!(done, 7);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no partial file left");
+    }
+
+    #[test]
+    fn cancelled_download_skips_requests_and_preserves_the_staged_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("openmic.exe.update");
+        fs::write(&dest, b"previous verified update").unwrap();
+        let done = AtomicU64::new(17);
+        // The sample has no request URLs: cancellation must win before any
+        // attempt to fetch or parse metadata, or to touch the staged file.
+        let result = download(
+            &agent(), &Release::sample("v9.0.0"), &RELEASE_KEY, &dest, &done, &AtomicBool::new(true),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "download cancelled");
+        assert_eq!(done.load(Ordering::Relaxed), 17);
+        assert_eq!(fs::read(&dest).unwrap(), b"previous verified update");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cancellation_during_checksum_fetch_prevents_further_update_requests() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let cancel = Arc::<AtomicBool>::default();
+        let cancelled = Arc::clone(&cancel);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "checksum request did not arrive");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept checksum request: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.starts_with("GET /checksum "));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() { break; }
+            }
+            // Cancel while the metadata request is in flight. The response
+            // is valid, but the signature and executable must not be fetched.
+            cancelled.store(true, Ordering::Relaxed);
+            let checksum = "0".repeat(64);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{checksum}").unwrap();
+        });
+        let release = Release {
+            sha_url: format!("{base}/checksum"), sig_url: format!("{base}/signature"),
+            exe_url: format!("{base}/executable"), ..Release::sample("v9.0.0")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = download(
+            &download_agent(Duration::from_secs(1)), &release, &RELEASE_KEY,
+            &dir.path().join("openmic.exe.update"), &AtomicU64::new(0), &cancel,
+        );
+        server.join().unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "download cancelled");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
