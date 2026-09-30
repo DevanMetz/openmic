@@ -94,10 +94,10 @@ impl App {
     fn step_action(&mut self, ui: &mut egui::Ui, step: Step) {
         match step {
             Step::Cable => {
-                if ui.small_button("Get VB-Cable").clicked() {
+                if ui.small_button("Get VB-Cable").on_hover_text("Run the installer as administrator").clicked() {
                     open_url(VB_CABLE_URL);
                 }
-                ui.weak("run its setup as administrator");
+                ui.weak("If installed, enable CABLE Input in Windows");
             }
             Step::Microphone => {
                 ui.weak("pick it under Routing below");
@@ -118,8 +118,8 @@ impl App {
 
     // ---- routing -------------------------------------------------------------
 
-    /// Discord hears OpenMic through VB-Cable. The checklist covers a missing
-    /// VB-Cable; this covers a wrong output and the default-mic setting.
+    /// Guide the VB-Cable route, or explain how a custom virtual output reaches
+    /// Discord. Device enumeration cannot tell whether a driver is installed.
     fn draw_cable_hint(&mut self, ui: &mut egui::Ui) {
         let cable = cable_input(&self.outputs).cloned();
         let tone = match &cable {
@@ -139,18 +139,18 @@ impl App {
                     None => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new("VB-Cable isn't installed: Discord needs it to hear OpenMic.")
+                                RichText::new("VB-Cable input isn't available.")
                                     .color(AMBER),
                             );
                             if ui.button("Get VB-Cable").clicked() {
                                 open_url(VB_CABLE_URL);
                             }
                         });
-                        ui.weak("Run its setup as administrator; OpenMic switches to it automatically.");
+                        ui.weak("If installed, enable CABLE Input in Windows. Otherwise, run VB-Cable's setup as administrator.");
                     }
                     Some(cable) if self.settings.output != cable => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Discord can't hear this output.").color(AMBER));
+                            ui.label(RichText::new("A different processed output is selected.").color(AMBER));
                             if ui.button("Use VB-Cable").clicked() {
                                 self.settings.output = cable;
                                 self.touch();
@@ -159,6 +159,7 @@ impl App {
                                 }
                             }
                         });
+                        ui.weak("For another virtual output, choose its matching input in Discord.");
                     }
                     Some(_) => {
                         let changed = ui
@@ -196,7 +197,7 @@ impl App {
                 if cable {
                     widgets::badge(ui, "VB-Cable connected", GREEN);
                 } else {
-                    widgets::badge(ui, "VB-Cable not installed", AMBER);
+                    widgets::badge(ui, "VB-Cable unavailable", AMBER);
                 }
             },
             |ui| {
@@ -388,7 +389,7 @@ fn step_mark(ui: &mut egui::Ui, number: usize, done: bool) {
 
 fn step_title(step: Step, default_mic: bool) -> &'static str {
     match step {
-        Step::Cable => "Install VB-Cable",
+        Step::Cable => "Set up VB-Cable",
         Step::Microphone => "Choose your microphone",
         Step::Discord if default_mic => "In Discord, set Voice & Video > Input Device to Default",
         Step::Discord => "In Discord, set Voice & Video > Input Device to CABLE Output",
