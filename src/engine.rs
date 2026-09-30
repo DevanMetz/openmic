@@ -179,7 +179,9 @@ impl OutQueue {
                 frame.fill(T::EQUILIBRIUM);
                 break;
             };
-            frame.fill(s.to_sample());
+            // Cubic rate conversion can overshoot even when DSP samples
+            // were already limited to the device's full-scale range.
+            frame.fill(s.clamp(-1.0, 1.0).to_sample());
         }
         for frame in frames {
             frame.fill(T::EQUILIBRIUM);
@@ -843,6 +845,17 @@ mod tests {
         assert!(is_transient(&ErrorKind::RealtimeDenied.into()));
         assert!(!is_transient(&ErrorKind::DeviceNotAvailable.into()));
         assert!(!is_transient(&ErrorKind::StreamInvalidated.into()));
+    }
+
+    #[test]
+    fn device_output_clips_resampling_overshoot_on_every_channel() {
+        let queue = OutQueue::new(48_000);
+        for sample in [1.25, -1.25, 0.25].into_iter().cycle().take(queue.target()) {
+            queue.push(sample);
+        }
+        let mut output = [0.0f32; 6];
+        queue.fill(&mut output, 2);
+        assert_eq!(output, [1.0, 1.0, -1.0, -1.0, 0.25, 0.25]);
     }
 
     #[test]

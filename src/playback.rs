@@ -153,7 +153,8 @@ where
         let start = progress.queued.load(Ordering::Relaxed);
         let mut at = start;
         for frame in data.chunks_mut(channels) {
-            let s = audio.get(at).copied().unwrap_or(0.0);
+            // Resampling can overshoot full scale even for clipped input.
+            let s = audio.get(at).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
             at = (at + 1).min(audio.len());
             frame.fill(T::from_sample(s));
         }
@@ -254,6 +255,19 @@ mod tests {
             callback: cpal::StreamInstant::from_millis(callback_ms),
             playback: cpal::StreamInstant::from_millis(playback_ms),
         })
+    }
+
+    #[test]
+    fn preview_output_clips_cubic_resampling_overshoot() {
+        let converted = resample(&[-1.0, 1.0, 1.0, -1.0], 96_000);
+        assert!(converted.iter().any(|s| s.abs() > 1.0), "the fixture must exercise interpolation overshoot");
+        let expected: Vec<_> = converted.iter().flat_map(|s| [s.clamp(-1.0, 1.0); 2]).collect();
+        let mut output = vec![0.0f32; expected.len()];
+        output_callback::<f32>(Arc::new(converted), 2, 96_000, Arc::default())(
+            &mut output, &output_time(0, 20),
+        );
+        assert_eq!(output, expected);
+        assert!(output.iter().all(|s| (-1.0..=1.0).contains(s)));
     }
 
     #[test]
