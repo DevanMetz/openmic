@@ -933,7 +933,12 @@ impl App {
         .collect()
     }
 
-    fn sync_hotkeys(&mut self) {
+    fn sync_hotkeys(&mut self, ctx: &egui::Context) {
+        // Capture temporarily frees every global shortcut. Restore them
+        // when the full window can no longer receive the replacement key.
+        if self.hidden || ctx.input(|i| !i.focused || i.viewport().minimized == Some(true)) {
+            self.cancel_capture();
+        }
         let bindings = self.hotkey_bindings();
         let Some(hotkeys) = &mut self.hotkeys else { return };
         let refused = hotkeys.set(bindings);
@@ -1018,8 +1023,9 @@ impl App {
     }
 
     fn cancel_capture(&mut self) {
-        self.capturing = None;
-        self.hotkey_status = ("Shortcut unchanged".into(), MUTED);
+        if self.capturing.take().is_some() {
+            self.hotkey_status = ("Shortcut unchanged".into(), MUTED);
+        }
     }
 
     // ---- speech to text ----------------------------------------------------
@@ -1117,7 +1123,7 @@ impl App {
             self.last_device_poll = Instant::now();
             self.refresh_devices(false);
         }
-        self.sync_hotkeys();
+        self.sync_hotkeys(ctx);
         let (muted, bypassed, running) = (self.settings.mute, self.settings.bypass, self.running());
         let listening = self.dictating.is_some();
         if let Some(tray) = &mut self.tray {
@@ -1248,6 +1254,9 @@ impl App {
             let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, text));
             if response.clicked() {
                 self.finish_pad_rename(true);
+                if !selected {
+                    self.cancel_capture();
+                }
                 self.page = page;
             }
         }
@@ -1659,6 +1668,73 @@ mod tests {
         assert!(app.capturing.is_none(), "Clear must end shortcut capture");
         assert!(app.settings.hotkeys.dictate.is_none());
         assert_eq!(app.hotkey_bindings(), vec![("Ctrl+Alt+M".into(), Command::ToggleMute)]);
+    }
+
+    #[test]
+    fn leaving_the_full_window_restores_shortcuts_without_changing_the_binding() {
+        for (focused, hidden, minimized) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let mut app = App::stopped(Settings::default());
+            app.assign_hotkey(&Binding::Dictate, Some("Ctrl+Alt+D".into()));
+            let saved = app.hotkey_bindings();
+            app.start_capture(Binding::Dictate);
+            app.hidden = hidden;
+
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput { focused, ..Default::default() };
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().minimized = Some(minimized);
+            let _ = ctx.run_ui(input, |ui| app.sync_hotkeys(ui.ctx()));
+
+            let active = focused && !hidden && !minimized;
+            assert_eq!(app.capturing.is_some(), active);
+            assert_eq!(app.settings.hotkeys.dictate.as_deref(), Some("Ctrl+Alt+D"));
+            if active {
+                assert!(app.hotkey_bindings().is_empty());
+            } else {
+                assert_eq!(app.hotkey_bindings(), saved);
+            }
+        }
+    }
+
+    #[test]
+    fn changing_pages_cancels_shortcut_capture() {
+        use eframe::App as _;
+        for destination in [Page::Settings, Page::Voice] {
+            let mut app = App::stopped(Settings::default());
+            app.page = Page::Settings;
+            app.assign_hotkey(&Binding::Dictate, Some("Ctrl+Alt+D".into()));
+            app.start_capture(Binding::Dictate);
+            let ctx = egui::Context::default();
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
+                events,
+                ..Default::default()
+            }, |ui| app.ui(ui, &mut frame));
+            let output = draw(&mut app, vec![]);
+            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == destination.title()
+                    && text.visual_bounding_rect().right() < SIDEBAR_WIDTH => Some(text.visual_bounding_rect().center()),
+                _ => None,
+            }).expect("sidebar navigation");
+            let button = |pressed| egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            };
+            for events in [vec![egui::Event::PointerMoved(pos)], vec![button(true)], vec![button(false)]] {
+                draw(&mut app, events);
+            }
+            assert_eq!(app.page, destination);
+            assert_eq!(app.capturing.is_some(), destination == Page::Settings,
+                "only leaving the current page cancels capture");
+            assert_eq!(app.settings.hotkeys.dictate.as_deref(), Some("Ctrl+Alt+D"));
+            if destination != Page::Settings {
+                assert_eq!(app.hotkey_bindings(), vec![("Ctrl+Alt+D".into(), Command::Dictate)]);
+            }
+        }
     }
 
     /// Draw the whole window headlessly (as eframe does) and return every
