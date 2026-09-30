@@ -94,7 +94,7 @@ The **Voice** page lists each setting as a row, in the order your voice passes t
 | **To Discord** | Output gain: how loud Discord hears you | Up or down | 0.5 dB |
 | **Hear yourself** | The headphone monitor, on the monitor output chosen under **Routing**; use headphones to prevent feedback | Volume, left or right | 1% |
 
-Pick a starting point from the preset chips above the rows (**Balanced**, **Mechanical keyboard**, **Quiet room**, **Noisy room**, **Low CPU**). **+** saves your current settings as a preset; right-click a saved one to delete it. Click the model name under **Remove noise** to switch between DeepFilterNet and RNNoise. **Bypass** sends your raw microphone with none of the settings. OpenMic reopens at the size and place you left it.
+Pick a starting point from the preset chips above the rows (**Balanced**, **Mechanical keyboard**, **Quiet room**, **Noisy room**, **Low CPU**). **+** saves your current settings as a preset; right-click a saved one to delete it. Click the model name under **Remove noise** to switch between DeepFilterNet and RNNoise. **Bypass** skips noise reduction and both gates; input gain, the rumble filter, output gain and microphone mute still apply. OpenMic reopens at the size and place you left it.
 
 Settings are saved automatically using atomic file replacement, so an interrupted write leaves the previous settings intact. If saving fails, the status panel shows **Settings not saved · retrying…**; hover over it for details. OpenMic retries while it runs.
 

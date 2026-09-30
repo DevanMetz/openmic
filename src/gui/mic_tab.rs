@@ -291,7 +291,7 @@ impl App {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if widgets::pill(ui, &mut self.settings.bypass, "Bypass", MUTED)
-                .on_hover_text("Send your raw microphone, with none of the settings below")
+                .on_hover_text("Skip noise reduction and both gates. Mic level, rumble filter, output level and mute still apply.")
                 .changed()
             {
                 self.apply_live();
@@ -319,7 +319,8 @@ impl App {
             },
             |ui| {
                 if bypassed {
-                    ui.colored_label(AMBER, "Bypass is on: Discord hears your raw microphone.");
+                    ui.colored_label(AMBER, "Bypass is on: noise reduction and both gates are skipped.")
+                        .on_hover_text("Mic level, rumble filter, output level and mute still apply.");
                 }
                 changed = viz::voice_rows(ui, &frames, &mut self.settings, &mut self.strength_before_off);
             },
