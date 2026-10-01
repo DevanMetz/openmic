@@ -10,7 +10,7 @@ pub fn cable_input(outputs: &[String]) -> Option<&String> {
 }
 
 /// Keep valid device choices and fill missing ones: the processed output
-/// prefers VB-Cable. The monitor avoids both the cable and the processed
+/// prefers VB-Cable. The monitor avoids known cables and the processed
 /// output. When VB-Cable has just been installed or the app launches
 /// (`prefer_cable`), switch the processed output over to it.
 /// Without VB-Cable the processed output stays unset: defaulting to the
@@ -41,7 +41,7 @@ pub fn choose_routes(
     if needs(&s.monitor_output, outputs) {
         s.monitor_output = outputs
             .iter()
-            .find(|n| Some(*n) != cable && *n != &s.output)
+            .find(|n| !crate::playback::is_cable(n) && *n != &s.output)
             .cloned()
             .unwrap_or_default();
     }
@@ -106,6 +106,27 @@ mod tests {
         choose_routes(&mut s, &inputs, &outputs, false, false);
         assert_eq!(s.output, processed, "keep the explicitly selected voice-call route");
         assert_eq!(s.monitor_output, "Headphones", "neither virtual voice-call route is a monitor default");
+    }
+
+    #[test]
+    fn automatic_monitor_selection_skips_every_known_virtual_cable() {
+        let main = "CABLE Input (VB-Audio Virtual Cable)";
+        let inputs = names(&["USB mic"]);
+        for extra in ["CABLE Input (second device)", "CABLE-A Input", "Line 1 (Virtual Audio Cable)"] {
+            let mut s = Settings::default();
+            let outputs = names(&[main, extra, "Headphones"]);
+            choose_routes(&mut s, &inputs, &outputs, false, false);
+            assert_eq!(s.output, main);
+            assert_eq!(s.monitor_output, "Headphones", "{extra} must not become an automatic headphone output");
+
+            let only_cables = names(&[main, extra]);
+            choose_routes(&mut s, &inputs, &only_cables, false, true);
+            assert!(s.monitor_output.is_empty(), "wait for headphones instead of selecting {extra}");
+
+            s.monitor_output = extra.into();
+            choose_routes(&mut s, &inputs, &outputs, false, true);
+            assert_eq!(s.monitor_output, extra, "preserve an explicitly selected route");
+        }
     }
 
     #[test]
