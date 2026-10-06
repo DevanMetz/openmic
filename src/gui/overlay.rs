@@ -3,15 +3,15 @@
 //! out, red when muted; click it to mute), then your starred pads, the
 //! preset (click for the next one) and a button to expand back to the full
 //! window. Buttons are as wide as their names, and pads come first: when the
-//! strip is too narrow, the preset goes before any pad does. Drag the strip
-//! to move it and its right edge to resize it, down to just the microphone.
+//! strip is too narrow, the preset goes first and the pads scroll. Drag the
+//! strip to move it and its right edge to resize it, down to just the microphone.
 
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, ResizeDirection, Sense, Stroke, StrokeKind, Vec2,
     ViewportBuilder, ViewportCommand, ViewportId,
 };
 
-use super::{App, Command, GREEN, MUTED, RED};
+use super::{App, Command, AMBER, GREEN, MUTED, RED};
 use crate::config;
 
 pub(super) const HEIGHT: f32 = 34.0;
@@ -49,8 +49,30 @@ pub(super) enum Meter {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Strip {
     pub preset: String,
-    /// Starred pads: board index, name, playing, loading.
-    pub pads: Vec<(usize, String, bool, bool)>,
+    pub pads: Vec<StripPad>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct StripPad {
+    /// File identity, independent of the board order and display name.
+    pub key: u64,
+    pub index: usize,
+    pub name: String,
+    pub playing: bool,
+    pub paused: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl StripPad {
+    fn failed(&self) -> bool {
+        self.error.is_some() && !self.loading && !self.playing && !self.paused
+    }
+
+    fn label(&self) -> String {
+        let name = truncate(&self.name, MAX_NAME);
+        if self.failed() { format!("! {name}") } else { name }
+    }
 }
 
 /// What the user did on the strip this frame.
@@ -60,24 +82,13 @@ pub(super) enum Action {
     Expand,
     NextPreset,
     PlayPad(usize),
+    RevealPad(usize),
 }
 
-/// Where the buttons go between `left` and `right`, given each pad's and
-/// the preset's width: pads in order while they fit, then the preset only
-/// if every pad fit and there's room. Returns each placed pad's (position
-/// in `pads`, x) and the preset's x.
-fn layout(left: f32, right: f32, pads: &[f32], preset: f32) -> (Vec<(usize, f32)>, Option<f32>) {
-    let mut x = left;
-    let mut placed = Vec::new();
-    for (i, &width) in pads.iter().enumerate() {
-        if x + width > right {
-            return (placed, None);
-        }
-        placed.push((i, x));
-        x += width + GAP;
-    }
-    let preset = (x + preset <= right).then_some(x);
-    (placed, preset)
+/// Put the preset after the pads only when every button fits.
+fn preset_position(left: f32, right: f32, pads: &[f32], preset: f32) -> Option<f32> {
+    let x = left + pads.iter().map(|width| width + GAP).sum::<f32>();
+    (x + preset <= right).then_some(x)
 }
 
 /// How wide a button for `text` is.
@@ -166,7 +177,18 @@ impl App {
                 .iter()
                 .enumerate()
                 .filter(|(_, pad)| pad.starred)
-                .map(|(i, pad)| (i, pad.display_name(), self.playing.contains(&super::clip_key(&pad.path)), self.clip_loading(&pad.path)))
+                .map(|(i, pad)| {
+                    let key = super::clip_key(&pad.path);
+                    StripPad {
+                        key,
+                        index: i,
+                        name: pad.display_name(),
+                        playing: self.playing.contains(&key),
+                        paused: self.pad_progress.get(&key).is_some_and(|clip| clip.paused),
+                        loading: self.clip_loading(&pad.path),
+                        error: self.clip_errors.get(&pad.path).cloned(),
+                    }
+                })
                 .collect(),
         }
     }
@@ -187,7 +209,7 @@ impl App {
             // Sized to fit what it shows, unless resized by hand.
             let width = self.settings.strip_width.unwrap_or_else(|| {
                 let measure = |text: &str| button_width(text_width(ctx, text));
-                let pads: Vec<f32> = strip.pads.iter().map(|(_, name, _, _)| measure(&truncate(name, MAX_NAME))).collect();
+                let pads: Vec<f32> = strip.pads.iter().map(|pad| measure(&pad.label())).collect();
                 fitting_width(&pads, measure(&truncate(&strip.preset, MAX_NAME)))
             });
             self.overlay_spawn_width = width.clamp(MIN_WIDTH, MAX_WIDTH);
@@ -239,6 +261,7 @@ impl App {
                 Action::Expand => self.set_collapsed(ctx, false),
                 Action::NextPreset => self.next_preset(),
                 Action::PlayPad(index) => self.toggle_clip(index, ctx),
+                Action::RevealPad(index) => self.reveal_pad(index, ctx),
             }
         }
     }
@@ -381,28 +404,42 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip) -> Vec<Action
         right = expand.left() - GAP;
     }
 
-    // Pads first, as wide as their names; the preset after them if there's room.
-    let names: Vec<String> = strip.pads.iter().map(|(_, name, _, _)| truncate(name, MAX_NAME)).collect();
+    // Pads first, as wide as their names; scroll them when they don't fit.
+    // The microphone, expand button and resize edge stay outside the scroll area.
+    let names: Vec<String> = strip.pads.iter().map(StripPad::label).collect();
     let preset_name = truncate(&strip.preset, MAX_NAME);
     let measure = |text: &str| button_width(ui.painter().layout_no_wrap(text.to_owned(), label_font(), visuals.text_color()).size().x);
     let widths: Vec<f32> = names.iter().map(|n| measure(n)).collect();
     let preset_width = measure(&preset_name);
-    let (placed, preset_x) = layout(mic_rect.right() + GAP, right, &widths, preset_width);
+    let left = mic_rect.right() + GAP;
+    let preset_x = preset_position(left, right, &widths, preset_width);
+    let content_width = widths.iter().sum::<f32>() + GAP * widths.len().saturating_sub(1) as f32;
+    let overflowing = content_width > right - left;
     let button_rect = |x: f32, width: f32| Rect::from_min_size(Pos2::new(x, rect.center().y - 11.0), Vec2::new(width, 22.0));
-    for (i, x) in placed {
-        let (index, _, playing, loading) = &strip.pads[i];
-        let mut button = egui::Button::new(egui::RichText::new(&names[i]).font(label_font()));
-        if *loading {
-            button = button.fill(super::CYAN.gamma_multiply(0.35));
-        } else if *playing {
-            button = button.fill(GREEN.gamma_multiply(0.35));
-        }
-        if ui.put(button_rect(x, widths[i]), button)
-            .on_hover_text(if *loading { "Loading… Click to cancel" } else { "Click to play, pause or resume" })
-            .clicked()
-        {
-            actions.push(Action::PlayPad(*index));
-        }
+    if right > left && !strip.pads.is_empty() {
+        let pads_rect = Rect::from_min_max(Pos2::new(left, rect.top()), Pos2::new(right, rect.bottom()));
+        ui.scope_builder(egui::UiBuilder::new().id_salt("strip-pads").max_rect(pads_rect), |ui| {
+            ui.style_mut().always_scroll_the_only_direction = true;
+            egui::ScrollArea::horizontal()
+                .id_salt("pads")
+                .min_scrolled_width(0.0)
+                .auto_shrink([false; 2])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .scroll_source(egui::scroll_area::ScrollSource::MOUSE_WHEEL)
+                .show(ui, |ui| {
+                    ui.set_min_width(content_width);
+                    let origin = ui.min_rect().left();
+                    let mut x = 0.0;
+                    for (i, pad) in strip.pads.iter().enumerate() {
+                        if let Some(action) = pad_button(
+                            ui, button_rect(origin + x, widths[i]), pad, &names[i], overflowing, (x, widths[i]),
+                        ) {
+                            actions.push(action);
+                        }
+                        x += widths[i] + GAP;
+                    }
+                });
+        });
     }
     if let Some(x) = preset_x {
         let label = egui::RichText::new(&preset_name).font(label_font()).color(visuals.weak_text_color());
@@ -428,6 +465,63 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip) -> Vec<Action
         }
     }
     actions
+}
+
+fn pad_button(
+    ui: &mut egui::Ui, rect: Rect, pad: &StripPad, label: &str, overflowing: bool, position: (f32, f32),
+) -> Option<Action> {
+    let mut button = egui::Button::new(egui::RichText::new(label).font(label_font()));
+    if pad.loading {
+        button = button.fill(super::CYAN.gamma_multiply(0.35));
+    } else if pad.playing {
+        button = button.fill(GREEN.gamma_multiply(0.35));
+    } else if pad.paused {
+        button = button.fill(AMBER.gamma_multiply(0.25)).stroke(Stroke::new(1.0, AMBER));
+    } else if pad.failed() {
+        button = button.fill(RED.gamma_multiply(0.18)).stroke(Stroke::new(1.0, RED));
+    }
+    let (action, hint) = if pad.loading {
+        ("Cancel loading", "Loading… Click to cancel")
+    } else if pad.playing {
+        ("Pause", "Click to pause")
+    } else if pad.paused {
+        ("Resume", "Paused. Click to resume")
+    } else if pad.failed() {
+        ("Retry", "Click to retry")
+    } else {
+        ("Play", "Click to play")
+    };
+    let hint = if overflowing { format!("{hint}\nScroll to reach more pads.") } else { hint.to_owned() };
+    let hint = if !pad.loading && let Some(error) = &pad.error {
+        format!("{hint}\nRight-click or Shift+F10 to show this pad on the Soundboard.\n\nCould not load this clip: {error}")
+    } else {
+        format!("{hint}\nRight-click or Shift+F10 to show this pad on the Soundboard.")
+    };
+    let id = ui.make_persistent_id(("pad", pad.key));
+    let response = ui.scope_builder(egui::UiBuilder::new().id(id).max_rect(rect), |ui| {
+        ui.put(rect, button).on_hover_text(hint)
+    }).inner;
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), format!("{action} {}", pad.name)));
+    if response.has_focus() {
+        // Store unscrolled geometry: row edits reveal the focused file again,
+        // while using the wheel can still scroll away from it.
+        let position_id = ui.make_persistent_id("focused-pad-position");
+        let position = (response.id, position.0, position.1);
+        let moved = ui.data_mut(|data| {
+            let previous = data.get_temp::<(egui::Id, f32, f32)>(position_id);
+            data.insert_temp(position_id, position);
+            previous != Some(position)
+        });
+        if response.gained_focus() || moved { response.scroll_to_me(None); }
+    }
+    if response.secondary_clicked() || (response.has_focus()
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::F10))) {
+        Some(Action::RevealPad(pad.index))
+    } else if response.clicked() {
+        Some(Action::PlayPad(pad.index))
+    } else {
+        None
+    }
 }
 
 /// `text` cut to `max` characters with an ellipsis.
@@ -466,7 +560,9 @@ mod tests {
     fn strip(names: &[&str]) -> Strip {
         Strip {
             preset: "Balanced".into(),
-            pads: names.iter().enumerate().map(|(i, n)| (i, n.to_string(), false, false)).collect(),
+            pads: names.iter().enumerate().map(|(i, n)| StripPad {
+                key: i as u64, index: i, name: n.to_string(), playing: false, paused: false, loading: false, error: None,
+            }).collect(),
         }
     }
 
@@ -513,19 +609,14 @@ mod tests {
     }
 
     #[test]
-    fn pads_come_first_and_the_preset_only_if_every_pad_fits() {
+    fn the_preset_only_shows_if_every_pad_fits() {
         // Room for everything.
-        let (pads, preset) = layout(0.0, 300.0, &[50.0, 60.0], 70.0);
-        assert_eq!(pads, [(0, 0.0), (1, 50.0 + GAP)]);
-        assert_eq!(preset, Some(110.0 + 2.0 * GAP));
-        // The preset goes first...
-        let (pads, preset) = layout(0.0, 140.0, &[50.0, 60.0], 70.0);
-        assert_eq!((pads.len(), preset), (2, None));
-        // ...then pads that don't fit, in order.
-        let (pads, preset) = layout(0.0, 80.0, &[50.0, 60.0], 70.0);
-        assert_eq!((pads, preset), (vec![(0, 0.0)], None));
+        assert_eq!(preset_position(0.0, 300.0, &[50.0, 60.0], 70.0), Some(110.0 + 2.0 * GAP));
+        // The preset goes first, whether or not every pad fits.
+        assert_eq!(preset_position(0.0, 140.0, &[50.0, 60.0], 70.0), None);
+        assert_eq!(preset_position(0.0, 80.0, &[50.0, 60.0], 70.0), None);
         // No pads: just the preset.
-        assert_eq!(layout(10.0, 100.0, &[], 70.0), (vec![], Some(10.0)));
+        assert_eq!(preset_position(10.0, 100.0, &[], 70.0), Some(10.0));
     }
 
     #[test]
@@ -583,6 +674,362 @@ mod tests {
     }
 
     #[test]
+    fn strip_pad_right_click_and_shift_f10_reveal_without_playing() {
+        let mut s = strip(&["first", "second"]);
+        s.pads[1].index = 17;
+        s.pads[1].paused = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let render = |events| {
+            let mut actions = Vec::new();
+            let output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, HEIGHT))),
+                events, ..Default::default()
+            }, |ui| actions = draw(ui, Meter::Live(-20.0), &s));
+            (output, actions)
+        };
+        let (output, _) = render(Vec::new());
+        let target = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+            .find(|(_, node)| node.label() == Some("Resume second")).map(|(id, _)| id).unwrap();
+        let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "second" => Some(text.visual_bounding_rect().center()),
+            _ => None,
+        }).unwrap();
+        let mut actions = Vec::new();
+        for pressed in [true, false] {
+            actions.extend(render(vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE,
+            }]).1);
+        }
+        assert_eq!(actions, [Action::RevealPad(17)]);
+        let key = |key, modifiers| vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }];
+        let mut focused = false;
+        for _ in 0..8 {
+            let (output, actions) = render(key(egui::Key::Tab, egui::Modifiers::NONE));
+            assert!(actions.is_empty());
+            if output.platform_output.accesskit_update.unwrap().focus == target { focused = true; break; }
+        }
+        assert!(focused, "keyboard navigation reaches the paused pad");
+        assert_eq!(render(key(egui::Key::F10, egui::Modifiers::SHIFT)).1, [Action::RevealPad(17)]);
+    }
+
+    #[test]
+    fn wheel_scrolling_reaches_overflowing_pads_and_keeps_window_controls_fixed() {
+        for dark in [true, false] {
+            for delta in [Vec2::new(0.0, -1000.0), Vec2::new(-1000.0, 0.0)] {
+                let mut s = strip(&["one", "two", "three", "four", "five", "last"]);
+                s.pads[5].index = 42;
+                s.pads[5].paused = true;
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                let render = |events| {
+                    let mut actions = Vec::new();
+                    let output = ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(DEFAULT_WIDTH, HEIGHT))),
+                        time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+                    }, |ui| actions = draw(ui, Meter::Live(-20.0), &s));
+                    (output, actions)
+                };
+                let visible_text = |output: &egui::FullOutput, label: &str| {
+                    output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            let rect = text.visual_bounding_rect();
+                            shape.clip_rect.contains_rect(rect).then_some(rect)
+                        }
+                        _ => None,
+                    })
+                };
+                render(Vec::new());
+                let (output, _) = render(Vec::new());
+                assert!(visible_text(&output, "one").is_some());
+                assert!(visible_text(&output, "last").is_none());
+                let expand = visible_text(&output, "⛶").unwrap().center();
+                let (output, actions) = render(vec![
+                    egui::Event::PointerMoved(Pos2::new(90.0, 17.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point, delta, modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ]);
+                assert!(actions.is_empty());
+                assert!(!output.viewport_output.values().any(|viewport| viewport.commands.iter().any(|command|
+                    matches!(command, ViewportCommand::StartDrag | ViewportCommand::BeginResize(_)))));
+                let mut output = output;
+                for _ in 0..5 {
+                    let (next, actions) = render(Vec::new());
+                    assert!(actions.is_empty(), "scrolling never plays or reveals a pad");
+                    output = next;
+                }
+                let last = visible_text(&output, "last").expect("the last pad scrolls fully into view").center();
+                assert_eq!(visible_text(&output, "⛶").unwrap().center(), expand);
+                for (pos, button, action) in [
+                    (last, egui::PointerButton::Primary, Action::PlayPad(42)),
+                    (last, egui::PointerButton::Secondary, Action::RevealPad(42)),
+                    (Pos2::new(17.0, 17.0), egui::PointerButton::Primary, Action::ToggleMute),
+                    (expand, egui::PointerButton::Primary, Action::Expand),
+                ] {
+                    let mut actions = Vec::new();
+                    for pressed in [true, false] {
+                        actions.extend(render(vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                            pos, button, pressed, modifiers: egui::Modifiers::NONE,
+                        }]).1);
+                    }
+                    assert_eq!(actions, [action]);
+                }
+                render(vec![egui::Event::PointerMoved(Pos2::new(90.0, 17.0)), egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point, delta: -delta, modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }]);
+                for _ in 0..5 { render(Vec::new()); }
+                let (output, _) = render(Vec::new());
+                assert!(visible_text(&output, "one").is_some(), "scrolling back reaches the first pad");
+                assert_eq!(visible_text(&output, "⛶").unwrap().center(), expand);
+                render(vec![egui::Event::PointerMoved(Pos2::new(90.0, 17.0)), egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point, delta, modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }]);
+                for width in [MIN_WIDTH, 600.0, DEFAULT_WIDTH] {
+                    let mut output = None;
+                    for _ in 0..3 {
+                        let mut actions = Vec::new();
+                        output = Some(ctx.run_ui(egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(width, HEIGHT))),
+                            time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), ..Default::default()
+                        }, |ui| actions = draw(ui, Meter::Live(-20.0), &s)));
+                        assert!(actions.is_empty(), "resizing never triggers a pad");
+                    }
+                    let output = output.unwrap();
+                    if width == MIN_WIDTH {
+                        assert!(!output.shapes.iter().any(|shape| matches!(shape.shape, egui::Shape::Text(_))));
+                    } else {
+                        assert!(visible_text(&output, "one").is_some(), "resizing restores the first pad");
+                        if width == 600.0 {
+                            for name in ["two", "three", "four", "five", "last", "Balanced"] {
+                                assert!(visible_text(&output, name).is_some(), "{name} fits after expanding");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_focus_scrolls_overflowing_pads_into_view_before_revealing_or_playing() {
+        let mut s = strip(&["one", "two", "three", "four", "five", "last"]);
+        s.pads[5].index = 42;
+        s.pads[5].paused = true;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let render = |events| {
+            let mut actions = Vec::new();
+            let output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(DEFAULT_WIDTH, HEIGHT))),
+                time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+            }, |ui| actions = draw(ui, Meter::Live(-20.0), &s));
+            (output, actions)
+        };
+        let (output, _) = render(Vec::new());
+        let target = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+            .find(|(_, node)| node.label() == Some("Resume last")).map(|(id, _)| id).unwrap();
+        let key = |key, modifiers| vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }];
+        let mut focused = false;
+        for _ in 0..s.pads.len() + 5 {
+            let (output, actions) = render(key(egui::Key::Tab, egui::Modifiers::NONE));
+            assert!(actions.is_empty(), "tabbing does not trigger pads");
+            if output.platform_output.accesskit_update.unwrap().focus == target { focused = true; break; }
+        }
+        assert!(focused, "Tab reaches the pad that started outside the strip");
+        for _ in 0..5 { render(Vec::new()); }
+        let (output, _) = render(Vec::new());
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "last" && shape.clip_rect.contains_rect(text.visual_bounding_rect()))),
+            "the focused pad is visible before it can be triggered");
+        assert_eq!(render(key(egui::Key::F10, egui::Modifiers::SHIFT)).1, [Action::RevealPad(42)]);
+        assert_eq!(render(key(egui::Key::Enter, egui::Modifiers::NONE)).1, [Action::PlayPad(42)]);
+    }
+
+    #[test]
+    fn strip_keyboard_focus_follows_the_file_when_the_board_changes() {
+        let sounds = ["same", "two", "three", "four", "five", "target", "seven"]
+            .into_iter().enumerate().map(|(i, name)| {
+                let mut pad = crate::config::Pad::new(std::path::PathBuf::from(format!("clip-{i}.wav")));
+                pad.name = Some(name.into());
+                pad.starred = true;
+                pad
+            }).collect();
+        let mut app = App::stopped(Settings { sounds, ..Settings::default() });
+        let path = app.settings.sounds[5].path.clone();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let render = |app: &App, events| {
+            let strip = app.strip_contents();
+            let mut actions = Vec::new();
+            let output = ctx.run_ui(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(DEFAULT_WIDTH, HEIGHT))),
+                time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+            }, |ui| actions = draw(ui, Meter::Live(-20.0), &strip));
+            (output, actions)
+        };
+        let (output, _) = render(&app, Vec::new());
+        let target = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+            .find(|(_, node)| node.label() == Some("Play target")).map(|(id, _)| id).unwrap();
+        let key = |key, modifiers| vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }];
+        let mut focused = false;
+        for _ in 0..app.settings.sounds.len() + 5 {
+            let (output, actions) = render(&app, key(egui::Key::Tab, egui::Modifiers::NONE));
+            assert!(actions.is_empty());
+            if output.platform_output.accesskit_update.unwrap().focus == target { focused = true; break; }
+        }
+        assert!(focused);
+        for _ in 0..5 { render(&app, Vec::new()); }
+        for delta in [1000.0, -1000.0] {
+            render(&app, vec![egui::Event::PointerMoved(Pos2::new(90.0, 17.0)), egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, delta),
+                modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move,
+            }]);
+            for _ in 0..5 { render(&app, Vec::new()); }
+            let (output, actions) = render(&app, Vec::new());
+            assert!(actions.is_empty());
+            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+            let visible = output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == "target" && shape.clip_rect.contains_rect(text.visual_bounding_rect())));
+            assert_eq!(visible, delta < 0.0, "focused pads do not prevent scrolling away and back");
+        }
+        let pad = app.settings.sounds.remove(5);
+        app.settings.sounds.insert(1, pad);
+        for _ in 0..5 {
+            let (output, actions) = render(&app, Vec::new());
+            assert!(actions.is_empty(), "changing the board does not trigger a strip pad");
+            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+        }
+        assert_eq!(render(&app, key(egui::Key::Enter, egui::Modifiers::NONE)).1, [Action::PlayPad(1)],
+            "Enter still targets the same file after it changes position");
+        let (output, _) = render(&app, Vec::new());
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "target" && shape.clip_rect.contains_rect(text.visual_bounding_rect()))),
+            "a moved focused pad is scrolled back into view");
+        app.settings.sounds[0].name = Some("a much longer preceding name".into());
+        for _ in 0..5 { render(&app, Vec::new()); }
+        let (output, _) = render(&app, Vec::new());
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "target" && shape.clip_rect.contains_rect(text.visual_bounding_rect()))),
+            "a wider preceding name keeps the same focused file visible");
+        app.settings.sounds[0].starred = false;
+        app.settings.sounds[1].name = Some("same".into());
+        app.settings.sounds[2].name = Some("same".into());
+        for _ in 0..5 { render(&app, Vec::new()); }
+        assert_eq!(render(&app, key(egui::Key::Enter, egui::Modifiers::NONE)).1, [Action::PlayPad(1)],
+            "un-starring another pad and using a duplicate name keep the focused file");
+        app.remove_clip(0);
+        assert_eq!(app.settings.sounds[0].path, path);
+        for _ in 0..5 { render(&app, Vec::new()); }
+        assert_eq!(render(&app, key(egui::Key::F10, egui::Modifiers::SHIFT)).1, [Action::RevealPad(0)],
+            "removing an earlier file updates the action's board index");
+        app.remove_clip(0);
+        assert!(render(&app, key(egui::Key::Enter, egui::Modifiers::NONE)).1.is_empty(),
+            "removing the focused file must not hand its keyboard action to another pad");
+    }
+
+    #[test]
+    fn failed_strip_pads_show_the_error_and_remain_clickable_in_both_themes() {
+        for dark in [true, false] {
+            let mut s = strip(&["horn", "applause", "rim"]);
+            s.pads[0].index = 7;
+            let error = "Could not read D:\\Soundboard\\Clips\\horn.wav: Reconnect the audio drive before retrying";
+            s.pads[0].error = Some(error.into());
+            s.pads[1].playing = true;
+            s.pads[2].loading = true;
+            let ctx = egui::Context::default();
+            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+            ctx.enable_accesskit();
+            let render = |events| {
+                let mut actions = Vec::new();
+                let output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, HEIGHT))),
+                    time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+                }, |ui| actions = draw(ui, Meter::Live(-20.0), &s));
+                (output, actions)
+            };
+            let (first, _) = render(Vec::new());
+            let nodes = first.platform_output.accesskit_update.unwrap().nodes;
+            for label in ["Retry horn", "Pause applause", "Cancel loading rim"] {
+                assert!(nodes.iter().any(|(_, node)| node.label() == Some(label)));
+            }
+            let (output, _) = render(Vec::new());
+            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "! horn" => Some(text.visual_bounding_rect().center()),
+                _ => None,
+            }).expect("the strip shows an error marker beside the pad name");
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.stroke.color == RED && rect.rect.contains(pos))));
+            render(vec![egui::Event::PointerMoved(pos)]);
+            let mut tooltip = false;
+            for _ in 0..6 {
+                let (output, _) = render(Vec::new());
+                tooltip |= output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.text().contains(error)));
+            }
+            assert!(tooltip, "the strip exposes the complete failure");
+            let mut actions = Vec::new();
+            for pressed in [true, false] {
+                actions.extend(render(vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                    pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                }]).1);
+            }
+            assert_eq!(actions, [Action::PlayPad(7)], "retry uses the pad's board index");
+        }
+    }
+
+    #[test]
+    #[ignore = "writes strip playback screenshots; needs Python with Pillow"]
+    fn snapshot_strip_playback_states() {
+        struct StripPreview(Strip);
+        impl eframe::App for StripPreview {
+            fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+                let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), HEIGHT));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    let _ = draw(ui, Meter::Live(-20.0), &self.0);
+                });
+            }
+        }
+        let mut s = strip(&["horn", "rim", "ready", "load", "failed"]);
+        s.pads[0].playing = true;
+        s.pads[1].paused = true;
+        let error = "Could not read D:\\Soundboard\\Clips\\rim.wav: Reconnect the audio drive before retrying";
+        s.pads[1].error = Some(error.into());
+        s.pads[3].loading = true;
+        s.pads[4].error = Some("Audio file unavailable; reconnect its drive and retry".into());
+        let (texts, _) = run(Meter::Live(-20.0), &s, 600.0, None, false);
+        let pos = texts.iter().find(|(text, _)| text == "rim").unwrap().1.center();
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            let mut preview = StripPreview(s.clone());
+            for (width, name) in [(600.0, "strip-playback"), (200.0, "strip-playback-narrow")] {
+                let image = super::super::snapshot::snapshot(&mut preview, &format!("{name}-{theme}"), Vec2::new(width, HEIGHT), 1.5, dark);
+                println!("SNAPSHOT {}", image.display());
+            }
+            let image = super::super::snapshot::snapshot_with_events(
+                &mut preview, &format!("strip-playback-scrolled-{theme}"), Vec2::new(200.0, HEIGHT), 1.5, dark,
+                vec![vec![egui::Event::PointerMoved(Pos2::new(90.0, 17.0)), egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -1000.0),
+                    modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move,
+                }], vec![egui::Event::PointerGone]],
+            );
+            println!("SNAPSHOT {}", image.display());
+            let image = super::super::snapshot::snapshot_with_events(
+                &mut preview, &format!("strip-paused-source-error-{theme}"), Vec2::new(600.0, 140.0), 1.25, dark,
+                vec![vec![egui::Event::PointerMoved(pos)]],
+            );
+            println!("SNAPSHOT {}", image.display());
+            let image = super::super::snapshot::snapshot_with_events(
+                &mut preview, &format!("strip-paused-source-error-native-{theme}"), Vec2::new(200.0, HEIGHT), 1.5, dark,
+                vec![vec![egui::Event::PointerMoved(pos)]],
+            );
+            println!("SNAPSHOT {}", image.display());
+        }
+    }
+
+    #[test]
     fn a_strip_resized_to_the_icon_still_mutes_and_shows_no_text() {
         for meter in [Meter::Stopped, Meter::Muted, Meter::Live(-20.0)] {
             let (texts, _) = run(meter, &strip(&["horn"]), MIN_WIDTH, None, false);
@@ -598,7 +1045,7 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
         let s = strip(&["airhorn", "rimshot", "bruh"]);
         let measure = |t: &str| button_width(text_width(&ctx, t));
-        let pads: Vec<f32> = s.pads.iter().map(|(_, n, _, _)| measure(n)).collect();
+        let pads: Vec<f32> = s.pads.iter().map(|pad| measure(&pad.name)).collect();
         let width = fitting_width(&pads, measure(&s.preset));
         let (texts, _) = run(Meter::Live(-20.0), &s, width, None, false);
         for label in ["airhorn", "rimshot", "bruh", "Balanced", "⛶"] {
@@ -609,6 +1056,10 @@ mod tests {
     /// Press at `from`, move to `to`, release; returns the window commands
     /// sent and the actions reported.
     fn drag(from: Pos2, to: Pos2) -> (Vec<ViewportCommand>, Vec<Action>) {
+        drag_strip(from, to, &strip(&[]))
+    }
+
+    fn drag_strip(from: Pos2, to: Pos2, strip: &Strip) -> (Vec<ViewportCommand>, Vec<Action>) {
         let ctx = egui::Context::default();
         let button = |pos, pressed| egui::Event::PointerButton {
             pos,
@@ -628,7 +1079,7 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let output = ctx.run_ui(input, |ui| actions.extend(draw(ui, Meter::Live(-20.0), &strip(&[]))));
+            let output = ctx.run_ui(input, |ui| actions.extend(draw(ui, Meter::Live(-20.0), strip)));
             commands.extend(output.viewport_output.into_values().flat_map(|v| v.commands));
         }
         (commands, actions)
@@ -644,6 +1095,13 @@ mod tests {
         let (commands, _) = drag(edge, edge + Vec2::new(-80.0, 0.0));
         assert!(commands.contains(&ViewportCommand::BeginResize(ResizeDirection::East)), "{commands:?}");
         assert!(!commands.contains(&ViewportCommand::StartDrag), "the edge resizes rather than moves");
+
+        let (commands, actions) = drag_strip(
+            Pos2::new(55.0, 17.0), Pos2::new(85.0, 20.0), &strip(&["one", "two", "three", "four", "last"]),
+        );
+        assert!(commands.contains(&ViewportCommand::StartDrag), "dragging a pad still moves the strip");
+        assert!(!commands.iter().any(|command| matches!(command, ViewportCommand::BeginResize(_))));
+        assert!(actions.is_empty(), "dragging a pad does not trigger it");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! uses the current settings each time, so you can tune and listen again.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -13,6 +14,7 @@ use crate::denoise::{Cleaner, ModelState, ProcessedRecording};
 use crate::dsp::Params;
 use crate::playback::{self, Player};
 use crate::record::{Recorder, Source};
+use crate::widgets;
 
 /// How long a test recording runs.
 pub(super) const TEST_LENGTH: Duration = Duration::from_secs(5);
@@ -31,9 +33,22 @@ struct Cleaning {
     report_status: bool,
 }
 
+struct Loading {
+    result: Receiver<anyhow::Result<Option<Vec<f32>>>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct MicTest {
     recording: Option<(Recorder, Instant)>,
+    /// Loading the finalized take off the UI thread before exposing previews.
+    loading: Option<Loading>,
     /// The take as recorded (mono, DSP rate).
     raw: Option<Arc<Vec<f32>>>,
     /// The cleaned take, its settings, and the model state that produced it.
@@ -46,11 +61,11 @@ pub(super) struct MicTest {
 
 impl MicTest {
     pub(super) fn recording(&self) -> bool {
-        self.recording.is_some()
+        self.recording.is_some() || self.loading.is_some()
     }
 
     pub(super) fn busy(&self) -> bool {
-        self.recording.is_some() || self.cleaning.is_some() || self.player.is_some()
+        self.recording() || self.cleaning.is_some() || self.player.is_some()
     }
 
     fn used_fallback(&self) -> bool {
@@ -85,6 +100,7 @@ impl App {
     }
 
     pub(super) fn start_mic_test(&mut self) {
+        if self.mic_test.recording() { return; }
         self.stop_test();
         // Keep track of the worker until it finishes so a new take cannot
         // start a competing cleaner. Its source identifies stale results.
@@ -130,7 +146,16 @@ impl App {
         }
     }
 
+    fn cancel_mic_test(&mut self) {
+        if !self.mic_test.recording() { return; }
+        self.stop_test();
+        self.mic_test.recording = None;
+        self.mic_test.loading = None;
+        self.mic_test.status = Some(("Mic test cancelled".into(), MUTED));
+    }
+
     fn play_test(&mut self, version: Version) {
+        if self.mic_test.recording() { return; }
         self.stop_test();
         let samples = match version {
             Version::Raw => self.mic_test.raw.clone(),
@@ -165,28 +190,56 @@ impl App {
     /// end of playback.
     pub(super) fn poll_mic_test(&mut self) {
         let test = &mut self.mic_test;
-        if let Some((recorder, started)) = &test.recording {
-            if let Some(e) = recorder.error() {
-                test.recording = None;
-                test.status = Some((short(&e), RED));
-            } else if started.elapsed() >= TEST_LENGTH {
-                let (recorder, _) = test.recording.take().expect("checked above");
-                let take = recorder.finish().and_then(|take| take.map(|take| {
-                    if let Some(warning) = take.warning() {
-                        anyhow::bail!("Record the mic test again: {warning}");
-                    }
-                    take.samples()
-                }).transpose());
-                match take {
-                    Ok(Some(samples)) if !samples.is_empty() => {
-                        test.raw = Some(Arc::new(samples));
-                        test.cleaned = None;
-                        test.status = Some(("Now compare: Raw, then Cleaned".into(), GREEN));
-                        self.clean_test(false);
-                    }
-                    Ok(_) => test.status = Some(("Nothing was recorded".into(), RED)),
-                    Err(e) => test.status = Some((short(&format!("{e:#}")), RED)),
+        if let Some((recorder, started)) = &mut test.recording {
+            if !recorder.is_stopping() {
+                if let Some(e) = recorder.error() {
+                    recorder.stop_capture();
+                    test.status = Some((short(&e), RED));
+                } else if started.elapsed() >= TEST_LENGTH {
+                    recorder.stop_capture();
+                    test.status = Some(("Finishing mic test…".into(), CYAN));
                 }
+            }
+            if recorder.is_stopping() && recorder.ready_to_finish() {
+                let (recorder, _) = test.recording.take().expect("checked above");
+                if let Some(e) = recorder.error() {
+                    test.status = Some((short(&e), RED));
+                } else {
+                    let (done, job) = crossbeam_channel::bounded(1);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let worker_cancel = Arc::clone(&cancel);
+                    let spawned = std::thread::Builder::new().name("openmic-test-load".into()).spawn(move || {
+                        if worker_cancel.load(Ordering::Relaxed) { return; }
+                        let take = recorder.finish().and_then(|take| take.map(|take| {
+                            if let Some(warning) = take.warning() {
+                                anyhow::bail!("Record the mic test again: {warning}");
+                            }
+                            take.samples_cancellable(&worker_cancel)
+                        }).transpose());
+                        let _ = done.send(take);
+                    });
+                    match spawned {
+                        Ok(_) => test.loading = Some(Loading { result: job, cancel }),
+                        Err(e) => test.status = Some((short(&format!("Could not load the mic test: {e}")), RED)),
+                    }
+                }
+            }
+        }
+        let finished = test.loading.as_ref().and_then(|loading| match loading.result.try_recv() {
+            Err(TryRecvError::Empty) => None,
+            result => Some(result.unwrap_or_else(|_| Err(anyhow::anyhow!("Could not load the mic test; record again")))),
+        });
+        if let Some(result) = finished {
+            test.loading = None;
+            match result {
+                Ok(Some(samples)) if !samples.is_empty() => {
+                    test.raw = Some(Arc::new(samples));
+                    test.cleaned = None;
+                    test.status = Some(("Now compare: Raw, then Cleaned".into(), GREEN));
+                    self.clean_test(false);
+                }
+                Ok(_) => test.status = Some(("Nothing was recorded".into(), RED)),
+                Err(e) => test.status = Some((short(&format!("{e:#}")), RED)),
             }
         }
         let test = &mut self.mic_test;
@@ -256,15 +309,27 @@ impl App {
     /// The test's controls: one row.
     pub(super) fn draw_mic_test(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if let Some((_, started)) = &self.mic_test.recording {
-                let left = TEST_LENGTH.saturating_sub(started.elapsed()).as_secs_f32();
-                ui.add(egui::ProgressBar::new(1.0 - left / TEST_LENGTH.as_secs_f32()).desired_width(120.0).text(format!("{left:.0} s")));
+            if let Some((recorder, started)) = &self.mic_test.recording {
+                if recorder.is_stopping() {
+                    ui.spinner();
+                } else {
+                    let left = TEST_LENGTH.saturating_sub(started.elapsed()).as_secs_f32();
+                    ui.add(egui::ProgressBar::new(1.0 - left / TEST_LENGTH.as_secs_f32()).desired_width(120.0).text(format!("{left:.0} s")));
+                }
+            } else if self.mic_test.loading.is_some() {
+                ui.spinner();
             } else if ui
                 .button(if self.mic_test.raw.is_some() { "Record again" } else { "Test my mic" })
                 .on_hover_text("Record 5 seconds, then hear it raw and cleaned on your headphones or speakers")
                 .clicked()
             {
                 self.start_mic_test();
+            }
+            if self.mic_test.recording() && ui.small_button("Cancel test")
+                .on_hover_text("Discard this mic test; keep the previous preview")
+                .clicked()
+            {
+                self.cancel_mic_test();
             }
             if self.mic_test.raw.is_some() && !self.mic_test.recording() {
                 for (version, label) in [(Version::Raw, "⏵ Raw"), (Version::Cleaned, "⏵ Cleaned")] {
@@ -289,7 +354,7 @@ impl App {
                 }
             }
             if let Some((text, color)) = &self.mic_test.status {
-                ui.label(RichText::new(text).small().color(*color));
+                ui.label(RichText::new(text).small().color(widgets::text_color(ui, *color)));
             }
         });
     }
@@ -306,6 +371,125 @@ mod tests {
         let (done, job) = crossbeam_channel::bounded(1);
         app.mic_test.cleaning = Some(Cleaning { result: job, raw, params, then_play, report_status: true });
         done
+    }
+
+    #[test]
+    fn voice_controls_keep_focus_when_mic_results_and_page_sections_change() {
+        use eframe::App as _;
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let controls = [
+            (Role::Slider, "Your mic"), (Role::Slider, "Remove rumble"), (Role::Slider, "Remove noise"),
+            (Role::Slider, "Only my voice"), (Role::Slider, "Quiet cut-off"), (Role::Slider, "To Discord"),
+            (Role::Slider, "Hear yourself"), (Role::CheckBox, "Remove rumble"), (Role::CheckBox, "Remove noise"),
+            (Role::CheckBox, "Only my voice"), (Role::CheckBox, "Quiet cut-off"), (Role::CheckBox, "Hear yourself"),
+            (Role::Link, "DeepFilterNet"),
+        ];
+        for dark in [true, false] {
+            for scene in ["cleanup result", "checklist completion", "bypass message"] {
+                for (role, label) in controls {
+                    let mut app = App::stopped(Settings {
+                        microphone: "Test microphone".into(), output: "CABLE Input (VB-Audio Virtual Cable)".into(),
+                        input_gain_db: 3.37, highpass_hz: 137.25, strength: 0.74321, voice_threshold: 0.61347,
+                        gate_threshold_db: -43.27, output_gain_db: -2.33, monitor_volume: 0.43561,
+                        ..Settings::default()
+                    });
+                    app.settings.setup.discord = true;
+                    app.settings.setup.tested = true;
+                    app.inputs = vec![app.settings.microphone.clone()];
+                    assert!(app.show_checklist(), "only the cable setup step is unfinished");
+                    let done = (scene == "cleanup result").then(|| pending_cleanup(&mut app, false));
+                    let original = app.settings.processing();
+                    let original_monitor = app.settings.monitor_volume;
+                    let ctx = egui::Context::default();
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    ctx.enable_accesskit();
+                    let mut frame = eframe::Frame::_new_kittest();
+                    let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
+                        time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+                    }, |ui| app.ui(ui, &mut frame));
+                    for _ in 0..3 { draw(&mut app, Vec::new()); }
+                    let output = draw(&mut app, Vec::new());
+                    let target_node = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                        .find(|(_, node)| node.role() == role && node.label() == Some(label)).map(|(id, _)| id)
+                        .unwrap_or_else(|| panic!("{role:?} {label} is named before {scene}; matching nodes: {:?}",
+                            output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                                .filter(|(_, node)| node.label() == Some(label) || node.value() == Some(label))
+                                .map(|(_, node)| (node.role(), node.label(), node.value())).collect::<Vec<_>>()));
+                    draw(&mut app, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+                    })]);
+                    for _ in 0..3 { draw(&mut app, Vec::new()); }
+                    match scene {
+                        "cleanup result" => {
+                            done.unwrap().send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
+                            app.poll_mic_test();
+                            assert!(app.mic_test.cleaning.is_none() && app.mic_test.cleaned.is_some());
+                            assert!(app.mic_test.status.is_some());
+                        }
+                        "checklist completion" => {
+                            app.outputs.push(app.settings.output.clone());
+                            assert!(!app.show_checklist());
+                        }
+                        "bypass message" => app.settings.bypass = true,
+                        _ => unreachable!(),
+                    }
+                    for _ in 0..3 { draw(&mut app, Vec::new()); }
+                    let output = draw(&mut app, Vec::new());
+                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                    assert_eq!(tree.focus, target_node, "{role:?} {label} keeps focus after {scene}");
+                    assert!(tree.nodes.iter().any(|(id, node)| *id == target_node && node.role() == role && node.label() == Some(label)),
+                        "the same control remains available to assistive input");
+                    assert_eq!(app.settings.processing(), original, "layout changes preserve saved precision");
+                    assert_eq!(app.settings.monitor_volume, original_monitor);
+                    assert!(app.dirty_since.is_none());
+                    let mut expected = original;
+                    let mut monitor = original_monitor;
+                    let mut monitor_on = app.settings.monitor;
+                    let key = if role == Role::Slider {
+                        match label {
+                            "Your mic" => expected.input_gain_db = 4.0,
+                            "Remove rumble" => expected.highpass_hz = 138.0,
+                            "Remove noise" => expected.strength = 0.75,
+                            "Only my voice" => expected.voice_threshold = 0.62,
+                            "Quiet cut-off" => expected.gate_threshold_db = -42.0,
+                            "To Discord" => expected.output_gain_db = -2.0,
+                            "Hear yourself" => monitor = 0.45,
+                            _ => unreachable!(),
+                        }
+                        egui::Key::ArrowRight
+                    } else if role == Role::CheckBox {
+                        match label {
+                            "Remove rumble" => expected.highpass = !expected.highpass,
+                            "Remove noise" => expected.strength = 0.0,
+                            "Only my voice" => expected.voice_gate = !expected.voice_gate,
+                            "Quiet cut-off" => expected.gate = !expected.gate,
+                            "Hear yourself" => monitor_on = !monitor_on,
+                            _ => unreachable!(),
+                        }
+                        egui::Key::Space
+                    } else {
+                        expected.model = crate::dsp::Model::Rnnoise;
+                        egui::Key::Enter
+                    };
+                    draw(&mut app, vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+                    for _ in 0..3 { draw(&mut app, Vec::new()); }
+                    assert_eq!(app.settings.processing(), expected, "the next key edits only {role:?} {label} after {scene}");
+                    assert_eq!(app.settings.monitor_volume, monitor);
+                    assert_eq!(app.settings.monitor, monitor_on);
+                    assert!(app.dirty_since.is_some());
+                }
+            }
+        }
+    }
+
+    fn finish_capture(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.mic_test.recording() {
+            app.poll_mic_test();
+            assert!(Instant::now() < deadline, "the mic test did not finish loading");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -360,7 +544,7 @@ mod tests {
 
     #[test]
     fn incomplete_mic_tests_keep_the_previous_preview_and_request_another_recording() {
-        for had_preview in [false, true] {
+        for (had_preview, count) in [(false, 0), (false, 96), (true, 0), (true, 96)] {
             let mut app = App::stopped(Settings::default());
             let raw = Arc::new(vec![0.1; 480]);
             let cleaned = Arc::new(vec![0.05; 480]);
@@ -368,15 +552,15 @@ mod tests {
                 app.mic_test.raw = Some(Arc::clone(&raw));
                 app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params(), ModelState::DeepFilter));
             }
-            let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
+            let recorder = Recorder::from_samples_for_test(&vec![0.25; count]);
             recorder.report_skipped_for_test();
             app.mic_test.recording = Some((recorder, Instant::now() - TEST_LENGTH));
-            app.poll_mic_test();
+            finish_capture(&mut app);
 
             assert!(!app.mic_test.busy(), "an incomplete take must not start cleaning or playback");
             assert!(!app.settings.setup.tested && app.dirty_since.is_none());
             let (message, color) = app.mic_test.status.as_ref().unwrap();
-            assert!(message.starts_with("Record the mic test again:"));
+            assert!(message.starts_with(if count == 0 { "Recording stopped:" } else { "Record the mic test again:" }));
             assert!(message.contains("audio was skipped"));
             assert_eq!(*color, RED);
             if had_preview {
@@ -385,6 +569,248 @@ mod tests {
             } else {
                 assert!(app.mic_test.raw.is_none() && app.mic_test.cleaned.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn slow_mic_test_writes_keep_controls_responsive_and_preserve_old_previews_on_failure() {
+        for capture_fails in [false, true] {
+            let mut app = App::stopped(Settings { model: crate::dsp::Model::Rnnoise, ..Settings::default() });
+            let raw = Arc::new(vec![0.1; 480]);
+            let cleaned = Arc::new(vec![0.05; 480]);
+            app.mic_test.raw = Some(Arc::clone(&raw));
+            app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params(), ModelState::Rnnoise));
+            let (recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 480]);
+            if capture_fails { recorder.report_error_for_test("Microphone disconnected"); }
+            app.mic_test.recording = Some((recorder, Instant::now() - TEST_LENGTH));
+
+            for _ in 0..3 { app.poll_mic_test(); }
+            let recorder = &app.mic_test.recording.as_ref().unwrap().0;
+            assert!(recorder.is_stopping() && !recorder.ready_to_finish());
+            assert!(app.mic_test.recording() && app.mic_test.busy());
+            assert!(app.mic_test.loading.is_none());
+            assert_eq!(app.update_blocker(), Some("Wait for the mic test to finish"));
+            app.start_mic_test();
+            app.play_test(Version::Raw);
+            app.play_test(Version::Cleaned);
+            assert!(app.mic_test.player.is_none() && app.mic_test.cleaning.is_none());
+            assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+            assert_eq!(app.mic_test.status, Some(if capture_fails {
+                ("Microphone disconnected".into(), RED)
+            } else {
+                ("Finishing mic test…".into(), CYAN)
+            }));
+            let ctx = egui::Context::default();
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw_mic_test(ui));
+            let texts: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            }).collect();
+            assert!(!texts.iter().any(|text| ["0 s", "Record again", "⏵ Raw", "⏵ Cleaned"].contains(text)));
+            assert!(texts.iter().any(|text| *text == app.mic_test.status.as_ref().unwrap().0));
+            app.run_command(&ctx, super::super::Command::ToggleMute);
+            assert!(app.settings.mute);
+
+            finish.send(()).unwrap();
+            finish_capture(&mut app);
+            assert!(!app.mic_test.recording() && app.mic_test.player.is_none());
+            assert!(!app.settings.setup.tested);
+            if capture_fails {
+                assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                assert!(Arc::ptr_eq(&app.mic_test.cleaned.as_ref().unwrap().0, &cleaned));
+                assert_eq!(app.mic_test.status, Some(("Microphone disconnected".into(), RED)));
+                assert!(!app.mic_test.busy());
+            } else {
+                let samples = app.mic_test.raw.as_ref().unwrap();
+                assert!(!Arc::ptr_eq(samples, &raw));
+                assert_eq!(samples.len(), 240);
+                assert!(samples.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+                assert_eq!(app.mic_test.status, Some(("Now compare: Raw, then Cleaned".into(), GREEN)));
+            }
+        }
+    }
+
+    #[test]
+    fn loading_a_mic_test_suppresses_old_playback_and_recovers_from_empty_or_failed_results() {
+        for outcome in 0..4 {
+            let mut app = App::stopped(Settings { model: crate::dsp::Model::Rnnoise, ..Settings::default() });
+            let clean = pending_cleanup(&mut app, true);
+            let raw = Arc::clone(app.mic_test.raw.as_ref().unwrap());
+            app.stop_test();
+            let (done, job) = crossbeam_channel::bounded(1);
+            app.mic_test.loading = Some(Loading { result: job, cancel: Arc::new(AtomicBool::new(false)) });
+            app.mic_test.status = Some(("Finishing mic test…".into(), CYAN));
+            clean.send((vec![0.05; 480], ModelState::Rnnoise)).unwrap();
+
+            app.poll_mic_test();
+            app.start_mic_test();
+            app.play_test(Version::Raw);
+            assert!(app.mic_test.recording.is_none() && app.mic_test.loading.is_some());
+            assert!(app.mic_test.cleaning.is_none() && app.mic_test.player.is_none());
+            assert_eq!(app.mic_test.status, Some(("Finishing mic test…".into(), CYAN)));
+            let old_cleaned = Arc::clone(&app.mic_test.cleaned.as_ref().unwrap().0);
+            match outcome {
+                0 => done.send(Ok(Some(vec![0.25; 240]))).unwrap(),
+                1 => done.send(Ok(None)).unwrap(),
+                2 => done.send(Err(anyhow::anyhow!("Unable to read test audio"))).unwrap(),
+                _ => drop(done),
+            }
+            app.poll_mic_test();
+
+            assert!(!app.mic_test.recording() && app.mic_test.player.is_none());
+            assert!(!app.settings.setup.tested && app.dirty_since.is_none());
+            if outcome == 0 {
+                assert_eq!(app.mic_test.raw.as_ref().unwrap().as_slice(), &[0.25; 240]);
+                assert_eq!(app.mic_test.status, Some(("Now compare: Raw, then Cleaned".into(), GREEN)));
+                if let Some((samples, _, _)) = &app.mic_test.cleaned {
+                    assert_eq!(samples.len(), 240, "never cache the previous preview for the new take");
+                }
+            } else {
+                assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                assert!(Arc::ptr_eq(&app.mic_test.cleaned.as_ref().unwrap().0, &old_cleaned));
+                assert!(!app.mic_test.busy() && app.update_blocker().is_none());
+                let (text, color) = app.mic_test.status.as_ref().unwrap();
+                assert_eq!(*color, RED);
+                assert!(text.contains(match outcome {
+                    1 => "Nothing was recorded",
+                    2 => "Unable to read test audio",
+                    _ => "record again",
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_test_button_releases_capture_and_loading_without_losing_the_previous_preview() {
+        for stage in ["recording", "finishing", "loading"] {
+            for had_preview in [false, true] {
+                let mut app = App::stopped(Settings::default());
+                let raw = Arc::new(vec![0.1; 480]);
+                let cleaned = Arc::new(vec![0.05; 480]);
+                if had_preview {
+                    app.mic_test.raw = Some(Arc::clone(&raw));
+                    app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params(), ModelState::DeepFilter));
+                }
+                let (loaded, job) = crossbeam_channel::bounded(1);
+                let cancel = Arc::new(AtomicBool::new(false));
+                let finish = if stage == "loading" {
+                    app.mic_test.loading = Some(Loading { result: job, cancel: Arc::clone(&cancel) });
+                    None
+                } else {
+                    let (mut recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 480]);
+                    if stage == "finishing" { recorder.stop_capture(); }
+                    app.mic_test.recording = Some((recorder, Instant::now()));
+                    Some(finish)
+                };
+                app.mic_test.status = Some(if stage == "recording" {
+                    ("Speak normally…".into(), AMBER)
+                } else {
+                    ("Finishing mic test…".into(), CYAN)
+                });
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                let draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 100.0))),
+                    events, ..Default::default()
+                }, |ui| app.draw_mic_test(ui));
+                let first = draw(&mut app, Vec::new());
+                assert!(first.platform_output.accesskit_update.unwrap().nodes.iter()
+                    .any(|(_, node)| node.label() == Some("Cancel test")));
+                let pos = draw(&mut app, Vec::new()).shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Cancel test" => Some(text.visual_bounding_rect().center()),
+                    _ => None,
+                }).expect("cancel is visible throughout capture and loading");
+                for pressed in [true, false] {
+                    draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+
+                assert!(!app.mic_test.recording() && !app.mic_test.busy());
+                assert!(app.mic_test.player.is_none() && app.mic_test.cleaning.is_none());
+                assert!(app.update_blocker().is_none());
+                assert_eq!(app.mic_test.status, Some(("Mic test cancelled".into(), MUTED)));
+                assert!(!app.settings.setup.tested && app.dirty_since.is_none());
+                if let Some(finish) = finish {
+                    finish.send(()).expect("cancellation must not wait for the disk writer");
+                } else {
+                    assert!(cancel.load(Ordering::Relaxed), "cancel the decoder as well as its result");
+                    assert!(loaded.send(Ok(Some(vec![0.9; 480]))).is_err(), "a cancelled load cannot publish late audio");
+                }
+                app.poll_mic_test();
+                if had_preview {
+                    assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                    assert!(Arc::ptr_eq(&app.mic_test.cleaned.as_ref().unwrap().0, &cleaned));
+                } else {
+                    assert!(app.mic_test.raw.is_none() && app.mic_test.cleaned.is_none());
+                }
+                let output = draw(&mut app, Vec::new());
+                let texts: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                }).collect();
+                assert!(texts.contains(&if had_preview { "Record again" } else { "Test my mic" }));
+                assert!(!texts.contains(&"Cancel test"));
+                assert_eq!(texts.contains(&"⏵ Raw"), had_preview);
+                assert_eq!(texts.contains(&"⏵ Cleaned"), had_preview);
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_mic_load_ignores_queued_audio_and_suppresses_the_previous_cleaner() {
+        for cleanup_fails in [false, true] {
+            let mut app = App::stopped(Settings::default());
+            let clean = pending_cleanup(&mut app, true);
+            let raw = Arc::clone(app.mic_test.raw.as_ref().unwrap());
+            let (loaded, job) = crossbeam_channel::bounded(1);
+            let cancel = Arc::new(AtomicBool::new(false));
+            app.mic_test.loading = Some(Loading { result: job, cancel: Arc::clone(&cancel) });
+            loaded.send(Ok(Some(vec![0.9; 480]))).unwrap();
+
+            app.cancel_mic_test();
+            assert!(cancel.load(Ordering::Relaxed));
+            let cleaning = app.mic_test.cleaning.as_ref().unwrap();
+            assert!(!cleaning.then_play && !cleaning.report_status);
+            if cleanup_fails {
+                drop(clean);
+            } else {
+                clean.send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
+            }
+            app.poll_mic_test();
+            assert!(!app.mic_test.busy() && app.mic_test.player.is_none());
+            assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+            assert_eq!(app.mic_test.status, Some(("Mic test cancelled".into(), MUTED)));
+            assert!(!app.settings.setup.tested && app.dirty_since.is_none());
+
+            // A new test still loads and cleans normally after cancellation.
+            app.settings.model = crate::dsp::Model::Rnnoise;
+            app.mic_test.recording = Some((Recorder::from_samples_for_test(&[0.25; 480]), Instant::now() - TEST_LENGTH));
+            finish_capture(&mut app);
+            assert!(!Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+            assert_eq!(app.mic_test.raw.as_ref().unwrap().len(), 240);
+            assert_eq!(app.mic_test.status, Some(("Now compare: Raw, then Cleaned".into(), GREEN)));
+            assert!(app.mic_test.player.is_none() && !app.settings.setup.tested);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes mic test finalization screenshots; needs Python with Pillow"]
+    fn snapshot_mic_test_finalization() {
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            let (recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 480]);
+            let mut app = App::stopped(Settings::default());
+            app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
+            app.mic_test.cleaned = Some((Arc::new(vec![0.05; 480]), app.test_params(), ModelState::DeepFilter));
+            app.mic_test.recording = Some((recorder, Instant::now()));
+            app.mic_test.status = Some(("Speak normally…".into(), AMBER));
+            super::super::snapshot::snapshot(&mut app, &format!("mic-test-recording-{theme}"), egui::vec2(700.0, 420.0), 1.0, dark);
+            app.mic_test.recording.as_mut().unwrap().1 = Instant::now() - TEST_LENGTH;
+            app.poll_mic_test();
+            super::super::snapshot::snapshot(&mut app, &format!("mic-test-finishing-{theme}"), egui::vec2(700.0, 420.0), 1.0, dark);
+            app.cancel_mic_test();
+            super::super::snapshot::snapshot(&mut app, &format!("mic-test-cancelled-{theme}"), egui::vec2(700.0, 420.0), 1.0, dark);
+            finish.send(()).unwrap();
         }
     }
 
@@ -495,7 +921,7 @@ mod tests {
             app.stop_test();
             app.mic_test.recording = Some((Recorder::from_samples_for_test(&[0.25; 480]), Instant::now() - TEST_LENGTH));
 
-            app.poll_mic_test();
+            finish_capture(&mut app);
 
             let raw = Arc::clone(app.mic_test.raw.as_ref().unwrap());
             assert!(!Arc::ptr_eq(&raw, &old_raw), "the new take was recorded");

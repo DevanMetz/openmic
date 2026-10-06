@@ -140,7 +140,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new("VB-Cable input isn't available.")
-                                    .color(AMBER),
+                                    .color(widgets::text_color(ui, AMBER)),
                             );
                             if ui.button("Get VB-Cable").clicked() {
                                 open_url(VB_CABLE_URL);
@@ -150,7 +150,7 @@ impl App {
                     }
                     Some(cable) if self.settings.output != cable => {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("A different processed output is selected.").color(AMBER));
+                            ui.label(RichText::new("A different processed output is selected.").color(widgets::text_color(ui, AMBER)));
                             if ui.button("Use VB-Cable").clicked() {
                                 self.settings.output = cable;
                                 self.touch();
@@ -316,14 +316,17 @@ impl App {
             "YOUR VOICE, STEP BY STEP",
             CYAN,
             |ui| {
-                ui.weak("drag in a picture · scroll to fine-tune · double-click to reset");
+                ui.weak("drag or scroll · Tab, then arrows · double-click to reset");
             },
             |ui| {
                 if bypassed {
-                    ui.colored_label(AMBER, "Bypass is on: noise reduction and both gates are skipped.")
+                    ui.colored_label(widgets::text_color(ui, AMBER), "Bypass is on: noise reduction and both gates are skipped.")
                         .on_hover_text("Mic level, rumble filter, output level and mute still apply.");
                 }
-                changed = viz::voice_rows(ui, &frames, &mut self.settings, &mut self.strength_before_off);
+                // Keep native switch and link IDs stable when other page sections change.
+                changed = ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("voice-settings")), |ui| {
+                    viz::voice_rows(ui, &frames, &mut self.settings, &mut self.strength_before_off)
+                }).inner;
             },
         );
         if changed.settings {
@@ -383,7 +386,7 @@ fn step_mark(ui: &mut egui::Ui, number: usize, done: bool) {
         painter.add(egui::Shape::line(tick.to_vec(), egui::Stroke::new(2.0, egui::Color32::from_gray(18))));
     } else {
         painter.circle_stroke(center, 8.0, egui::Stroke::new(1.0, MUTED));
-        painter.text(center, egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::proportional(11.0), MUTED);
+        painter.text(center, egui::Align2::CENTER_CENTER, number.to_string(), egui::FontId::proportional(11.0), widgets::text_color(ui, MUTED));
     }
 }
 
@@ -400,6 +403,376 @@ fn step_title(step: Step, default_mic: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draw_voice(app: &mut App, ctx: &egui::Context, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+        use eframe::App as _;
+        let mut frame = eframe::Frame::_new_kittest();
+        ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+        }, |ui| app.ui(ui, &mut frame))
+    }
+
+    #[test]
+    fn assistive_focus_and_keyboard_activation_change_only_the_requested_control() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for (old_role, old_label, new_role, new_label, key, field) in [
+                    (Role::Button, "Soundboard", Role::CheckBox, "Remove noise", egui::Key::Space, "noise"),
+                    (Role::CheckBox, "Remove rumble", Role::CheckBox, "Remove noise", egui::Key::Space, "noise"),
+                    (Role::CheckBox, "Remove noise", Role::CheckBox, "Remove rumble", egui::Key::Space, "rumble"),
+                    (Role::CheckBox, "Remove rumble", Role::Link, "DeepFilterNet", egui::Key::Enter, "model"),
+                    (Role::Link, "DeepFilterNet", Role::CheckBox, "Only my voice", egui::Key::Enter, "voice"),
+                    (Role::CheckBox, "Only my voice", Role::Link, "DeepFilterNet", egui::Key::Space, "model"),
+                ] {
+                    let mut app = App::stopped(config::Settings { strength: 0.74321, highpass_hz: 137.25, monitor_volume: 0.43561, ..Default::default() });
+                    app.settings.setup.dismissed = true;
+                    let page = app.page;
+                    let original = app.settings.processing();
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    ctx.enable_accesskit();
+                    let size = egui::vec2(760.0, 880.0);
+                    for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                    let [old, new] = [(old_role, old_label), (new_role, new_label)].map(|(role, label)| *tree.nodes.iter()
+                        .find(|(_, node)| node.role() == role && node.label() == Some(label)).map(|(id, _)| id).unwrap());
+                    let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+                    });
+                    draw_voice(&mut app, &ctx, size, vec![focus(old)]);
+                    for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                    assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, old);
+                    assert!(app.dirty_since.is_none());
+                    draw_voice(&mut app, &ctx, size, vec![focus(new), egui::Event::Key {
+                        key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                    }]);
+                    for _ in 0..7 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                    let mut expected = original;
+                    match field {
+                        "noise" => expected.strength = 0.0,
+                        "rumble" => expected.highpass = !expected.highpass,
+                        "model" => expected.model = crate::dsp::Model::Rnnoise,
+                        "voice" => expected.voice_gate = !expected.voice_gate,
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(app.page, page, "the key must not activate the old {old_label} sidebar button");
+                    assert_eq!(app.settings.processing(), expected, "{key:?} belongs only to the requested {new_label}");
+                    assert_eq!(app.settings.monitor_volume, 0.43561);
+                    assert!(!app.settings.monitor);
+                    assert!(app.dirty_since.is_some());
+                    assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, new);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escape_cancels_activation_waiting_for_focus() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for dark in [true, false] {
+            for (role, label, modifiers) in [
+                (Role::Button, "Soundboard", None),
+                (Role::Slider, "Remove rumble", Some(egui::Modifiers::NONE)),
+                (Role::Link, "DeepFilterNet", Some(egui::Modifiers::SHIFT)),
+            ] {
+                let mut app = App::stopped(config::Settings { strength: 0.74321, ..Default::default() });
+                app.settings.setup.dismissed = true;
+                let page = app.page;
+                let original = app.settings.processing();
+                let ctx = egui::Context::default();
+                ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                ctx.enable_accesskit();
+                let size = egui::vec2(760.0, 880.0);
+                for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let [old, new] = [(role, label), (Role::CheckBox, "Remove noise")].map(|(role, label)| *tree.nodes.iter()
+                    .find(|(_, node)| node.role() == role && node.label() == Some(label)).map(|(id, _)| id).unwrap());
+                let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+                });
+                let key = |key| egui::Event::Key {
+                    key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                };
+                draw_voice(&mut app, &ctx, size, vec![focus(old)]);
+                for _ in 0..2 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                let movement = modifiers.map_or_else(|| focus(new), |modifiers| egui::Event::Key {
+                    key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers,
+                });
+                draw_voice(&mut app, &ctx, size, vec![movement, key(egui::Key::Space)]);
+                assert_eq!(app.settings.processing(), original, "the command waits for focus");
+                draw_voice(&mut app, &ctx, size, vec![key(egui::Key::Escape)]);
+                for _ in 0..4 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                assert_eq!(app.settings.processing(), original, "Escape discards the unseen activation");
+                assert_eq!(app.page, page);
+                assert!(app.dirty_since.is_none());
+                draw_voice(&mut app, &ctx, size, vec![focus(new), key(egui::Key::Space)]);
+                for _ in 0..5 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                let mut expected = original;
+                expected.strength = 0.0;
+                assert_eq!(app.settings.processing(), expected, "a fresh command still works after cancellation");
+                assert_eq!(app.page, page);
+                assert!(app.dirty_since.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn batched_tab_activation_uses_the_new_focus_once() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for key in [egui::Key::Space, egui::Key::Enter] {
+                    for (old_role, old_label, new_role, new_label, backwards, field) in [
+                        (Role::Link, "DeepFilterNet", Role::CheckBox, "Only my voice", false, "voice"),
+                        (Role::CheckBox, "Only my voice", Role::Link, "DeepFilterNet", true, "model"),
+                        (Role::Slider, "Remove rumble", Role::CheckBox, "Remove noise", false, "noise"),
+                        (Role::Slider, "Only my voice", Role::CheckBox, "Quiet cut-off", false, "gate"),
+                        (Role::Slider, "Quiet cut-off", Role::CheckBox, "Quiet cut-off", true, "gate"),
+                        (Role::CheckBox, "Remove rumble", Role::Slider, "Your mic", true, "none"),
+                        (Role::Link, "DeepFilterNet", Role::CheckBox, "Only my voice", false, "both"),
+                        (Role::CheckBox, "Only my voice", Role::Link, "DeepFilterNet", true, "both"),
+                    ] {
+                        let mut app = App::stopped(config::Settings {
+                            strength: 0.74321, highpass_hz: 137.25, voice_threshold: 0.61347, monitor_volume: 0.43561,
+                            ..Default::default()
+                        });
+                        app.settings.setup.dismissed = true;
+                        let page = app.page;
+                        let original = app.settings.processing();
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        ctx.enable_accesskit();
+                        let size = egui::vec2(760.0, 880.0);
+                        for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                        let [old, new] = [(old_role, old_label), (new_role, new_label)].map(|(role, label)| *tree.nodes.iter()
+                            .find(|(_, node)| node.role() == role && node.label() == Some(label)).map(|(id, _)| id).unwrap());
+                        draw_voice(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                            action: Action::Focus, target_tree: TreeId::ROOT, target_node: old, data: None,
+                        })]);
+                        for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                        let mut clicked = Vec::new();
+                        let command = |pressed| egui::Event::Key {
+                            key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                        };
+                        let mut events = if field == "both" { vec![command(true), command(false)] } else { Vec::new() };
+                        events.extend([
+                            egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false,
+                                modifiers: if backwards { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE } },
+                            command(true),
+                        ]);
+                        for _ in 0..8 {
+                            let output = draw_voice(&mut app, &ctx, size, std::mem::take(&mut events));
+                            clicked.extend(output.platform_output.events.iter().filter_map(|event| match event {
+                                egui::output::OutputEvent::Clicked(info) => info.label.clone(),
+                                _ => None,
+                            }));
+                        }
+                        let mut expected = original;
+                        match field {
+                            "voice" => expected.voice_gate = !expected.voice_gate,
+                            "model" => expected.model = crate::dsp::Model::Rnnoise,
+                            "noise" => expected.strength = 0.0,
+                            "gate" => expected.gate = !expected.gate,
+                            "both" => { expected.model = crate::dsp::Model::Rnnoise; expected.voice_gate = !expected.voice_gate; }
+                            "none" => {},
+                            _ => unreachable!(),
+                        }
+                        assert_eq!(app.settings.processing(), expected,
+                            "{key:?} after Tab belongs to {new_label}; backwards={backwards}, passes={passes}");
+                        let expected_clicks = if field == "both" { vec![old_label, new_label] } else { vec![new_label] };
+                        assert_eq!(clicked, expected_clicks, "each control reports its activation once, in input order");
+                        assert_eq!(app.page, page);
+                        assert_eq!(app.settings.monitor_volume, 0.43561);
+                        assert!(!app.settings.monitor);
+                        assert_eq!(app.dirty_since.is_some(), field != "none");
+                        let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                        assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, new);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn voice_keyboard_controls_scroll_into_view_and_apply_batched_input() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let controls = [
+            (Role::Slider, "Your mic"), (Role::Slider, "Remove rumble"), (Role::Slider, "Remove noise"),
+            (Role::Slider, "Only my voice"), (Role::Slider, "Quiet cut-off"), (Role::Slider, "To Discord"),
+            (Role::Slider, "Hear yourself"), (Role::CheckBox, "Remove rumble"), (Role::CheckBox, "Remove noise"),
+            (Role::CheckBox, "Only my voice"), (Role::CheckBox, "Quiet cut-off"), (Role::CheckBox, "Hear yourself"),
+            (Role::Link, "DeepFilterNet"),
+        ];
+        for dark in [true, false] {
+            let mut app = App::stopped(config::Settings::default());
+            app.settings.setup.dismissed = true;
+            app.settings.input_gain_db = 3.37;
+            app.settings.highpass_hz = 137.25;
+            app.settings.monitor_volume = 0.43561;
+            let original = app.settings.processing();
+            let ctx = egui::Context::default();
+            ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+            ctx.enable_accesskit();
+            let size = egui::vec2(700.0, 420.0);
+            for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+            let mut visited = std::collections::HashSet::new();
+            let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+            for _ in 0..80 {
+                let output = draw_voice(&mut app, &ctx, size, vec![key(egui::Key::Tab, egui::Modifiers::NONE)]);
+                if ctx.memory(|memory| memory.focused()).is_none() { continue; }
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let node = &tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1;
+                let role = node.role();
+                if !node.label().is_some_and(|label| controls.contains(&(role, label))) { continue; }
+                let name = node.label().unwrap().to_owned();
+                for _ in 0..6 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                let node = &tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1;
+                assert_eq!(node.label(), Some(name.as_str()));
+                assert_eq!(node.role(), role);
+                let bounds = node.bounds().unwrap();
+                let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect) && match &shape.shape {
+                    egui::Shape::Rect(outline) if role != Role::Link => outline.rect == rect && outline.stroke.width == 2.0,
+                    egui::Shape::Text(link) if role == Role::Link => link.galley.text() == name && link.underline.width > 0.0,
+                    _ => false,
+                }), "the focused {role:?} {name} and its focus indicator are fully visible");
+                visited.insert((role, name));
+                if visited.len() == controls.len() { break; }
+            }
+            assert_eq!(visited, controls.into_iter().map(|(role, label)| (role, label.to_owned())).collect());
+            assert_eq!(app.settings.processing(), original);
+            assert_eq!(app.settings.monitor_volume, 0.43561);
+            assert!(app.dirty_since.is_none(), "Tab preserves saved values");
+            for _ in 0..2 {
+                draw_voice(&mut app, &ctx, size, vec![key(egui::Key::Tab, egui::Modifiers::SHIFT)]);
+                for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+            }
+            let output = draw_voice(&mut app, &ctx, size, Vec::new());
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            assert_eq!(tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1.label(), Some("To Discord"));
+            let rumble_switch = *tree.nodes.iter().find(|(_, node)| node.role() == Role::CheckBox && node.label() == Some("Remove rumble"))
+                .map(|(id, _)| id).unwrap();
+            draw_voice(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::Focus, target_tree: TreeId::ROOT, target_node: rumble_switch, data: None,
+            })]);
+            for _ in 0..2 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+            draw_voice(&mut app, &ctx, size, vec![key(egui::Key::Tab, egui::Modifiers::NONE), key(egui::Key::ArrowUp, egui::Modifiers::NONE)]);
+            for _ in 0..6 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+            let mut expected = original;
+            expected.highpass_hz = 138.0;
+            assert_eq!(app.settings.processing(), expected, "a batched Tab and arrow edits the new control");
+            assert_eq!(app.settings.monitor_volume, 0.43561);
+            assert!(app.dirty_since.is_some(), "keyboard edits enter the normal settings save path");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn snapshot_voice_keyboard_focus() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for (role, label, name, size, action) in [
+            (Role::Slider, "Your mic", "voice-keyboard", egui::vec2(760.0, 880.0), Action::Focus),
+            (Role::Slider, "Hear yourself", "voice-keyboard-small", egui::vec2(700.0, 420.0), Action::Focus),
+            (Role::CheckBox, "Remove rumble", "voice-switch", egui::vec2(760.0, 880.0), Action::Focus),
+            (Role::CheckBox, "Hear yourself", "voice-switch-small", egui::vec2(700.0, 420.0), Action::Focus),
+            (Role::Link, "DeepFilterNet", "voice-model-small", egui::vec2(700.0, 420.0), Action::Focus),
+            (Role::CheckBox, "Remove noise", "voice-noise-off", egui::vec2(760.0, 880.0), Action::Click),
+        ] {
+            for (dark, theme) in [(true, "dark"), (false, "light")] {
+                let mut app = App::stopped(config::Settings::default());
+                app.settings.setup.dismissed = true;
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                for _ in 0..3 { draw_voice(&mut app, &ctx, size, Vec::new()); }
+                let output = draw_voice(&mut app, &ctx, size, Vec::new());
+                let target_node = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .find(|(_, node)| node.role() == role && node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                let mut events = vec![vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action, target_tree: TreeId::ROOT, target_node, data: None,
+                })]];
+                events.extend(vec![Vec::new(); 6]);
+                let path = super::super::snapshot::snapshot_with_events(&mut app, &format!("{name}-{theme}"), size, 1.5, dark, events);
+                if action == Action::Click { assert_eq!(app.settings.strength, 0.0); }
+                println!("SNAPSHOT {}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn a_preset_name_accepts_a_batched_backward_tab_edit_and_enter() {
+        use eframe::App as _;
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                let mut app = App::stopped(config::Settings::default());
+                app.settings.setup.dismissed = true;
+                app.preset_name = "Old name".into();
+                let processing = app.settings.processing();
+                let ctx = egui::Context::default();
+                ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                ctx.enable_accesskit();
+                let mut frame = eframe::Frame::_new_kittest();
+                let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
+                    events, ..Default::default()
+                }, |ui| app.ui(ui, &mut frame));
+                for _ in 0..3 { draw(&mut app, Vec::new()); }
+                let output = draw(&mut app, Vec::new());
+                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "+" => Some(text.visual_bounding_rect().center()),
+                    _ => None,
+                }).unwrap();
+                for pressed in [true, false] {
+                    draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    }]);
+                }
+                for _ in 0..3 { draw(&mut app, Vec::new()); }
+                let output = draw(&mut app, Vec::new());
+                let save = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .find(|(_, node)| node.label() == Some("Save")).map(|(id, _)| id).unwrap();
+                draw(&mut app, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: save, data: None,
+                })]);
+                for _ in 0..2 { draw(&mut app, Vec::new()); }
+                let key = |key, modifiers| egui::Event::Key {
+                    key, physical_key: None, pressed: true, repeat: false, modifiers,
+                };
+                draw(&mut app, vec![
+                    key(egui::Key::Tab, egui::Modifiers::SHIFT),
+                    key(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Text("Studio".into()),
+                    key(egui::Key::ArrowLeft, egui::Modifiers::NONE),
+                    egui::Event::Text("X".into()),
+                    key(egui::Key::Enter, egui::Modifiers::NONE),
+                ]);
+                for _ in 0..4 { draw(&mut app, Vec::new()); }
+                let preset = app.settings.presets.iter().find(|preset| preset.name == "StudiXo").unwrap_or_else(|| panic!(
+                    "the edited name is saved; names={:?}, text={:?}, popup={}, focus={:?}, passes={passes}",
+                    app.settings.presets.iter().map(|preset| &preset.name).collect::<Vec<_>>(), app.preset_name,
+                    egui::Popup::is_any_open(&ctx), ctx.memory(|memory| memory.focused())));
+                assert_eq!(preset.processing, processing);
+                assert_eq!(app.settings.processing(), processing);
+                assert!(app.preset_name.is_empty() && app.dirty_since.is_some());
+                assert!(!egui::Popup::is_any_open(&ctx));
+            }
+        }
+    }
 
     #[test]
     fn selecting_a_route_reports_a_change() {

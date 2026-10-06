@@ -40,6 +40,7 @@ struct Row<'a> {
     title: &'a str,
     explain: &'a str,
     value: String,
+    unit: &'a str,
     /// A second, clickable line under the value (the noise model).
     value_link: Option<&'a str>,
     cursor: CursorIcon,
@@ -54,21 +55,36 @@ struct RowInput {
 }
 
 fn draw_row(ui: &mut egui::Ui, row: &Row, paint: impl FnOnce(&egui::Painter, Rect, bool)) -> RowInput {
-    let active = row.on.unwrap_or(true);
+    let mut active = row.on.unwrap_or(true);
     let mut switched = false;
     let mut link = false;
+    let picture_id = ui.make_persistent_id(("voice-picture", row.id));
     let picture = ui
         .horizontal(|ui| {
             ui.set_min_height(PICTURE_HEIGHT + 10.0);
             // The switch, or a gap the same width.
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(SWITCH_WIDTH, PICTURE_HEIGHT), Sense::click());
+            let sense = if row.on.is_some() { Sense::click() } else { Sense::hover() };
+            let (rect, mut response) = ui.allocate_exact_size(Vec2::new(SWITCH_WIDTH, PICTURE_HEIGHT), sense);
             if let Some(on) = row.on {
+                switched = response.clicked();
+                // Paint and announce the new state before the caller applies it.
+                let on = if switched { !on } else { on };
+                active = on;
+                if switched {
+                    response.mark_changed();
+                    ui.ctx().request_repaint();
+                }
                 switch(ui, rect, on, response.hovered());
+                if response.has_focus() {
+                    ui.painter().rect_stroke(rect, 5.0, Stroke::new(2.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
+                }
+                if response.gained_focus() {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
                 let response = response
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text(if on { "On: click to turn off" } else { "Off: click to turn on" });
-                response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, row.title));
-                switched = response.clicked();
+                response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, response.enabled(), on, row.title));
             }
             ui.vertical(|ui| {
                 ui.set_width(TITLE_WIDTH);
@@ -77,20 +93,32 @@ fn draw_row(ui: &mut egui::Ui, row: &Row, paint: impl FnOnce(&egui::Painter, Rec
                 ui.label(RichText::new(row.explain).small().weak());
             });
             let width = (ui.available_width() - VALUE_WIDTH - ui.spacing().item_spacing.x).max(80.0);
-            let (rect, picture) = ui.allocate_exact_size(Vec2::new(width, PICTURE_HEIGHT), Sense::click_and_drag());
-            let picture = picture.on_hover_cursor(row.cursor);
+            let (_, rect) = ui.allocate_space(Vec2::new(width, PICTURE_HEIGHT));
+            let picture = ui.interact(rect, picture_id, Sense::click_and_drag()).on_hover_cursor(row.cursor);
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, 5.0, ui.visuals().extreme_bg_color);
             paint(&painter, rect.shrink2(Vec2::new(4.0, 2.0)), active);
             if !active {
                 painter.rect_filled(rect, 5.0, ui.visuals().panel_fill.gamma_multiply(0.55));
             }
+            if picture.has_focus() {
+                painter.rect_stroke(rect, 5.0, Stroke::new(2.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
+            }
+            if picture.gained_focus() {
+                picture.scroll_to_me(Some(egui::Align::Center));
+            }
             ui.vertical(|ui| {
                 ui.set_width(VALUE_WIDTH);
                 let value = RichText::new(&row.value).monospace();
                 ui.label(if active { value } else { value.weak() });
                 if let Some(text) = row.value_link {
-                    link = ui.link(RichText::new(text).small()).on_hover_text("Switch the noise model").clicked();
+                    // egui's text selection overwrites the link's assistive role.
+                    ui.style_mut().interaction.selectable_labels = false;
+                    let response = ui.link(RichText::new(text).small()).on_hover_text("Switch the noise model");
+                    if response.gained_focus() {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    link = response.clicked();
                 }
             });
             picture
@@ -152,7 +180,14 @@ fn idle(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) {
 
 /// Change `value` by a relative drag (up or right increases), `per_px` a pixel.
 fn drag_by(picture: &egui::Response, value: &mut f32, per_px: f32, range: std::ops::RangeInclusive<f32>) -> bool {
-    let delta = picture.drag_delta();
+    let mut delta = picture.drag_delta();
+    if picture.drag_stopped_by(egui::PointerButton::Primary) {
+        // drag_delta is zero on release, even when the pointer moved again.
+        delta = picture.ctx.input(|input| input.pointer.delta());
+        if let Some(from_global) = picture.ctx.layer_transform_from_global(picture.layer_id) {
+            delta *= from_global.scaling;
+        }
+    }
     let pixels = if delta.x.abs() > delta.y.abs() { delta.x } else { -delta.y };
     let next = (*value + pixels * per_px).clamp(*range.start(), *range.end());
     let changed = next != *value;
@@ -162,13 +197,87 @@ fn drag_by(picture: &egui::Response, value: &mut f32, per_px: f32, range: std::o
 
 /// Set `value` from where the pointer is along one axis of the picture.
 fn drag_to(picture: &egui::Response, rect: Rect, value: &mut f32, map: impl Fn(Pos2, Rect) -> f32) -> bool {
-    if !picture.dragged() && !picture.clicked() {
+    if !picture.dragged() && !picture.clicked() && !picture.drag_stopped_by(egui::PointerButton::Primary) {
         return false;
     }
     let Some(pos) = picture.interact_pointer_pos() else { return false };
     let next = map(pos, rect);
     let changed = next != *value;
     *value = next;
+    changed
+}
+
+/// Wheel, keyboard and assistive adjustments share the same fine-step grid.
+fn value_control(ui: &mut egui::Ui, row: &Row, input: &RowInput, value: &mut f32, step: f32, range: std::ops::RangeInclusive<f32>, default: f32) -> bool {
+    use egui::accesskit::{Action, ActionData, TreeId};
+    let picture = &input.picture;
+    let before = *value;
+    let scale = if row.unit == "%" { 100.0 } else { 1.0 };
+    let requested_elsewhere = ui.input(|input| input.events.iter().rev().find_map(|event| match event {
+        egui::Event::AccessKitActionRequest(request) if request.action == Action::Focus && request.target_tree == TreeId::ROOT =>
+            Some(request.target_node != picture.id.accesskit_id()),
+        _ => None,
+    }).unwrap_or(false));
+    let focused = picture.has_focus() && !requested_elsewhere;
+    if focused {
+        ui.memory_mut(|memory| memory.set_focus_lock_filter(picture.id, egui::EventFilter {
+            horizontal_arrows: true, vertical_arrows: true, ..Default::default()
+        }));
+    }
+    if picture.enabled() {
+        step_by(value, input.notches, step, range.clone());
+        let mut used_key = false;
+        ui.input_mut(|input| input.events.retain(|event| {
+            match event {
+                egui::Event::Key { key, pressed: true, modifiers, .. } if focused && modifiers.is_none() => {
+                    match key {
+                        egui::Key::ArrowUp | egui::Key::ArrowRight => { step_by(value, 1.0, step, range.clone()); }
+                        egui::Key::ArrowDown | egui::Key::ArrowLeft => { step_by(value, -1.0, step, range.clone()); }
+                        egui::Key::Home => *value = *range.start(),
+                        egui::Key::End => *value = *range.end(),
+                        _ => return true,
+                    }
+                    used_key = true;
+                    false
+                }
+                egui::Event::AccessKitActionRequest(request)
+                    if request.target_tree == TreeId::ROOT && request.target_node == picture.id.accesskit_id() =>
+                {
+                    match request.action {
+                        Action::Increment => { step_by(value, 1.0, step, range.clone()); }
+                        Action::Decrement => { step_by(value, -1.0, step, range.clone()); }
+                        Action::SetValue => {
+                            if let Some(ActionData::NumericValue(next)) = &request.data && next.is_finite() {
+                                *value = (next / scale).clamp(*range.start() as f64, *range.end() as f64) as f32;
+                            }
+                        }
+                        _ => return true,
+                    }
+                    false
+                }
+                _ => true,
+            }
+        }));
+        if used_key { ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None)); }
+        reset_on_double_click(picture, value, default);
+    }
+    let changed = *value != before;
+    let mut response = picture.clone();
+    if changed { response.mark_changed(); }
+    response.widget_info(|| egui::WidgetInfo::slider(picture.enabled(), *value as f64 * scale, row.title));
+    ui.ctx().accesskit_node_builder(picture.id, |node| {
+        node.set_description(row.explain);
+        node.set_value(format!("{:.2} {}", *value as f64 * scale, row.unit));
+        node.set_min_numeric_value(*range.start() as f64 * scale);
+        node.set_max_numeric_value(*range.end() as f64 * scale);
+        node.set_numeric_value_step(step as f64 * scale);
+        if picture.enabled() {
+            node.add_action(Action::SetValue);
+            if *value < *range.end() { node.add_action(Action::Increment); }
+            if *value > *range.start() { node.add_action(Action::Decrement); }
+        }
+    });
+    if changed { ui.ctx().request_repaint(); }
     changed
 }
 
@@ -186,6 +295,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "Your mic",
         explain: "How loud you are going in",
         value: format!("{:+.1} dB", s.input_gain_db),
+        unit: "dB",
         value_link: None,
         cursor: CursorIcon::ResizeVertical,
     };
@@ -199,8 +309,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         }
     });
     changed.settings |= drag_by(&input.picture, &mut s.input_gain_db, 0.25, INPUT_GAIN_RANGE)
-        | step_by(&mut s.input_gain_db, input.notches, 0.5, INPUT_GAIN_RANGE)
-        | reset_on_double_click(&input.picture, &mut s.input_gain_db, 0.0);
+        | value_control(ui, &row, &input, &mut s.input_gain_db, 0.5, INPUT_GAIN_RANGE, 0.0);
 
     // ---- Remove rumble ---------------------------------------------------
     let row = Row {
@@ -209,6 +318,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "Remove rumble",
         explain: "Cuts low thumps and hum",
         value: format!("{:.0} Hz", s.highpass_hz),
+        unit: "Hz",
         value_link: None,
         cursor: CursorIcon::ResizeHorizontal,
     };
@@ -217,8 +327,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
     changed.settings |= toggle(input.switched, &mut s.highpass);
     changed.settings |= drag_to(&input.picture, input.picture.rect, &mut s.highpass_hz, |pos, rect| {
         freq_at(rect.shrink2(Vec2::new(4.0, 2.0)), pos.x).clamp(*HIGHPASS_RANGE.start(), *HIGHPASS_RANGE.end()).round()
-    }) | step_by(&mut s.highpass_hz, input.notches, 1.0, HIGHPASS_RANGE)
-        | reset_on_double_click(&input.picture, &mut s.highpass_hz, HIGHPASS_HZ);
+    }) | value_control(ui, &row, &input, &mut s.highpass_hz, 1.0, HIGHPASS_RANGE, HIGHPASS_HZ);
 
     // ---- Remove noise ----------------------------------------------------
     let noise_on = s.strength > 0.0;
@@ -228,6 +337,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "Remove noise",
         explain: "Keeps your voice, drops the room",
         value: format!("{:.0}%", s.strength * 100.0),
+        unit: "%",
         value_link: Some(match s.model {
             Model::DeepFilter => "DeepFilterNet",
             Model::Rnnoise => "RNNoise",
@@ -265,8 +375,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         changed.settings = true;
     }
     changed.settings |= drag_by(&input.picture, &mut s.strength, 0.005, 0.0..=1.0)
-        | step_by(&mut s.strength, input.notches, 0.01, 0.0..=1.0)
-        | reset_on_double_click(&input.picture, &mut s.strength, 1.0);
+        | value_control(ui, &row, &input, &mut s.strength, 0.01, 0.0..=1.0, 1.0);
 
     // ---- Only my voice (voice gate) -------------------------------------
     let row = Row {
@@ -275,6 +384,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "Only my voice",
         explain: "Silent when you're not talking",
         value: format!("{:.0}%", s.voice_threshold * 100.0),
+        unit: "%",
         value_link: None,
         cursor: CursorIcon::ResizeVertical,
     };
@@ -294,8 +404,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
     changed.settings |= drag_to(&input.picture, input.picture.rect, &mut s.voice_threshold, |pos, rect| {
         let r = rect.shrink2(Vec2::new(4.0, 2.0));
         (((r.bottom() - pos.y) / r.height()) * 100.0).round().clamp(5.0, 95.0) / 100.0
-    }) | step_by(&mut s.voice_threshold, input.notches, 0.01, VOICE_RANGE)
-        | reset_on_double_click(&input.picture, &mut s.voice_threshold, VOICE_THRESHOLD);
+    }) | value_control(ui, &row, &input, &mut s.voice_threshold, 0.01, VOICE_RANGE, VOICE_THRESHOLD);
 
     // ---- Quiet cut-off (level gate) --------------------------------------
     let row = Row {
@@ -304,6 +413,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "Quiet cut-off",
         explain: "Mutes anything below a level",
         value: format!("{:.0} dB", s.gate_threshold_db),
+        unit: "dB",
         value_link: None,
         cursor: CursorIcon::ResizeVertical,
     };
@@ -325,8 +435,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         let r = rect.shrink2(Vec2::new(4.0, 2.0));
         let db = FLOOR_DB * (pos.y - r.top()) / r.height();
         db.round().clamp(*GATE_THRESHOLD_RANGE.start(), *GATE_THRESHOLD_RANGE.end())
-    }) | step_by(&mut s.gate_threshold_db, input.notches, 1.0, GATE_THRESHOLD_RANGE)
-        | reset_on_double_click(&input.picture, &mut s.gate_threshold_db, -50.0);
+    }) | value_control(ui, &row, &input, &mut s.gate_threshold_db, 1.0, GATE_THRESHOLD_RANGE, -50.0);
 
     // ---- To Discord --------------------------------------------------------
     let row = Row {
@@ -335,6 +444,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "To Discord",
         explain: "How loud Discord hears you",
         value: format!("{:+.1} dB", s.output_gain_db),
+        unit: "dB",
         value_link: None,
         cursor: CursorIcon::ResizeVertical,
     };
@@ -347,8 +457,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         }
     });
     changed.settings |= drag_by(&input.picture, &mut s.output_gain_db, 0.25, OUTPUT_GAIN_RANGE)
-        | step_by(&mut s.output_gain_db, input.notches, 0.5, OUTPUT_GAIN_RANGE)
-        | reset_on_double_click(&input.picture, &mut s.output_gain_db, 0.0);
+        | value_control(ui, &row, &input, &mut s.output_gain_db, 0.5, OUTPUT_GAIN_RANGE, 0.0);
 
     // ---- Hear yourself (headphone monitor) --------------------------------
     let row = Row {
@@ -357,6 +466,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
         title: "Hear yourself",
         explain: "What Discord hears, in your headphones",
         value: format!("{:.0}%", s.monitor_volume * 100.0),
+        unit: "%",
         value_link: None,
         cursor: CursorIcon::ResizeHorizontal,
     };
@@ -373,8 +483,7 @@ pub fn voice_rows(ui: &mut egui::Ui, frames: &[ScopeFrame], s: &mut Settings, st
     changed.settings |= drag_to(&input.picture, input.picture.rect, &mut s.monitor_volume, |pos, rect| {
         let r = rect.shrink2(Vec2::new(4.0, 2.0));
         (((pos.x - r.left()) / r.width()) * 100.0).round().clamp(0.0, 100.0) / 100.0
-    }) | step_by(&mut s.monitor_volume, input.notches, 0.01, 0.0..=1.0)
-        | reset_on_double_click(&input.picture, &mut s.monitor_volume, 1.0);
+    }) | value_control(ui, &row, &input, &mut s.monitor_volume, 0.01, 0.0..=1.0, 1.0);
 
     changed.pictures = ui.data(|d| d.get_temp::<Vec<(String, Rect)>>(Id::new("row pictures"))).unwrap_or_default();
     changed
@@ -527,14 +636,296 @@ mod tests {
 
     /// Run the rows for a frame with `events`; returns what changed.
     fn rows(ctx: &egui::Context, s: &mut Settings, before_off: &mut f32, frames: &[ScopeFrame], events: Vec<egui::Event>) -> Changed {
+        rows_output(ctx, s, before_off, frames, events).0
+    }
+
+    fn rows_output(ctx: &egui::Context, s: &mut Settings, before_off: &mut f32, frames: &[ScopeFrame], events: Vec<egui::Event>) -> (Changed, egui::FullOutput) {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 420.0))),
             events,
             ..Default::default()
         };
         let mut out = Changed::default();
-        let _ = ctx.run_ui(input, |ui| out = voice_rows(ui, frames, s, before_off));
-        out
+        let output = ctx.run_ui(input, |ui| out = voice_rows(ui, frames, s, before_off));
+        (out, output)
+    }
+
+    fn setting_mut<'a>(settings: &'a mut Settings, id: &str) -> &'a mut f32 {
+        match id {
+            "mic" => &mut settings.input_gain_db,
+            "rumble" => &mut settings.highpass_hz,
+            "noise" => &mut settings.strength,
+            "voice" => &mut settings.voice_threshold,
+            "level" => &mut settings.gate_threshold_db,
+            "out" => &mut settings.output_gain_db,
+            "monitor" => &mut settings.monitor_volume,
+            _ => panic!("unknown voice control {id}"),
+        }
+    }
+
+    #[test]
+    fn voice_switches_report_and_draw_the_new_state_in_the_activation_frame() {
+        use egui::accesskit::{Action, ActionRequest, Role, Toggled, TreeId};
+        for dark in [true, false] {
+            for label in ["Remove rumble", "Remove noise", "Only my voice", "Quiet cut-off", "Hear yourself"] {
+                for input in ["pointer", "keyboard", "assistive"] {
+                    let ctx = egui::Context::default();
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+                    ctx.enable_accesskit();
+                    let mut settings = Settings { strength: 0.74321, monitor_volume: 0.43561, highpass_hz: 137.25, ..Settings::default() };
+                    let strength = settings.strength;
+                    let mut before_off = strength;
+                    for _ in 0..3 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+                    let (_, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], Vec::new());
+                    let (target, node) = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                        .find(|(_, node)| node.role() == Role::CheckBox && node.label() == Some(label)).unwrap();
+                    let target = *target;
+                    let bounds = node.bounds().unwrap();
+                    let rect = Rect::from_min_max(Pos2::new(bounds.x0 as f32, bounds.y0 as f32), Pos2::new(bounds.x1 as f32, bounds.y1 as f32));
+                    let action = |action| egui::Event::AccessKitActionRequest(ActionRequest {
+                        action, target_tree: TreeId::ROOT, target_node: target, data: None,
+                    });
+                    let space = |pressed| egui::Event::Key {
+                        key: egui::Key::Space, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                    };
+                    if input == "keyboard" {
+                        rows(&ctx, &mut settings, &mut before_off, &[], vec![action(Action::Focus)]);
+                        for _ in 0..2 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+                    }
+                    for _ in 0..2 {
+                        let mut expected = settings.clone();
+                        let next_on = match label {
+                            "Remove rumble" => { expected.highpass = !expected.highpass; expected.highpass }
+                            "Remove noise" => { expected.strength = if expected.strength > 0.0 { 0.0 } else { strength }; expected.strength > 0.0 }
+                            "Only my voice" => { expected.voice_gate = !expected.voice_gate; expected.voice_gate }
+                            "Quiet cut-off" => { expected.gate = !expected.gate; expected.gate }
+                            "Hear yourself" => { expected.monitor = !expected.monitor; expected.monitor }
+                            _ => unreachable!(),
+                        };
+                        let events = match input {
+                            "pointer" => {
+                                rows(&ctx, &mut settings, &mut before_off, &[], vec![egui::Event::PointerMoved(rect.center())]);
+                                rows(&ctx, &mut settings, &mut before_off, &[], vec![button(rect.center(), true)]);
+                                vec![button(rect.center(), false)]
+                            }
+                            "keyboard" => vec![space(true)],
+                            "assistive" => vec![action(Action::Click)],
+                            _ => unreachable!(),
+                        };
+                        let (changed, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], events);
+                        assert!(changed.settings);
+                        assert_eq!(changed.monitor, label == "Hear yourself");
+                        assert_eq!(settings.processing(), expected.processing(), "{input} changes only {label}");
+                        assert_eq!(settings.monitor, expected.monitor);
+                        assert_eq!(settings.monitor_volume, expected.monitor_volume);
+                        let node = &output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                            .find(|(id, _)| *id == target).unwrap().1;
+                        assert_eq!(node.toggled(), Some(if next_on { Toggled::True } else { Toggled::False }),
+                            "{input} immediately exposes the new {label} state");
+                        assert!(output.platform_output.events.iter().any(|event| matches!(event, egui::output::OutputEvent::Clicked(info)
+                            if info.label.as_deref() == Some(label) && info.selected == Some(next_on))),
+                            "{input} announces the new {label} state");
+                        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, Shape::Circle(knob)
+                            if rect.contains(knob.center) && knob.fill == Color32::WHITE && (knob.center.x > rect.center().x) == next_on)),
+                            "the {label} knob agrees with its announced state");
+                        if input == "assistive" {
+                            assert!(ctx.memory(|memory| memory.focused()).is_none(), "assistive clicks preserve keyboard focus");
+                        }
+                        let events = if input == "keyboard" { vec![space(false)] } else { Vec::new() };
+                        let changed = rows(&ctx, &mut settings, &mut before_off, &[], events);
+                        assert!(!changed.settings && !changed.monitor, "the action only toggles once");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn voice_pictures_expose_named_values_and_keyboard_adjustments() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for dark in [true, false] {
+            for (id, label, base, raised, scale, range) in [
+                ("mic", "Your mic", 0.0, 1.0, 1.0, INPUT_GAIN_RANGE),
+                ("rumble", "Remove rumble", 100.0, 102.0, 1.0, HIGHPASS_RANGE),
+                ("noise", "Remove noise", 0.6, 0.62, 100.0, 0.0..=1.0),
+                ("voice", "Only my voice", 0.5, 0.52, 100.0, VOICE_RANGE),
+                ("level", "Quiet cut-off", -50.0, -48.0, 1.0, GATE_THRESHOLD_RANGE),
+                ("out", "To Discord", 0.0, 1.0, 1.0, OUTPUT_GAIN_RANGE),
+                ("monitor", "Hear yourself", 0.5, 0.52, 100.0, 0.0..=1.0),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                ctx.enable_accesskit();
+                let mut settings = Settings {
+                    input_gain_db: 3.37, highpass_hz: 137.25, strength: 0.74321, voice_threshold: 0.61347,
+                    gate_threshold_db: -43.27, output_gain_db: -2.33, monitor_volume: 0.43561,
+                    ..Settings::default()
+                };
+                *setting_mut(&mut settings, id) = base;
+                let mut before_off = settings.strength;
+                let mut expected = settings.clone();
+                for _ in 0..3 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+                let (_, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], Vec::new());
+                let (target, node) = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .find(|(_, node)| node.role() == Role::Slider && node.label() == Some(label))
+                    .unwrap_or_else(|| panic!("{label} exposes a named slider"));
+                assert_eq!(node.numeric_value(), Some(base as f64 * scale));
+                rows(&ctx, &mut settings, &mut before_off, &[], vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: *target, data: None,
+                })]);
+                for _ in 0..2 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+                assert_eq!(settings.processing(), expected.processing(), "focusing {label} preserves precise values");
+                assert_eq!(settings.monitor_volume, expected.monitor_volume);
+                let key = |key| egui::Event::Key {
+                    key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                };
+                let (changed, output) = rows_output(&ctx, &mut settings, &mut before_off, &[],
+                    vec![key(egui::Key::ArrowUp), key(egui::Key::ArrowRight)]);
+                let actual = *setting_mut(&mut settings, id);
+                assert!((actual - raised).abs() < 1e-5, "both arrow presses adjust {label}: {actual}");
+                assert!(changed.settings);
+                assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, *target, "arrows retain focus");
+                assert!(output.platform_output.events.iter().any(|event| matches!(event, egui::output::OutputEvent::ValueChanged(info)
+                    if info.label.as_deref() == Some(label))), "{label} announces keyboard value changes");
+                *setting_mut(&mut expected, id) = actual;
+                assert_eq!(settings.processing(), expected.processing(), "arrows change only {label}");
+                assert_eq!(settings.monitor_volume, expected.monitor_volume);
+                assert_eq!(settings.monitor, expected.monitor);
+                let (changed, output) = rows_output(&ctx, &mut settings, &mut before_off, &[],
+                    vec![key(egui::Key::ArrowDown), key(egui::Key::ArrowLeft)]);
+                let actual = *setting_mut(&mut settings, id);
+                assert!((actual - base).abs() < 1e-5, "both reverse arrows decrease {label}: {actual}");
+                assert!(changed.settings);
+                assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, *target);
+                *setting_mut(&mut expected, id) = actual;
+                assert_eq!(settings.processing(), expected.processing());
+                assert_eq!(settings.monitor_volume, expected.monitor_volume);
+                for (key_name, limit) in [(egui::Key::Home, *range.start()), (egui::Key::End, *range.end())] {
+                    let changed = rows(&ctx, &mut settings, &mut before_off, &[], vec![key(key_name)]);
+                    assert!(changed.settings);
+                    assert_eq!(*setting_mut(&mut settings, id), limit, "{key_name:?} reaches the {label} limit");
+                    *setting_mut(&mut expected, id) = limit;
+                    assert_eq!(settings.processing(), expected.processing());
+                    assert_eq!(settings.monitor_volume, expected.monitor_volume);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assistive_focus_and_arrow_input_edit_only_the_requested_voice_control() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for (old, new, field) in [("Your mic", "Remove rumble", "rumble"), ("Remove rumble", "Your mic", "mic")] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut settings = Settings::default();
+            let mut before_off = settings.strength;
+            for _ in 0..3 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+            let (_, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], Vec::new());
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            let [old, new] = [old, new].map(|label| *tree.nodes.iter()
+                .find(|(_, node)| node.role() == Role::Slider && node.label() == Some(label)).map(|(id, _)| id).unwrap());
+            let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+            });
+            rows(&ctx, &mut settings, &mut before_off, &[], vec![focus(old)]);
+            for _ in 0..2 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+            let mut expected = settings.clone();
+            *setting_mut(&mut expected, field) += if field == "mic" { 0.5 } else { 1.0 };
+            let (changed, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], vec![
+                focus(new), egui::Event::Key {
+                    key: egui::Key::ArrowRight, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            assert!(changed.settings);
+            assert_eq!(settings.processing(), expected.processing(), "the arrow belongs to the requested {field} control");
+            assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, new);
+        }
+    }
+
+    #[test]
+    fn assistive_voice_adjustments_use_visible_units_and_enforce_finite_limits() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
+        for (id, label, value, scale, step, range) in [
+            ("mic", "Your mic", 3.37, 1.0, 0.5, INPUT_GAIN_RANGE),
+            ("rumble", "Remove rumble", 137.25, 1.0, 1.0, HIGHPASS_RANGE),
+            ("noise", "Remove noise", 0.61347, 100.0, 0.01, 0.0..=1.0),
+            ("voice", "Only my voice", 0.61347, 100.0, 0.01, VOICE_RANGE),
+            ("level", "Quiet cut-off", -43.27, 1.0, 1.0, GATE_THRESHOLD_RANGE),
+            ("out", "To Discord", -2.33, 1.0, 0.5, OUTPUT_GAIN_RANGE),
+            ("monitor", "Hear yourself", 0.43561, 100.0, 0.01, 0.0..=1.0),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut settings = Settings::default();
+            let mut before_off = settings.strength;
+            for _ in 0..3 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+            let (_, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], Vec::new());
+            let (target, node) = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                .find(|(_, node)| node.role() == Role::Slider && node.label() == Some(label)).unwrap();
+            assert_eq!(node.min_numeric_value(), Some(*range.start() as f64 * scale));
+            assert_eq!(node.max_numeric_value(), Some(*range.end() as f64 * scale));
+            assert!((node.numeric_value_step().unwrap() - step as f64 * scale).abs() < 1e-6);
+            assert!(node.supports_action(Action::SetValue));
+            let action = |action, data| egui::Event::AccessKitActionRequest(ActionRequest {
+                action, target_tree: TreeId::ROOT, target_node: *target, data,
+            });
+            let mut expected = settings.clone();
+            let (changed, output) = rows_output(&ctx, &mut settings, &mut before_off, &[],
+                vec![action(Action::SetValue, Some(ActionData::NumericValue(value as f64 * scale)))]);
+            assert!(changed.settings);
+            assert_eq!(*setting_mut(&mut settings, id), value, "assistive {label} values use its displayed unit");
+            *setting_mut(&mut expected, id) = value;
+            assert_eq!(settings.processing(), expected.processing());
+            assert_eq!(settings.monitor_volume, expected.monitor_volume);
+            let node = &output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                .find(|(node_id, _)| node_id == target).unwrap().1;
+            assert_eq!(node.numeric_value(), Some(value as f64 * scale), "the new value is exposed immediately");
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(!rows(&ctx, &mut settings, &mut before_off, &[],
+                    vec![action(Action::SetValue, Some(ActionData::NumericValue(invalid)))]).settings);
+                assert_eq!(*setting_mut(&mut settings, id), value);
+            }
+            for (outside, limit) in [(-1e6, *range.start()), (1e6, *range.end())] {
+                rows(&ctx, &mut settings, &mut before_off, &[],
+                    vec![action(Action::SetValue, Some(ActionData::NumericValue(outside)))]);
+                assert_eq!(*setting_mut(&mut settings, id), limit);
+                *setting_mut(&mut expected, id) = limit;
+                assert_eq!(settings.processing(), expected.processing());
+                assert_eq!(settings.monitor_volume, expected.monitor_volume);
+            }
+            assert!(!rows(&ctx, &mut settings, &mut before_off, &[], vec![action(Action::Increment, None)]).settings);
+            rows(&ctx, &mut settings, &mut before_off, &[], vec![action(Action::Decrement, None)]);
+            assert!((*setting_mut(&mut settings, id) - (*range.end() - step)).abs() < 1e-5);
+            assert_eq!(settings.monitor, expected.monitor);
+            assert!(ctx.memory(|memory| memory.focused()).is_none(), "assistive edits do not steal keyboard focus");
+        }
+    }
+
+    #[test]
+    fn voice_tab_navigation_skips_empty_switch_gaps() {
+        use egui::accesskit::Role;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut settings = Settings::default();
+        let original = settings.processing();
+        let mut before_off = settings.strength;
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..3 { rows(&ctx, &mut settings, &mut before_off, &[], Vec::new()); }
+        for _ in 0..30 {
+            let (_, output) = rows_output(&ctx, &mut settings, &mut before_off, &[], vec![egui::Event::Key {
+                key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+            }]);
+            if ctx.memory(|memory| memory.focused()).is_none() { continue; }
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            let node = &tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1;
+            assert!(node.label().is_some_and(|label| !label.is_empty()), "every Tab stop names a usable control: {node:?}");
+            if node.role() == Role::Slider { visited.insert(node.label().unwrap().to_owned()); }
+        }
+        assert_eq!(visited, ["Your mic", "Remove rumble", "Remove noise", "Only my voice", "Quiet cut-off", "To Discord", "Hear yourself"]
+            .into_iter().map(str::to_owned).collect());
+        assert_eq!(settings.processing(), original, "Tab never changes a setting");
     }
 
     fn button(pos: Pos2, pressed: bool) -> egui::Event {
@@ -587,19 +978,20 @@ mod tests {
         let mut s = Settings::default();
         let mut before_off = 1.0;
         let drag = |ctx: &egui::Context, s: &mut Settings, before_off: &mut f32, from: Pos2, to: Pos2| {
+            let mut changed = false;
             for events in [
                 vec![egui::Event::PointerMoved(from)],
                 vec![button(from, true)],
-                vec![egui::Event::PointerMoved(from + (to - from) * 0.5)],
-                vec![egui::Event::PointerMoved(to)],
+                vec![egui::Event::PointerMoved(from + (to - from) * 0.75)],
                 vec![button(to, false)],
             ] {
-                rows(ctx, s, before_off, &[], events);
+                changed = rows(ctx, s, before_off, &[], events).settings;
             }
+            assert!(changed, "the release reports its final movement as a settings change");
         };
         let mic = picture(&ctx, &mut s, "mic");
         drag(&ctx, &mut s, &mut before_off, mic.center(), mic.center() - Vec2::new(0.0, 20.0));
-        assert!(s.input_gain_db > 2.0, "dragging up raises the gain: {}", s.input_gain_db);
+        assert!((s.input_gain_db - 5.0).abs() < 1e-4, "gain includes the final movement on release: {}", s.input_gain_db);
 
         let rumble = picture(&ctx, &mut s, "rumble");
         let target = freq_x(rumble.shrink2(Vec2::new(4.0, 2.0)), 150.0);
@@ -607,9 +999,9 @@ mod tests {
         assert!((s.highpass_hz - 150.0).abs() <= 2.0, "the cutoff follows the pointer: {}", s.highpass_hz);
 
         let voice = picture(&ctx, &mut s, "voice");
-        let quarter = Pos2::new(voice.center().x, voice.bottom() - 2.0 - (voice.height() - 4.0) * 0.25);
-        drag(&ctx, &mut s, &mut before_off, voice.center(), quarter);
-        assert!((s.voice_threshold - 0.25).abs() <= 0.02, "the threshold follows the pointer: {}", s.voice_threshold);
+        let tenth = Pos2::new(voice.center().x, voice.bottom() - 2.0 - (voice.height() - 4.0) * 0.1);
+        drag(&ctx, &mut s, &mut before_off, voice.center(), tenth);
+        assert!((s.voice_threshold - 0.1).abs() <= 0.02, "the threshold follows the pointer through release: {}", s.voice_threshold);
     }
 
     #[test]

@@ -116,6 +116,7 @@ pub enum Event {
     DownloadFailed(String),
     /// Keep recognized words available to copy even if Windows refuses typing.
     Transcribed { text: String, typing_error: Option<String> },
+    TranscriptionCancelled,
     /// The take held no speech.
     Nothing,
     Failed(String),
@@ -124,6 +125,7 @@ pub enum Event {
 struct Job {
     model: SpeechModel,
     take: Take,
+    cancel: Arc<AtomicBool>,
 }
 
 /// Download and transcription threads, and their progress.
@@ -133,6 +135,8 @@ pub struct Dictation {
     wake: Arc<dyn Fn() + Send + Sync>,
     /// Takes queued or being transcribed.
     pending: Arc<AtomicU64>,
+    /// Shared by the current batch; cancelled takes keep their old flag.
+    transcription_cancel: Arc<AtomicBool>,
     download: Option<Download>,
 }
 
@@ -157,6 +161,7 @@ impl Dictation {
             events: crossbeam_channel::unbounded(),
             wake: Arc::new(wake),
             pending: Arc::default(),
+            transcription_cancel: Arc::default(),
             download: None,
         }
     }
@@ -181,6 +186,32 @@ impl Dictation {
     /// A take is being transcribed.
     pub fn busy(&self) -> bool {
         self.pending.load(Ordering::Relaxed) > 0
+    }
+
+    /// Stop the current transcription and skip takes already queued for it.
+    pub fn cancel_transcription(&self) {
+        if self.busy() {
+            self.transcription_cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn transcription_cancelling(&self) -> bool {
+        self.busy() && self.transcription_cancel.load(Ordering::Relaxed)
+    }
+
+    /// Hold the real worker before it reads its queue, without opening a model.
+    #[cfg(test)]
+    pub(crate) fn delayed_for_test() -> (Self, Sender<()>) {
+        let mut dictation = Self::new(|| {});
+        let (jobs, queue) = crossbeam_channel::unbounded();
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let (events, pending) = (dictation.events.0.clone(), Arc::clone(&dictation.pending));
+        let thread = thread::spawn(move || {
+            let _ = wait.recv();
+            transcribe_loop(&queue, &events, &|| {}, &pending);
+        });
+        dictation.worker = Some(TranscriptionWorker { jobs, thread });
+        (dictation, release)
     }
 
     /// The model being downloaded, with (bytes done, bytes expected).
@@ -225,6 +256,9 @@ impl Dictation {
     /// Transcribe `take` and type the words into the focused app.
     pub fn transcribe(&mut self, model: SpeechModel, take: Take) {
         self.reap_worker();
+        if self.transcription_cancel.load(Ordering::Relaxed) {
+            self.transcription_cancel = Arc::default();
+        }
         if self.worker.is_none() {
             let (jobs, queue) = crossbeam_channel::unbounded();
             let (events, wake, pending) =
@@ -242,7 +276,8 @@ impl Dictation {
             }
         }
         self.pending.fetch_add(1, Ordering::Relaxed);
-        if self.worker.as_ref().unwrap().jobs.send(Job { model, take }).is_err() {
+        let cancel = Arc::clone(&self.transcription_cancel);
+        if self.worker.as_ref().unwrap().jobs.send(Job { model, take, cancel }).is_err() {
             // The receiver is gone, so this worker cannot change pending again.
             self.discard_worker();
         }
@@ -263,38 +298,61 @@ impl Dictation {
     }
 }
 
+impl Drop for Dictation {
+    fn drop(&mut self) {
+        self.cancel_transcription();
+        self.cancel_download();
+    }
+}
+
 /// Worker thread: keep the last model loaded, since loading it takes longer
 /// than transcribing a phrase.
 fn transcribe_loop(queue: &Receiver<Job>, events: &Sender<Event>, wake: &dyn Fn(), pending: &AtomicU64) {
     let mut loaded: Option<(SpeechModel, Transcriber)> = None;
-    for Job { model, take } in queue.iter() {
+    for Job { model, take, cancel } in queue.iter() {
         let result = (|| -> Result<String> {
-            let samples = take.samples()?;
+            check_transcription_cancelled(&cancel)?;
+            let samples = take.samples_cancellable(&cancel)?;
             drop(take); // deletes the temporary file
-            let audio = decimate(&samples);
+            let audio = decimate(&samples, &cancel)?;
             drop(samples); // free the 48 kHz copy before loading or running Whisper
             if (audio.len() as f32) < MIN_SECONDS * m::SAMPLE_RATE as f32 {
                 return Ok(String::new());
             }
             if loaded.as_ref().is_none_or(|(which, _)| *which != model) {
+                check_transcription_cancelled(&cancel)?;
                 loaded = None; // free the old model before loading the new one
                 loaded = Some((model, Transcriber::load(model)?));
             }
             let (_, transcriber) = loaded.as_mut().context("model not loaded")?;
-            transcriber.transcribe(&audio)
+            transcriber.transcribe(&audio, &cancel)
         })();
-        let event = transcription_event(result, type_text);
+        let event = transcription_event(result, &cancel, type_text);
         pending.fetch_sub(1, Ordering::Relaxed);
         let _ = events.send(event);
         wake();
     }
 }
 
-fn transcription_event(result: Result<String>, type_text: impl FnOnce(&str) -> Result<()>) -> Event {
+fn check_transcription_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("Transcription cancelled");
+    }
+    Ok(())
+}
+
+fn transcription_event(result: Result<String>, cancel: &AtomicBool, type_text: impl FnOnce(&str, &AtomicBool) -> Result<()>) -> Event {
+    if cancel.load(Ordering::Relaxed) {
+        return Event::TranscriptionCancelled;
+    }
     match result {
         Ok(text) if text.is_empty() => Event::Nothing,
         Ok(text) => {
-            let typing_error = type_text(&text).err().map(|e| format!("{e:#}"));
+            let typing = type_text(&text, cancel);
+            if typing.is_err() && cancel.load(Ordering::Relaxed) {
+                return Event::TranscriptionCancelled;
+            }
+            let typing_error = typing.err().map(|e| format!("{e:#}"));
             Event::Transcribed { text, typing_error }
         }
         Err(e) => Event::Failed(format!("{e:#}")),
@@ -492,10 +550,11 @@ impl Transcriber {
     }
 
     /// 16 kHz mono samples to text, 30 seconds at a time.
-    fn transcribe(&mut self, audio: &[f32]) -> Result<String> {
+    fn transcribe(&mut self, audio: &[f32], cancel: &AtomicBool) -> Result<String> {
+        check_transcription_cancelled(cancel)?;
         let mut text = String::new();
         for chunk in audio.chunks(m::N_SAMPLES) {
-            let words = self.transcribe_chunk(chunk)?;
+            let words = self.transcribe_chunk(chunk, cancel)?;
             if !words.is_empty() {
                 if !text.is_empty() {
                     text.push(' ');
@@ -503,10 +562,12 @@ impl Transcriber {
                 text.push_str(&words);
             }
         }
+        check_transcription_cancelled(cancel)?;
         Ok(text)
     }
 
-    fn transcribe_chunk(&mut self, audio: &[f32]) -> Result<String> {
+    fn transcribe_chunk(&mut self, audio: &[f32], cancel: &AtomicBool) -> Result<String> {
+        check_transcription_cancelled(cancel)?;
         let n_mels = self.model.config.num_mel_bins;
         // Whisper's default budget per 30 s window.
         let max_tokens = self.model.config.max_target_positions / 2;
@@ -514,7 +575,9 @@ impl Transcriber {
         let frames = mel.len() / n_mels;
         let mel = Tensor::from_vec(mel, (1, n_mels, frames), &Device::Cpu)?
             .narrow(2, 0, m::N_FRAMES.min(frames))?;
+        check_transcription_cancelled(cancel)?;
         let features = self.model.encoder.forward(&mel, true)?;
+        check_transcription_cancelled(cancel)?;
 
         let Tokens { sot, eot, transcribe, no_timestamps, no_speech, space, .. } = self.tokens;
         let mut tokens = vec![sot];
@@ -526,6 +589,7 @@ impl Transcriber {
         let prompt = tokens.len();
 
         for step in 0..max_tokens {
+            check_transcription_cancelled(cancel)?;
             let input = Tensor::new(tokens.as_slice(), &Device::Cpu)?.unsqueeze(0)?;
             let ys = self.model.decoder.forward(&input, &features, step == 0)?;
             if step == 0 {
@@ -711,7 +775,8 @@ fn mel_filters(n_mels: usize) -> Vec<f32> {
 
 /// 48 kHz to 16 kHz: a windowed-sinc low-pass at 7.2 kHz, then every
 /// third sample.
-fn decimate(samples: &[f32]) -> Vec<f32> {
+fn decimate(samples: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
+    check_transcription_cancelled(cancel)?;
     const TAPS: usize = 63;
     let cutoff = 7_200.0 / dsp::SR as f64;
     let half = (TAPS / 2) as isize;
@@ -732,15 +797,19 @@ fn decimate(samples: &[f32]) -> Vec<f32> {
     kernel.iter_mut().for_each(|k| *k /= gain);
     (0..samples.len())
         .step_by(DECIMATION)
-        .map(|center| {
-            kernel
+        .enumerate()
+        .map(|(index, center)| {
+            if index.is_multiple_of(4096) {
+                check_transcription_cancelled(cancel)?;
+            }
+            Ok(kernel
                 .iter()
                 .enumerate()
                 .filter_map(|(i, k)| {
                     let at = center as isize + i as isize - half;
                     usize::try_from(at).ok().and_then(|at| samples.get(at)).map(|s| s * k)
                 })
-                .sum()
+                .sum())
         })
         .collect()
 }
@@ -749,7 +818,7 @@ fn decimate(samples: &[f32]) -> Vec<f32> {
 
 /// Type `text` into the focused window, as if from the keyboard.
 #[cfg(windows)]
-fn type_text(text: &str) -> Result<()> {
+fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
     use std::time::Instant;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
@@ -763,6 +832,7 @@ fn type_text(text: &str) -> Result<()> {
         .iter()
         .any(|key| unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0)
     {
+        check_transcription_cancelled(cancel)?;
         if started.elapsed() > Duration::from_secs(3) {
             bail!("Release Ctrl, Alt, Shift and Windows keys so the text can be typed");
         }
@@ -783,6 +853,7 @@ fn type_text(text: &str) -> Result<()> {
     };
     let text = text.replace(['\r', '\n'], " ");
     let inputs: Vec<INPUT> = text.encode_utf16().flat_map(|unit| [key(unit, false), key(unit, true)]).collect();
+    check_transcription_cancelled(cancel)?;
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if (sent as usize) < inputs.len() {
         bail!("Windows blocked the typing (is the app running as administrator?)");
@@ -791,7 +862,8 @@ fn type_text(text: &str) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn type_text(_text: &str) -> Result<()> {
+fn type_text(_text: &str, cancel: &AtomicBool) -> Result<()> {
+    check_transcription_cancelled(cancel)?;
     bail!("typing text is available on Windows")
 }
 
@@ -832,6 +904,80 @@ mod tests {
     fn short_take() -> Take {
         // Too short to load a speech model or type into the focused app.
         crate::record::Recorder::from_samples_for_test(&[0.2; 96]).finish().unwrap().unwrap()
+    }
+
+    #[test]
+    fn cancelling_queued_takes_keeps_one_worker_and_accepts_new_dictation() {
+        for queue_before_completion in [true, false] {
+            let (mut dictation, release) = Dictation::delayed_for_test();
+            dictation.transcribe(SpeechModel::TinyEn, short_take());
+            dictation.transcribe(SpeechModel::TinyEn, short_take());
+            let cancelled = Arc::clone(&dictation.transcription_cancel);
+            dictation.cancel_transcription();
+            assert!(dictation.busy() && dictation.transcription_cancelling());
+            assert_eq!(dictation.pending.load(Ordering::Relaxed), 2, "keep tracking the worker until it stops");
+            if queue_before_completion {
+                dictation.transcribe(SpeechModel::TinyEn, short_take());
+                assert!(!dictation.transcription_cancelling());
+                assert!(!Arc::ptr_eq(&cancelled, &dictation.transcription_cancel));
+            }
+            release.send(()).unwrap();
+            for _ in 0..2 {
+                assert!(matches!(dictation.events.1.recv_timeout(Duration::from_secs(3)), Ok(Event::TranscriptionCancelled)));
+            }
+            if !queue_before_completion {
+                assert!(!dictation.busy());
+                dictation.cancel_transcription(); // an idle click must not cancel the next take
+                dictation.transcribe(SpeechModel::TinyEn, short_take());
+            }
+            assert!(matches!(dictation.events.1.recv_timeout(Duration::from_secs(3)), Ok(Event::Nothing)),
+                "a fresh take must survive an earlier cancellation");
+            assert!(cancelled.load(Ordering::Relaxed), "cancelled jobs must keep their original flag");
+            assert!(!dictation.busy() && !dictation.transcription_cancelling());
+            assert!(dictation.poll().is_none());
+            let worker = dictation.worker.take().unwrap();
+            drop(worker.jobs);
+            worker.thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_dictation_cancels_queued_takes_without_waiting_for_the_worker() {
+        let (mut dictation, release) = Dictation::delayed_for_test();
+        dictation.transcribe(SpeechModel::TinyEn, short_take());
+        dictation.transcribe(SpeechModel::TinyEn, short_take());
+        let events = dictation.events.1.clone();
+        let pending = Arc::clone(&dictation.pending);
+        let worker = dictation.worker.take().unwrap();
+        drop(dictation);
+        release.send(()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(events.recv_timeout(Duration::from_secs(3)), Ok(Event::TranscriptionCancelled)),
+                "discarded owners must not let queued audio reach typing");
+        }
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        drop(worker.jobs);
+        worker.thread.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_dictation_cancels_a_live_model_download_without_waiting() {
+        let mut dictation = Dictation::new(|| {});
+        let cancel: Arc<AtomicBool> = Arc::default();
+        let flag = Arc::clone(&cancel);
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let (done, finished) = crossbeam_channel::bounded(1);
+        let thread = thread::spawn(move || {
+            wait.recv().unwrap();
+            done.send(flag.load(Ordering::Relaxed)).unwrap();
+            check_download_cancelled(&flag)
+        });
+        dictation.download = Some(Download { cancel: Arc::clone(&cancel), ..test_download(thread) });
+        assert!(!dictation.download.as_ref().unwrap().thread.is_finished());
+        drop(dictation);
+        assert!(cancel.load(Ordering::Relaxed));
+        release.send(()).unwrap();
+        assert!(finished.recv_timeout(Duration::from_secs(3)).unwrap());
     }
 
     fn wait_for_thread<T>(worker: &thread::JoinHandle<T>) {
@@ -994,7 +1140,7 @@ mod tests {
 
     #[test]
     fn failed_typing_keeps_the_recognized_words() {
-        let event = transcription_event(Ok("Keep my words.".into()), |text| {
+        let event = transcription_event(Ok("Keep my words.".into()), &AtomicBool::new(false), |text, _| {
             assert_eq!(text, "Keep my words.");
             bail!("Windows blocked typing")
         });
@@ -1009,24 +1155,56 @@ mod tests {
 
     #[test]
     fn successful_typing_keeps_the_transcript_without_an_error() {
-        let event = transcription_event(Ok("Hello".into()), |_| Ok(()));
+        let event = transcription_event(Ok("Hello".into()), &AtomicBool::new(false), |_, _| Ok(()));
         assert!(matches!(event, Event::Transcribed { text, typing_error: None } if text == "Hello"));
     }
 
     #[test]
     fn silence_and_transcription_errors_never_type() {
         assert!(matches!(
-            transcription_event(Ok(String::new()), |_| panic!("silence must not type")),
+            transcription_event(Ok(String::new()), &AtomicBool::new(false), |_, _| panic!("silence must not type")),
             Event::Nothing
         ));
-        let event = transcription_event(Err(anyhow::anyhow!("model unavailable")), |_| {
+        let event = transcription_event(Err(anyhow::anyhow!("model unavailable")), &AtomicBool::new(false), |_, _| {
             panic!("failed transcription must not type")
         });
         assert!(matches!(event, Event::Failed(error) if error == "model unavailable"));
     }
 
+    #[test]
+    fn cancelled_results_never_type_or_replace_the_previous_transcript() {
+        for result in [Ok("Discard these words".into()), Ok(String::new()), Err(anyhow::anyhow!("model unavailable"))] {
+            let event = transcription_event(result, &AtomicBool::new(true), |_, _| panic!("cancelled dictation must never type"));
+            assert!(matches!(event, Event::TranscriptionCancelled));
+        }
+        let cancel = AtomicBool::new(false);
+        let event = transcription_event(Ok("Waiting for shortcut modifiers".into()), &cancel, |_, flag| {
+            flag.store(true, Ordering::Relaxed);
+            check_transcription_cancelled(flag)
+        });
+        assert!(matches!(event, Event::TranscriptionCancelled), "cancellation must also stop typing while modifiers are held");
+    }
+
+    #[test]
+    fn cancellation_after_typing_preserves_the_completed_transcript() {
+        let cancel = AtomicBool::new(false);
+        let event = transcription_event(Ok("Already typed".into()), &cancel, |_, flag| {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        assert!(matches!(event, Event::Transcribed { text, typing_error: None } if text == "Already typed"));
+    }
+
+    #[test]
+    fn cancelled_audio_preparation_returns_no_partial_transcription_input() {
+        assert!(decimate(&[0.25; 48_000], &AtomicBool::new(true)).is_err());
+        let take = short_take();
+        assert!(take.samples_cancellable(&AtomicBool::new(true)).is_err());
+        assert_eq!(take.samples().unwrap().len(), 48, "cancelling a read must not damage its source");
+    }
+
     /// A real loopback HTTP response whose body stalls after one byte.
-    fn stalled_response() -> (String, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+    fn stalled_response() -> (impl Read, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/model", listener.local_addr().unwrap());
@@ -1045,44 +1223,65 @@ mod tests {
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na").unwrap();
             let _ = stopped.recv_timeout(Duration::from_secs(3));
         });
-        (url, stop, server)
+        let agent = download_agent(Duration::from_millis(250));
+        // Resolution dispatches a worker even for numeric loopback addresses.
+        // Allow setup time under parallel load while keeping the 250 ms I/O cap.
+        let reader = agent.get(&url).config()
+            .timeout_resolve(Some(Duration::from_secs(3))).build()
+            .call().unwrap().into_body().into_reader();
+        (reader, stop, server)
     }
 
     #[test]
     fn stalled_download_body_times_out() {
-        let (url, stop, server) = stalled_response();
-        let agent = download_agent(Duration::from_millis(250));
-        let mut reader = agent.get(&url).call().unwrap().into_body().into_reader();
+        let (mut reader, stop, server) = stalled_response();
         let mut buf = [0; 1];
         reader.read_exact(&mut buf).unwrap();
         let started = std::time::Instant::now();
         let result = read_download_chunk(&mut reader, &mut buf, &AtomicBool::new(false));
+        let elapsed = started.elapsed();
         let _ = stop.send(());
         server.join().unwrap();
         assert!(result.is_err(), "a stalled body must not wait indefinitely");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
     fn cancellation_during_a_stalled_read_is_reported_after_timeout() {
-        let (url, stop, server) = stalled_response();
-        let agent = download_agent(Duration::from_millis(250));
-        let mut reader = agent.get(&url).call().unwrap().into_body().into_reader();
+        let (mut reader, stop, server) = stalled_response();
         let mut buf = [0; 1];
         reader.read_exact(&mut buf).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let cancel_gate = Arc::clone(&gate);
         let canceller = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
+            cancel_gate.wait();
             flag.store(true, Ordering::Relaxed);
+            cancel_gate.wait();
         });
+        struct GatedRead<R> {
+            inner: R,
+            gate: Arc<std::sync::Barrier>,
+        }
+        impl<R: Read> Read for GatedRead<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                // Cancel after the initial flag check, while Read is active.
+                // Both phases finish before the real HTTP timeout starts.
+                self.gate.wait();
+                self.gate.wait();
+                self.inner.read(buf)
+            }
+        }
+        let mut reader = GatedRead { inner: reader, gate };
         let started = std::time::Instant::now();
         let result = read_download_chunk(&mut reader, &mut buf, &cancel);
+        let elapsed = started.elapsed();
         let _ = stop.send(());
         canceller.join().unwrap();
         server.join().unwrap();
         assert_eq!(result.unwrap_err().to_string(), "download cancelled");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(elapsed < Duration::from_secs(2));
     }
 
     #[test]
@@ -1118,13 +1317,13 @@ mod tests {
         assert!(model.is_downloaded());
         assert_eq!(done.load(Ordering::Relaxed), total.load(Ordering::Relaxed));
 
-        let audio = decimate(&crate::decode::load_clip(Path::new(&wav)).unwrap());
+        let audio = decimate(&crate::decode::load_clip(Path::new(&wav)).unwrap(), &cancel).unwrap();
         let mut transcriber = Transcriber::load(model).unwrap();
         let started = std::time::Instant::now();
-        let text = transcriber.transcribe(&audio).unwrap();
+        let text = transcriber.transcribe(&audio, &cancel).unwrap();
         println!("{:.2?}: {text}", started.elapsed());
         assert!(!text.is_empty());
-        assert_eq!(transcriber.transcribe(&vec![0.0; 16_000]).unwrap(), "", "silence types nothing");
+        assert_eq!(transcriber.transcribe(&vec![0.0; 16_000], &cancel).unwrap(), "", "silence types nothing");
     }
 
     #[test]
@@ -1133,9 +1332,10 @@ mod tests {
             (0..48_000).map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin()).collect()
         };
         let rms = |s: &[f32]| (s[100..s.len() - 100].iter().map(|x| x * x).sum::<f32>() / (s.len() - 200) as f32).sqrt();
-        let voice = decimate(&tone(1_000.0));
+        let cancel = AtomicBool::new(false);
+        let voice = decimate(&tone(1_000.0), &cancel).unwrap();
         assert_eq!(voice.len(), 16_000);
         assert!((rms(&voice) - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
-        assert!(rms(&decimate(&tone(12_000.0))) < 0.01, "would alias to 4 kHz");
+        assert!(rms(&decimate(&tone(12_000.0), &cancel).unwrap()) < 0.01, "would alias to 4 kHz");
     }
 }

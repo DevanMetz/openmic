@@ -31,7 +31,7 @@ Audio stays on your computer. Nothing is recorded unless you use **Record** or s
 - **Test my mic**: record 5 seconds and hear it raw and cleaned on your headphones
 - A setup checklist for first runs, and one-click preset chips
 - A sidebar with Voice, Soundboard, Record, Dictation and Settings pages, and a status panel on every page: whether Discord hears you, your level, **Mute** and **Start/Stop**
-- **Always-on-top strip**: a thin bar with your starred pads, the preset and a button to open the full window. The microphone turns green while your voice goes out; click it to mute. Buttons are as wide as their names, and pads come first when space runs out. Drag its right edge to resize it, down to just the microphone. The strip stays visible when you open the full window; turn off **Always show the strip** under **Settings** to show it only while collapsed. The window's minimize button collapses to the strip (turn that off under **Settings**). OpenMic reopens the way you left it
+- **Always-on-top strip**: a thin bar with your starred pads, the preset and a button to open the full window. The microphone turns green while your voice goes out; click it to mute. Buttons are as wide as their names, and pads come first when space runs out. Scroll over the pads to reach any that don't fit. Drag its right edge to resize it, down to just the microphone. The strip stays visible when you open the full window; turn off **Always show the strip** under **Settings** to show it only while collapsed. The window's minimize button collapses to the strip (turn that off under **Settings**). OpenMic reopens the way you left it
 - Automatic settings persistence
 - Optional Windows startup (straight into the notification area) and automatic processing; OpenMic waits for a saved device that connects after launch
 - One copy at a time: launching OpenMic again brings the running window back
@@ -72,6 +72,8 @@ The **Get set up** checklist at the top of the **Voice** page walks through thes
 5. In Discord (**User Settings → Voice & Video**), disable Discord/Krisp noise suppression to avoid double processing.
 6. Click **Test my mic** under **Processing**: speak for 5 seconds, then play **Raw** and **Cleaned** to hear what Discord hears. The test plays on your headphone monitor output (or the Windows default output). It refuses VB-Cable and your configured processed output, including when either is the Windows default; choose headphones as the monitor output to listen. **Cleaned** uses your current settings, so change a preset or slider and play it again. Click the selected preview again to stop, including while cleanup is still running.
 
+When the five seconds are up, **Finishing mic test…** shows while the WAV finishes and loads in the background. Microphone controls stay responsive, and the previous preview is kept if the new take fails. **Cancel test** discards the new test while recording or finishing so you can record again or listen to the previous preview.
+
 The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your voice.
 
 ## Devices that connect late
@@ -82,7 +84,7 @@ If a device is unplugged while processing, OpenMic shows **reconnecting…** and
 
 ## Adjusting
 
-The **Voice** page lists each setting as a row, in the order your voice passes through them. Each row has its name, a short line saying what it does, a live picture of it working, and its value. Drag inside a picture to change the setting, scroll over it for fine steps, and double-click it to reset. A switch turns a setting on or off; rows that are off are dimmed.
+The **Voice** page lists each setting as a row, in the order your voice passes through them. Each row has its name, a short line saying what it does, a live picture of it working, and its value. Drag inside a picture to change the setting, scroll over it for fine steps, and double-click it to reset. **Tab** and **Shift+Tab** focus controls and scroll them into view. In a focused picture, **Up** or **Right** increases the value and **Down** or **Left** decreases it by the same fine step as scrolling; **Home** and **End** select its minimum and maximum. A switch turns a setting on or off; rows that are off are dimmed.
 
 | Row | What it does | Drag | Wheel step |
 |---|---|---|---|
@@ -104,29 +106,37 @@ If OpenMic cannot read its settings file at startup, it shows a recovery screen 
 
 Drop one or more audio files onto the main window from any page to add them to the soundboard. OpenMic shows the new pads, skips files already on the board, and reports any files it could not read.
 
-Clips load in the background so microphone controls stay responsive. The Soundboard page shows import progress and **Cancel import**; cancellation keeps the pads already added. Drop more files or use **Add clips** while an import runs to add them to the queue.
+Clips load in the background so microphone controls stay responsive. The Soundboard page shows import progress and **Cancel import**; cancellation keeps the pads already added. Drop more files or use **Add clips** while an import runs to add them to the queue. If search has focus, completed imports keep your query so you can continue typing.
 
-Open the **Soundboard** page, click **Add clips**, then click a pad to play it. Click a playing pad to pause it; click again to resume from the same position. Strip pads work the same way; pad hotkeys trigger the clip from the beginning. **Stop clips** ends playback and clears paused clips. Each pad shows the clip's length and keeps its progress visible while paused. Drag a pad onto another to reorder the board; with more than nine clips, a search box filters them by name. Click **☆ Add to strip** on a pad to put it on the strip; **★ On strip** removes it again. Right-click a pad to set its own volume, a hotkey, or its trim: drag the start or end on the waveform (or type them) to play only part of the clip. Trimming doesn't change the file. Use the × on a pad to remove it from the board; the audio file stays on disk. **Clip volume** affects the whole soundboard. Turn on **Let clips overlap** to layer pads instead of each one replacing the last (up to 16 at once). Clips are mixed into the same processed output Discord receives, and route changes preserve their playheads and paused state. **Mute** silences your voice without silencing the soundboard. Recording has its own **Record** page.
+Open the **Soundboard** page, click **Add clips**, then click a pad to play it. Click a playing pad to pause it; click again to resume from the same position. Strip pads work the same way; pad hotkeys trigger the clip from the beginning. **Stop clips** ends playback and clears paused clips. Each pad shows the clip's length and keeps its progress visible while paused. Drag a pad onto another to reorder the board; with more than nine clips, a search box filters them by name. **Tab** and **Shift+Tab** move between pad controls and scroll the focused pad into view. Click **☆ Add to strip** on a pad to put it on the strip; **★ On strip** removes it again. Right-click a pad, or focus any of its controls and press **Shift+F10**, to set its own volume, a hotkey, or its trim: drag the start or end on the waveform (or type them) to play only part of the clip. The keyboard menu starts at the volume slider; **Tab** moves between its controls, and **Escape** returns to the pad. Trimming doesn't change the file. Use the × on a pad to remove it from the board; the audio file stays on disk. **Clip volume** affects the whole soundboard. Turn on **Let clips overlap** to layer pads instead of each one replacing the last (up to 16 at once). Clips are mixed into the same processed output Discord receives, and route changes preserve their playheads and paused state. **Mute** silences your voice without silencing the soundboard. Recording has its own **Record** page.
+
+Click a volume's percentage, or focus it with **Tab**, to type a value from 0 to 100. For example, `50` and `50%` both set half volume. Changes apply to playing clips immediately. **Tab** and **Shift+Tab** scroll focused playback controls into view on short screens.
 
 Hover over a pad's name and click it to rename it. Press **Enter** or click elsewhere to save, or **Escape** to cancel. The display name is saved for the board, search and strip; the audio file keeps its original name. Leaving the name blank restores the filename label.
 
 If you edit a clip's audio file outside OpenMic, the next time you start the pad or open its trim controls, OpenMic reloads the audio and updates its duration and waveform.
 
-Trim waveforms load in the background, including while OpenMic is stopped. The menu shows **Loading waveform…** until the controls are ready, or **Retry waveform** if the file could not be read. Opening the menu never starts playback. Closing it cancels an unfinished preview unless the pad is also waiting to play.
+Editing a pad's trim or source file leaves its current playback intact. Playing and paused pads show the duration of their loaded selection. Restarting the pad applies the latest trim and reloads any changed audio.
 
-The first playback after launch, or after editing a clip, loads its audio in the background. The pad shows **Loading**; click it again or use **Stop clips** to cancel. Cached clips start immediately. With overlap off, choosing another pad cancels older pending playback; with overlap on, requested clips load one at a time and start as each is ready.
+The strip highlights playing pads in green and paused pads in amber. Hover a pad for its current action. When more pads are starred than fit, scroll over the pads with the mouse wheel or a horizontal touchpad gesture; **Tab** also scrolls the focused pad into view. The microphone and expand button stay in place. Right-click a strip pad, or focus it and press **Shift+F10**, to open the Soundboard and scroll to that pad for its controls and full error details. A paused clip can resume its loaded audio even if the source file has become unavailable.
+
+Trim waveforms load in the background, including while OpenMic is stopped. The menu shows **Loading waveform…** until the controls are ready, or **Retry waveform** if the file could not be read. Opening the menu preserves the saved trim and never starts playback. If an edited file is shorter than the saved points, the menu shows those points and offers **Reset** to use the full current clip. Closing it cancels an unfinished preview unless the pad is also waiting to play.
+
+The first playback after launch, or after editing a clip, loads its audio in the background. The pad shows **Loading**; click it again or use **Stop clips** to cancel. Cached clips start immediately. With overlap off, choosing another pad cancels older pending playback; with overlap on, requested clips load one at a time and start as each is ready. A failed load stays marked **Failed** on its pad, even when another clip plays. Hover for the full error and click to retry. Starred pads also show failures in red with a **!** on the strip.
 
 To make a clip, choose **Microphone** (the selected raw mic) or **Computer audio** (the Windows default output or another playback device), then click **Record** and **Stop recording**. While it records, a live waveform, level meter and running file size show what's being captured; afterwards the whole take is drawn so you can check it before keeping it. Name the take and choose **Save WAV** or **Add to soundboard**. Takes are written to disk as they record, so there's no time limit beyond the WAV format's 4 GB (about six hours of 48 kHz stereo); a take you discard is deleted. Computer audio records the full mix playing through the chosen output; recording works even when OpenMic processing is stopped.
 
 The **Device** line shows the device opened for the current recording and keeps that name with the finished take. Changing microphone routing or the Windows default device applies to the next recording.
 
-If writing a recording fails, OpenMic stops and reports the error. When possible, it recovers the complete audio frames already on disk so you can save the partial take; a recovered take carries a warning.
+**Stop recording** stops capture and finishes the WAV in the background. The Record page shows **Finishing** while the disk writer drains the remaining audio; microphone controls stay responsive. Wait for **Take ready** before saving or adding it to the soundboard.
 
-Saving a take replaces an existing WAV only after the new file is complete, including when saving to another drive. If saving fails, your previous WAV stays intact and the take remains available to retry.
+If writing a recording fails, OpenMic stops and reports the error. When possible, it recovers the complete audio frames already on disk so you can save the partial take; a recovered take carries a warning. Capture failures are reported even if the take is empty.
 
-**Save WAV** and **Add to soundboard** save in the background, so microphone controls stay responsive even when copying a long take to another drive. The Record page shows **Saving** until the file is ready. If you quit during a save, OpenMic waits for it to finish; a failed save keeps the window and take open for retry.
+Saving a take replaces an existing WAV only after the new file is complete, including when saving to another drive. If saving fails, your previous WAV stays intact and the take remains available to retry. Hover over the recording status to read the full error or partial-take warning, including details that do not fit on the page.
 
-If you quit with a recording running or a take still unsaved, OpenMic asks whether to return to it or discard it and quit. Closing to the notification area keeps the recording available without asking.
+**Save WAV** and **Add to soundboard** save in the background, so microphone controls stay responsive even when copying a long take to another drive. The Record page shows **Saving** until the file is ready. A take added to the soundboard keeps an active search query so you can continue typing. If you quit during a save, OpenMic waits for it to finish; a failed save keeps the window and take open for retry.
+
+If you quit with a recording running or a take still unsaved, OpenMic asks whether to return to it or discard it and quit. Discarding stops capture and removes the temporary WAV without waiting for its writer to drain. Closing to the notification area keeps the recording available without asking.
 
 ## Hotkeys and the notification area
 
@@ -142,7 +152,15 @@ OpenMic checks GitHub Releases once a day. To check right away, click the versio
 
 On the **Dictation** page, pick a model under **Speech to text** and click **Download** (once; English-only Tiny, Base or Small, or Base and Small for any language). Then set its **Shortcut** at the top of the page. Hold it while you speak and let go: OpenMic transcribes what your selected microphone heard and types it into the app you're using, such as Discord's message box. Choose **Press to start, again to stop** for longer dictation (it stops by itself after 5 minutes). Transcription runs on your PC; the last result can be copied from the Dictation page, including when typing into the target app fails. Apps running as administrator don't accept typed text from OpenMic.
 
-While listening, **Discard recording** on the Dictation page stops the current take without transcribing or typing it. This also works if its shortcut has been cleared or reassigned; the previous transcript stays available to copy.
+When dictation stops, **Finishing recording…** shows while the WAV writer drains its remaining audio in the background. The next take can start once this finishes, or immediately after you discard it.
+
+While listening or finishing a take, **Discard recording** on the Dictation page stops the current take without transcribing or typing it. This also works if its shortcut has been cleared or reassigned; the previous transcript stays available to copy.
+
+After recording, **Cancel transcription** discards the current transcription and any queued takes before they type. OpenMic shows **Cancelling transcription…** until the worker finishes its current model step. The previous transcript stays available to copy, and new recordings can be transcribed normally.
+
+**Tab** and **Shift+Tab** scroll focused Dictation controls into view on short screens. Shortcut warnings and new recordings preserve keyboard focus, and background status changes preserve your transcript selection.
+
+Quitting cancels pending transcription and model downloads immediately. Closing to the notification area keeps them running.
 
 Changes to the speech model or hold/toggle behavior apply to the next recording. A take keeps the model it started with, and models needed by active dictation cannot be removed from the page.
 

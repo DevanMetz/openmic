@@ -30,7 +30,7 @@ impl App {
                     ui.add_space(8.0);
                     ui.add(egui::Label::new(RichText::new(error.path.display().to_string()).monospace()).wrap());
                     ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(&error.message).color(RED)).wrap());
+                    ui.add(egui::Label::new(RichText::new(&error.message).color(widgets::text_color(ui, RED))).wrap());
                     ui.add_space(8.0);
                     ui.label("Close any program locking the file, or fix or restore it, then retry. To start fresh, move the file to a backup location first.");
                     ui.add_space(10.0);

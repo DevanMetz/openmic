@@ -6,14 +6,51 @@ use eframe::egui::{
     Response, Sense, Stroke, StrokeKind, Vec2,
 };
 
-use crate::gui::{AMBER, GREEN, RED};
+use crate::gui::{AMBER, CYAN, GREEN, MUTED, RED, VIOLET};
 
 /// Text on a filled accent-colored background.
 const ON_ACCENT: Color32 = Color32::from_gray(18);
+const LIGHT_CYAN: Color32 = Color32::from_rgb(0x07, 0x59, 0x85);
+
+/// Keep small helper labels and native links legible in both system themes.
+pub fn configure_text_styles(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        let visuals = &mut style.visuals;
+        visuals.weak_text_color = Some(Color32::from_gray(if visuals.dark_mode { 160 } else { 100 }));
+        if !visuals.dark_mode {
+            visuals.hyperlink_color = LIGHT_CYAN;
+        }
+    });
+}
 
 /// Outline for unselected controls, visible in light and dark themes.
 fn outline(visuals: &egui::Visuals) -> Color32 {
     visuals.weak_text_color().gamma_multiply(0.6)
+}
+
+/// Accent text needs darker shades on light panels and tinted badges.
+pub fn text_color(ui: &egui::Ui, accent: Color32) -> Color32 {
+    if ui.visuals().dark_mode {
+        return accent;
+    }
+    match accent {
+        CYAN => LIGHT_CYAN,
+        GREEN => Color32::from_rgb(0x16, 0x65, 0x34),
+        AMBER => Color32::from_rgb(0x92, 0x40, 0x0e),
+        VIOLET => Color32::from_rgb(0x6d, 0x28, 0xd9),
+        RED => Color32::from_rgb(0xb9, 0x1c, 0x1c),
+        MUTED => Color32::from_rgb(0x47, 0x55, 0x69),
+        _ => accent,
+    }
+}
+
+/// Reveal newly focused controls during keyboard or assistive navigation.
+pub fn scroll_on_focus(response: &Response) {
+    if response.gained_focus()
+        && response.ctx.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+    {
+        response.scroll_to_me(Some(Align::Center));
+    }
 }
 
 /// A full-width panel with an accent bar, a title, optional content on the
@@ -39,7 +76,7 @@ pub fn card<R>(
             ui.horizontal(|ui| {
                 let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 14.0), Sense::hover());
                 ui.painter().rect_filled(bar, 1.5, accent);
-                ui.label(egui::RichText::new(title).strong().size(13.0).color(accent));
+                ui.label(egui::RichText::new(title).strong().size(13.0).color(text_color(ui, accent)));
                 ui.with_layout(Layout::right_to_left(Align::Center), header_right);
             });
             ui.add_space(6.0);
@@ -50,9 +87,10 @@ pub fn card<R>(
 
 /// A small rounded status badge.
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
+    let foreground = text_color(ui, color);
     let galley = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(11.0), color);
+        .layout_no_wrap(text.to_owned(), FontId::proportional(11.0), foreground);
     let size = galley.size() + Vec2::new(14.0, 4.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter()
@@ -62,7 +100,7 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.painter().galley(
         Pos2::new(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
         galley,
-        color,
+        foreground,
     );
 }
 

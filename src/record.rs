@@ -145,6 +145,19 @@ impl Recorder {
         self.full.store(true, Ordering::Relaxed);
     }
 
+    /// Simulate a writer still draining after capture stops.
+    #[cfg(test)]
+    pub(crate) fn delayed_writer_for_test(samples: &[f32]) -> (Self, crossbeam_channel::Sender<()>) {
+        let mut recorder = Self::from_samples_for_test(samples);
+        let bytes = recorder.bytes();
+        let (release, wait) = crossbeam_channel::bounded(1);
+        recorder.writer = Some(thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+            Ok(bytes)
+        }));
+        (recorder, release)
+    }
+
     /// An empty `device_name` means the Windows default device for that source.
     pub fn start(source: Source, device_name: &str) -> Result<Self> {
         #[cfg(not(windows))]
@@ -297,11 +310,26 @@ impl Recorder {
         self.full.load(Ordering::Relaxed)
     }
 
+    /// Stop capture immediately; the disk writer finishes on its own thread.
+    pub fn stop_capture(&mut self) {
+        self.stream.take();
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Once true, finish can collect the writer's result without waiting for it.
+    pub fn ready_to_finish(&self) -> bool {
+        self.writer.as_ref().is_none_or(|writer| writer.is_finished())
+    }
+
     /// A capture failure. Keep it until finish so a recovered take carries
     /// its warning even after the UI has noticed and stopped the recording.
     pub fn error(&self) -> Option<String> {
         self.error.lock().clone().or_else(|| {
-            self.writer.as_ref().is_some_and(|writer| writer.is_finished())
+            (!self.is_stopping() && self.writer.as_ref().is_some_and(|writer| writer.is_finished()))
                 .then(|| "Recording writer stopped unexpectedly".into())
         })
     }
@@ -321,7 +349,8 @@ impl Recorder {
         self.peaks.lock().recent(count)
     }
 
-    /// Stop capturing and close the file. `Ok(None)` if nothing was heard.
+    /// Stop capturing and close the file. `Ok(None)` only for a successful,
+    /// empty capture; failures stay visible even when no frames were written.
     pub fn finish(mut self) -> Result<Option<Take>> {
         let data_bytes = self.shutdown()?;
         let path = self.path.take().context("recording already finished")?;
@@ -342,14 +371,16 @@ impl Recorder {
             peaks: self.peaks.lock().recent(usize::MAX),
             warning,
         };
+        if take.frames == 0 && let Some(warning) = take.warning() {
+            bail!("Recording stopped: {warning}");
+        }
         Ok((take.frames > 0).then_some(take)) // an empty take deletes itself
     }
 
     /// Stop the stream, let the writer drain the queue, and return the
     /// bytes it wrote.
     fn shutdown(&mut self) -> Result<u64> {
-        self.stream.take(); // dropping a cpal Stream stops it
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop_capture();
         match self.writer.take() {
             Some(writer) => match writer.join() {
                 Ok(result) => result,
@@ -369,7 +400,11 @@ impl Recorder {
 impl Drop for Recorder {
     /// Abandoned mid-take (the app closing, say): discard the file.
     fn drop(&mut self) {
-        let _ = self.shutdown();
+        self.stop_capture();
+        // Discarded audio needs no writer result. Dropping the handle detaches
+        // the writer so a slow disk cannot hold up quitting. Its open file
+        // allows deletion and disappears when the writer closes it.
+        self.writer.take();
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
         }
@@ -575,8 +610,13 @@ impl Take {
     }
 
     /// The take as mono samples at the DSP rate.
+    #[cfg(test)]
     pub fn samples(&self) -> Result<Vec<f32>> {
         crate::decode::load_clip(&self.path)
+    }
+
+    pub(crate) fn samples_cancellable(&self, cancel: &AtomicBool) -> Result<Vec<f32>> {
+        crate::decode::load_clip_cancellable(&self.path, cancel)
     }
 
     pub fn duration(&self) -> Duration {
@@ -685,6 +725,60 @@ mod tests {
         let take = written_take(&[0.1; 8]);
         let path = take.path.clone();
         assert!(path.exists());
+        drop(take);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn abandoning_capture_does_not_wait_for_the_writer_and_deletes_the_open_wav() {
+        let mut recorder = Recorder::from_samples_for_test(&[]);
+        let path = recorder.path.clone().unwrap();
+        let wav = WavWriter::create(&path, 48_000, 2).unwrap();
+        let queue = ArrayQueue::new(8);
+        for sample in [0.5; 8] { queue.push(sample).unwrap(); }
+        let (stop, peaks, bytes, full, error) = (
+            Arc::clone(&recorder.stop), Arc::clone(&recorder.peaks), Arc::clone(&recorder.bytes),
+            Arc::clone(&recorder.full), Arc::clone(&recorder.error),
+        );
+        let stopped = Arc::clone(&stop);
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let (done, finished) = crossbeam_channel::bounded(1);
+        recorder.writer = Some(thread::spawn(move || {
+            let released = wait.recv_timeout(Duration::from_secs(3)).is_ok();
+            let result = write_loop(wav, &queue, &stop, &peaks, &bytes, &full, &error);
+            let _ = done.send((released, result.is_ok()));
+            result
+        }));
+
+        drop(recorder);
+        assert!(stopped.load(Ordering::Relaxed), "discard must stop capture and wake the writer");
+        assert_eq!(finished.try_recv(), Err(crossbeam_channel::TryRecvError::Empty),
+            "discard must return before the stalled writer finishes");
+        release.send(()).unwrap();
+        assert_eq!(finished.recv_timeout(Duration::from_secs(3)).unwrap(), (true, true),
+            "the existing writer must be able to finish after its file is discarded");
+        assert!(!path.exists(), "the abandoned WAV must not remain after its last handle closes");
+    }
+
+    #[test]
+    fn stopping_capture_waits_for_the_existing_writer_without_blocking() {
+        let (mut recorder, release) = Recorder::delayed_writer_for_test(&[0.5; 480]);
+        let path = recorder.path.clone().unwrap();
+        recorder.stop_capture();
+        assert!(recorder.is_stopping() && !recorder.ready_to_finish());
+        assert!(recorder.error().is_none());
+        recorder.stop_capture(); // repeated Stop requests keep the same writer
+        assert!(path.is_file());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !recorder.ready_to_finish() {
+            assert!(Instant::now() < deadline, "writer did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(recorder.error().is_none(), "a requested stop is not an unexpected writer exit");
+        let take = recorder.finish().unwrap().unwrap();
+        assert_eq!(take.samples().unwrap().len(), 240);
+        assert!(take.warning().is_none());
         drop(take);
         assert!(!path.exists());
     }
@@ -909,6 +1003,39 @@ mod tests {
         let take = recorder.finish().unwrap().unwrap();
         assert_eq!(take.warning(), Some("microphone disconnected"));
         assert_eq!(take.samples().unwrap().len(), 240);
+    }
+
+    #[test]
+    fn empty_recordings_report_failures_and_remove_their_temporary_files() {
+        for (capture_failed, skipped, during_shutdown) in [
+            (false, false, false), (true, false, false), (false, true, false),
+            (true, true, false), (true, false, true), (true, true, true),
+        ] {
+            let mut recorder = Recorder::from_samples_for_test(&[]);
+            let path = recorder.path.clone().unwrap();
+            if during_shutdown {
+                let stop = Arc::clone(&recorder.stop);
+                let error = Arc::clone(&recorder.error);
+                recorder.writer = Some(thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) { thread::yield_now(); }
+                    *error.lock() = Some("Microphone disconnected".into());
+                    Ok(0)
+                }));
+            } else if capture_failed {
+                recorder.report_error_for_test("Microphone disconnected");
+            }
+            if skipped { recorder.report_skipped_for_test(); }
+
+            let result = recorder.finish();
+            assert!(!path.exists(), "empty takes must remove their temporary file on success or failure");
+            if capture_failed || skipped {
+                let message = result.err().expect("an empty failed recording must report its failure").to_string();
+                assert_eq!(message.contains("Microphone disconnected"), capture_failed);
+                assert_eq!(message.contains("audio was skipped"), skipped);
+            } else {
+                assert!(result.unwrap().is_none(), "a normal empty take is not a capture failure");
+            }
+        }
     }
 
     #[test]

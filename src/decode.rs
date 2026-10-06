@@ -31,6 +31,7 @@ pub fn duration(path: &Path) -> Option<f32> {
 }
 
 /// Decode `path` to clipped mono samples at [`dsp::SR`].
+#[cfg(test)]
 pub fn load_clip(path: &Path) -> Result<Vec<f32>> {
     load_clip_cancellable(path, &AtomicBool::new(false))
 }

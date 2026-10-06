@@ -14,7 +14,7 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 
 use crate::denoise::{Cleaner, ModelState};
-use crate::dsp::{Clip, Mixer, Params, FRAME, SR};
+use crate::dsp::{Clip, ClipProgress, Mixer, Params, FRAME, SR};
 use crate::resample::Resampler;
 
 /// How much processing history the GUI scope shows: 3 s of 10 ms frames.
@@ -512,8 +512,8 @@ impl Engine {
         self.mixer.lock().set_gain(key, gain);
     }
 
-    /// Clip keys, progress (0..1), and paused state from one mixer snapshot.
-    pub fn clip_progress(&self) -> Vec<(u64, f32, bool)> {
+    /// Progress, paused state, and loaded durations from one mixer snapshot.
+    pub fn clip_progress(&self) -> Vec<ClipProgress> {
         self.mixer.lock().progress()
     }
 

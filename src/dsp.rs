@@ -301,6 +301,17 @@ pub struct Mixer {
     voices: Vec<Clip>,
 }
 
+/// A loaded clip's playback state, independent of later pad or file edits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipProgress {
+    pub key: u64,
+    /// Position within the selected audio, from 0 to 1.
+    pub fraction: f32,
+    pub paused: bool,
+    /// Duration of the loaded selection in seconds.
+    pub duration: f32,
+}
+
 impl Mixer {
     /// Keys of the clips currently sounding.
     #[cfg(test)]
@@ -308,11 +319,16 @@ impl Mixer {
         self.voices.iter().filter(|v| !v.paused).map(|v| v.key).collect()
     }
 
-    /// Each clip's key, progress (0..1), and whether it is paused.
-    pub fn progress(&self) -> Vec<(u64, f32, bool)> {
+    /// Each loaded clip's progress, paused state, and selected duration.
+    pub fn progress(&self) -> Vec<ClipProgress> {
         self.voices
             .iter()
-            .map(|v| (v.key, v.pos as f32 / v.samples().len().max(1) as f32, v.paused))
+            .map(|v| ClipProgress {
+                key: v.key,
+                fraction: v.pos as f32 / v.samples().len().max(1) as f32,
+                paused: v.paused,
+                duration: v.samples().len() as f32 / SR as f32,
+            })
             .collect()
     }
 
@@ -480,11 +496,11 @@ mod tests {
         let mut first = vec![0.0; 6_000];
         mixer.mix(&mut first, 1.0);
         assert_eq!(first, vec![0.05; 6_000], "skip the prefix and apply per-pad gain");
-        assert_eq!(mixer.progress(), [(7, 0.25, false)], "progress is relative to the selected duration");
+        assert_eq!(mixer.progress(), [ClipProgress { key: 7, fraction: 0.25, paused: false, duration: 0.5 }], "progress is relative to the selected duration");
         mixer.toggle_pause(7, false);
         let mut routed = Mixer::default();
         routed.resume(mixer.take_remaining());
-        assert_eq!(routed.progress(), [(7, 0.25, true)]);
+        assert_eq!(routed.progress(), [ClipProgress { key: 7, fraction: 0.25, paused: true, duration: 0.5 }]);
         let mut paused = [0.01; 32];
         routed.mix(&mut paused, 1.0);
         assert_eq!(paused, [0.01; 32]);
@@ -560,7 +576,7 @@ mod tests {
         let mut mic = [0.05; 8];
         mixer.mix(&mut mic, 1.0);
         assert_eq!(mic, [0.05; 8], "paused audio contributes nothing to the mic");
-        assert_eq!(mixer.progress(), [(1, 0.25, true)], "the playhead stays put");
+        assert_eq!(mixer.progress(), [ClipProgress { key: 1, fraction: 0.25, paused: true, duration: 4.0 / SR as f32 }], "the playhead stays put");
 
         assert_eq!(mixer.toggle_pause(1, false), Some(false));
         let mut rest = [0.0; 3];
@@ -570,7 +586,7 @@ mod tests {
         assert_eq!(mixer.toggle_pause(1, false), None, "a finished clip can start again");
 
         mixer.play(clip(1, samples), false);
-        assert_eq!(mixer.progress(), [(1, 0.0, false)]);
+        assert_eq!(mixer.progress(), [ClipProgress { key: 1, fraction: 0.0, paused: false, duration: 4.0 / SR as f32 }]);
         mixer.toggle_pause(1, false);
         mixer.stop();
         assert!(mixer.progress().is_empty(), "Stop clips also discards paused playheads");
@@ -586,13 +602,16 @@ mod tests {
         let mut frame = [0.0; 2];
         mixer.mix(&mut frame, 1.0);
         assert_eq!(frame, [0.2; 2]);
-        assert_eq!(mixer.progress(), [(1, 0.25, true), (2, 0.5, false)]);
+        assert_eq!(mixer.progress(), [
+            ClipProgress { key: 1, fraction: 0.25, paused: true, duration: 8.0 / SR as f32 },
+            ClipProgress { key: 2, fraction: 0.5, paused: false, duration: 8.0 / SR as f32 },
+        ]);
 
         mixer.toggle_pause(1, true);
         assert_eq!(mixer.playing_keys(), [1, 2], "resuming respects overlap");
         mixer.toggle_pause(1, true);
         mixer.toggle_pause(1, false);
-        assert_eq!(mixer.progress(), [(1, 0.25, false)], "without overlap, resuming replaces other clips");
+        assert_eq!(mixer.progress(), [ClipProgress { key: 1, fraction: 0.25, paused: false, duration: 8.0 / SR as f32 }], "without overlap, resuming replaces other clips");
         mixer.toggle_pause(1, false);
         mixer.stop_key(1);
         assert_eq!(mixer.toggle_pause(1, false), None, "removing a paused pad discards its playhead");
@@ -632,7 +651,7 @@ mod tests {
         let mut silence = [0.0; 2];
         switched.mix(&mut silence, 1.0);
         assert_eq!(silence, [0.0; 2]);
-        assert_eq!(switched.progress(), [(7, 0.625, true)], "a route change preserves pause and position");
+        assert_eq!(switched.progress(), [ClipProgress { key: 7, fraction: 0.625, paused: true, duration: 8.0 / SR as f32 }], "a route change preserves pause and position");
         switched.toggle_pause(7, false);
         switched.mix(&mut silence, 1.0);
         assert!((silence[0] - 0.5).abs() < 1e-6 && (silence[1] - 0.6).abs() < 1e-6);

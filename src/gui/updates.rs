@@ -9,6 +9,7 @@ use eframe::egui::{self, RichText};
 
 use super::{open_url, short, App, AMBER, GREEN, MUTED, RED};
 use crate::update::{self, Status};
+use crate::widgets;
 
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
@@ -49,7 +50,7 @@ impl App {
             if ui.small_button("×").on_hover_text("Dismiss").clicked() {
                 self.update_error = None;
             }
-            ui.label(RichText::new(short(&error)).color(RED)).on_hover_text(error);
+            ui.label(RichText::new(short(&error)).color(widgets::text_color(ui, RED))).on_hover_text(error);
             return;
         }
         match self.updater.status().clone() {
@@ -64,7 +65,7 @@ impl App {
                     let ctx = ui.ctx().clone();
                     self.install_update(&ctx);
                 }
-                ui.label(RichText::new(format!("{} ready", release.tag)).color(GREEN))
+                ui.label(RichText::new(format!("{} ready", release.tag)).color(widgets::text_color(ui, GREEN)))
                     .on_hover_text("Downloaded and checked against the release's SHA-256 checksum");
             }
             Status::Downloading(release) => {
@@ -88,7 +89,7 @@ impl App {
                 if ui.button("Update").on_hover_text("Download and verify the new version").clicked() {
                     self.updater.download();
                 }
-                ui.label(RichText::new(format!("{} available", release.tag)).color(GREEN));
+                ui.label(RichText::new(format!("{} available", release.tag)).color(widgets::text_color(ui, GREEN)));
             }
             Status::DownloadFailed { release, error } => {
                 if ui.button("Retry update")
@@ -97,7 +98,7 @@ impl App {
                 {
                     self.updater.download();
                 }
-                ui.label(RichText::new("Update download failed").color(AMBER)).on_hover_text(error);
+                ui.label(RichText::new("Update download failed").color(widgets::text_color(ui, AMBER))).on_hover_text(error);
             }
             Status::Checking => {
                 ui.weak("Checking for updates…");
@@ -107,13 +108,13 @@ impl App {
                 if ui.link("Releases page").clicked() {
                     open_url(update::RELEASES_PAGE);
                 }
-                ui.label(RichText::new("Couldn't check for updates").color(AMBER)).on_hover_text(e);
+                ui.label(RichText::new("Couldn't check for updates").color(widgets::text_color(ui, AMBER))).on_hover_text(e);
             }
             Status::UpToDate if recent_check => {
-                ui.label(RichText::new(format!("{VERSION} is up to date")).color(MUTED));
+                ui.label(RichText::new(format!("{VERSION} is up to date")).color(widgets::text_color(ui, MUTED)));
             }
             _ if self.updated_at.is_some_and(|t| t.elapsed() < UPDATED_SHOWN) => {
-                ui.label(RichText::new(format!("Updated to {VERSION}")).color(GREEN));
+                ui.label(RichText::new(format!("Updated to {VERSION}")).color(widgets::text_color(ui, GREEN)));
             }
             _ => {
                 ui.weak("Clean voice. Instant sounds. Fully local.");

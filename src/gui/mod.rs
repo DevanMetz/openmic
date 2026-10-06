@@ -14,7 +14,7 @@ mod snapshot;
 mod sound_tab;
 mod updates;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -33,6 +33,7 @@ use crate::tray::Tray;
 use crate::logfile;
 use crate::update::Updater;
 use crate::viz;
+use crate::widgets;
 use routes::{cable_input, choose_routes};
 
 pub(crate) const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
@@ -161,16 +162,22 @@ pub struct App {
     sound_status: Status,
     /// Keys of the clips playing as of this frame.
     playing: Vec<u64>,
-    /// Progress (0..1) for playing and paused clips, by clip key.
-    pad_progress: HashMap<u64, f32>,
+    /// Playback state and loaded durations for playing and paused clips.
+    pad_progress: HashMap<u64, dsp::ClipProgress>,
     /// Clip lengths in seconds, read once per file in the background.
     pad_durations: durations::Durations,
     /// The soundboard's search text.
     pad_filter: String,
+    /// A strip pad to reveal and focus when the board next draws.
+    pad_to_reveal: Option<PathBuf>,
+    /// Reveal the board while preserving the focused pad control.
+    soundboard_scroll_to_top: bool,
     /// A clip name being edited, separate from its saved display name.
     renaming_pad: Option<sound_tab::PadRename>,
-    /// The trim menu's current clip and any load error awaiting a retry.
-    trim_clip: Option<clips::TrimClip>,
+    /// The trim menu's current clip.
+    trim_clip: Option<PathBuf>,
+    /// Load failures stay on their pads until retried or removed.
+    clip_errors: HashMap<PathBuf, String>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
     clip_cache: HashMap<PathBuf, CachedClip>,
     /// Files being imported in the background, one decoder at a time.
@@ -219,7 +226,7 @@ pub struct App {
     hotkey_status: Status,
     /// Speech-to-text model download and transcription.
     dictation: Dictation,
-    /// Speech being recorded for dictation.
+    /// Speech being recorded or finalized for dictation.
     dictating: Option<DictationRecording>,
     /// Most recent result; live listening/transcription indicators use their own state.
     dictation_status: Status,
@@ -266,6 +273,7 @@ impl App {
         instance: crate::instance::Instance,
         just_updated: bool,
     ) -> Self {
+        widgets::configure_text_styles(ctx);
         let mut app = Self::stopped(settings);
         app.updated_at = just_updated.then(Instant::now);
         {
@@ -333,8 +341,11 @@ impl App {
             pad_progress: HashMap::new(),
             pad_durations: durations::Durations::default(),
             pad_filter: String::new(),
+            pad_to_reveal: None,
+            soundboard_scroll_to_top: false,
             renaming_pad: None,
             trim_clip: None,
+            clip_errors: HashMap::new(),
             clip_cache: HashMap::new(),
             clip_import: None,
             clip_loads: None,
@@ -701,6 +712,9 @@ impl App {
     // ---- tray, hotkeys and window ------------------------------------------
 
     fn run_command(&mut self, ctx: &egui::Context, command: Command) {
+        if self.quitting {
+            return;
+        }
         if self.settings.load_error.is_some() && !matches!(command, Command::Show | Command::Quit) {
             self.run_command(ctx, Command::Show);
             return;
@@ -772,6 +786,8 @@ impl App {
     fn quit(&mut self, ctx: &egui::Context) {
         self.confirm_quit = false;
         self.quitting = true;
+        self.dictation.cancel_transcription();
+        self.dictation.cancel_download();
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
@@ -784,12 +800,15 @@ impl App {
             return;
         }
         let active = self.recorder.is_some();
+        let finishing = self.recorder.as_ref().is_some_and(Recorder::is_stopping);
         let saving = self.recording_save.is_some();
         let dialog = egui::Modal::new(egui::Id::new("quit-recording")).show(ctx, |ui| {
             ui.set_width(340.0);
             ui.heading(if saving { "Saving before quitting…" } else { "Quit without saving?" });
             ui.label(if saving {
                 "Your recording is being saved. OpenMic will close when it finishes."
+            } else if finishing {
+                "OpenMic is finishing your recording. Quitting will discard this take."
             } else if active {
                 "Recording is still running. Quitting will discard this take."
             } else {
@@ -797,12 +816,12 @@ impl App {
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button(if saving { "Keep OpenMic open" } else if active { "Keep recording" } else { "Back to recording" }).clicked() {
+                if ui.button(if saving || finishing { "Keep OpenMic open" } else if active { "Keep recording" } else { "Back to recording" }).clicked() {
                     self.confirm_quit = false;
                 }
                 if saving {
                     ui.spinner();
-                } else if ui.button(RichText::new("Discard and quit").color(RED)).clicked() {
+                } else if ui.button(RichText::new("Discard and quit").color(widgets::text_color(ui, RED))).clicked() {
                     self.quit(ctx);
                 }
             });
@@ -862,10 +881,14 @@ impl App {
     fn update_blocker(&self) -> Option<&'static str> {
         if self.recording_save.is_some() {
             Some("Wait for your recording to finish saving")
+        } else if self.recorder.as_ref().is_some_and(Recorder::is_stopping) {
+            Some("Wait for your recording to finish")
         } else if self.recorder.is_some() || self.take.is_some() {
             Some("Save or discard your recording first")
         } else if self.dictating.is_some() || self.dictation.busy() {
             Some("Wait for speech to text to finish")
+        } else if self.mic_test.busy() {
+            Some("Wait for the mic test to finish")
         } else if self.dictation.download_progress().is_some() {
             Some("Wait for the speech model download to finish or cancel it")
         } else if self.clip_import.as_ref().is_some_and(sound_tab::ClipImport::has_pending_files) {
@@ -1062,6 +1085,9 @@ impl App {
 
     /// Stop recording and type what was said.
     fn stop_dictation(&mut self) {
+        if let Some(recording) = &mut self.dictating {
+            recording.recorder.stop_capture();
+        }
         if let Some((model, take)) = self.finish_dictation() {
             self.dictation.transcribe(model, take);
         }
@@ -1069,6 +1095,9 @@ impl App {
 
     /// Finish and validate a take before handing it to the transcription worker.
     fn finish_dictation(&mut self) -> Option<(dictation::SpeechModel, Take)> {
+        if !self.dictating.as_ref().is_some_and(|recording| recording.recorder.ready_to_finish()) {
+            return None;
+        }
         let recording = self.dictating.take()?;
         self.dictation_status = match recording.recorder.finish() {
             Ok(Some(take)) => {
@@ -1098,13 +1127,16 @@ impl App {
             self.dictation_status = (short(&e), RED);
         }
         // A toggle left on by mistake shouldn't record all day.
-        if self.dictating.as_ref().is_some_and(|recording| recording.recorder.elapsed() >= MAX_DICTATION) {
+        if self.dictating.as_ref().is_some_and(|recording| {
+            recording.recorder.is_stopping() || recording.recorder.elapsed() >= MAX_DICTATION
+        }) {
             self.stop_dictation();
         }
         while let Some(event) = self.dictation.poll() {
             self.dictation_status = match event {
                 dictation::Event::Downloaded(model) => (format!("{} is ready", model.label()), GREEN),
                 dictation::Event::DownloadCancelled => ("Model download cancelled".into(), MUTED),
+                dictation::Event::TranscriptionCancelled => ("Transcription cancelled".into(), MUTED),
                 dictation::Event::DownloadFailed(e) => {
                     logfile::warn(format_args!("speech model download failed: {e}"));
                     (short(&e), RED)
@@ -1131,11 +1163,12 @@ impl App {
             self.run_command(ctx, command);
         }
         self.handle_close(ctx);
-        if self.settings.load_error.is_some() { return; }
+        if self.quitting || self.settings.load_error.is_some() { return; }
         self.poll_engine();
         if self.hidden || self.page != Page::Soundboard { self.close_trim_editor(); }
         self.poll_clip_loads(ctx);
         self.pad_durations.poll(ctx);
+        self.poll_recording_save(ctx);
         self.poll_recording();
         self.poll_dictation();
         self.poll_mic_test();
@@ -1150,7 +1183,7 @@ impl App {
         }
         self.sync_hotkeys(ctx);
         let (muted, bypassed, running) = (self.settings.mute, self.settings.bypass, self.running());
-        let listening = self.dictating.is_some();
+        let listening = self.dictating.as_ref().is_some_and(|recording| !recording.recorder.is_stopping());
         if let Some(tray) = &mut self.tray {
             tray.sync(muted, bypassed, running, listening, self.settings.collapsed);
         }
@@ -1172,6 +1205,8 @@ const MAX_DICTATION: Duration = Duration::from_secs(300);
 impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         logfile::info("quitting");
+        self.dictation.cancel_transcription();
+        self.dictation.cancel_download();
         self.finish_pad_rename(true);
         self.clip_import.take();
         self.recorder.take();
@@ -1187,6 +1222,7 @@ impl eframe::App for App {
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
+        if self.quitting { return; }
         if self.settings.load_error.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
             return;
@@ -1209,10 +1245,19 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.quitting { return; }
         if self.settings.load_error.is_some() {
             self.draw_settings_recovery(ui);
             return;
         }
+        ui.ctx().plugin_or_default::<DeferredFocusInput>();
+        let routed_keyboard = if self.capturing.is_some() {
+            // Shortcut capture reads the next physical key from the original batch.
+            ui.data_mut(|data| data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input")));
+            false
+        } else {
+            apply_keyboard_input(ui)
+        };
         let ctx = ui.ctx().clone();
         self.import_dropped_sounds(&ctx);
         self.capture_hotkey(&ctx);
@@ -1235,19 +1280,29 @@ impl eframe::App for App {
             ui.separator();
             // The window can be shorter than a page (a small laptop
             // screen): pages scroll, the sidebar stays put.
-            ScrollArea::vertical()
+            let mut scroll = ScrollArea::vertical()
                 .id_salt(self.page.title())
-                .auto_shrink([false; 2])
-                .show(ui, |ui| match self.page {
-                    Page::Voice => self.draw_mic_tab(ui),
-                    Page::Soundboard => self.draw_sound_tab(ui),
-                    Page::Record => self.draw_record_page(ui),
-                    Page::Dictation => self.draw_dictation_page(ui),
-                    Page::Settings => self.draw_settings_tab(ui),
-                });
+                .auto_shrink([false; 2]);
+            let reveal_board = std::mem::take(&mut self.soundboard_scroll_to_top);
+            if self.page == Page::Soundboard && (self.pad_to_reveal.is_some() || reveal_board) {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            scroll.show(ui, |ui| match self.page {
+                Page::Voice => self.draw_mic_tab(ui),
+                Page::Soundboard => self.draw_sound_tab(ui),
+                Page::Record => self.draw_record_page(ui),
+                Page::Dictation => self.draw_dictation_page(ui),
+                Page::Settings => self.draw_settings_tab(ui),
+            });
         });
         if self.page != Page::Soundboard { self.close_trim_editor(); }
         self.draw_quit_confirmation(&ctx);
+        if routed_keyboard && ctx.output(|output| output.ime.is_some()) {
+            // Replayed arrows belong to the active text editor's caret.
+            ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        }
+        let focused = ctx.memory(|memory| memory.focused());
+        ui.data_mut(|data| data.insert_temp(egui::Id::new("keyboard-focus"), focused));
     }
 }
 
@@ -1264,13 +1319,15 @@ impl App {
             self.draw_version(ui);
         });
         if cfg!(debug_assertions) {
-            ui.label(RichText::new("dev build").small().color(AMBER))
+            ui.label(RichText::new("dev build").small().color(widgets::text_color(ui, AMBER)))
                 .on_hover_text("Built without --release: slower, and never updates itself");
         }
         ui.add_space(10.0);
         for page in Page::ALL {
             let label = match page {
+                Page::Record if self.recorder.as_ref().is_some_and(Recorder::is_stopping) => "Record  • finishing".to_owned(),
                 Page::Record if self.recorder.is_some() => "Record  ⏺ REC".to_owned(),
+                Page::Dictation if self.dictating.as_ref().is_some_and(|recording| recording.recorder.is_stopping()) => "Dictation  • finishing".to_owned(),
                 Page::Dictation if self.dictating.is_some() => "Dictation  • listening".to_owned(),
                 _ => page.title().to_owned(),
             };
@@ -1322,11 +1379,11 @@ impl App {
         }
         ui.add_space(4.0);
         if let Some(error) = &self.save_error {
-            ui.label(RichText::new("Settings not saved · retrying…").small().color(RED)).on_hover_text(error);
+            ui.label(RichText::new("Settings not saved · retrying…").small().color(widgets::text_color(ui, RED))).on_hover_text(error);
         }
         // Details beyond the state line ("Running · voice 42%", a warning).
         if self.status.0 != "Stopped" {
-            ui.add(egui::Label::new(RichText::new(&self.status.0).small().color(self.status.1)).wrap());
+            ui.add(egui::Label::new(RichText::new(&self.status.0).small().color(widgets::text_color(ui, self.status.1))).wrap());
         }
         let (state, color) = match (self.engine.is_some(), self.settings.mute) {
             (true, true) => ("Muted", RED),
@@ -1334,7 +1391,7 @@ impl App {
             (false, _) if self.waiting_for_device => ("Waiting for a device", AMBER),
             (false, _) => ("Stopped", MUTED),
         };
-        ui.label(RichText::new(format!("• {state}")).strong().color(color));
+        ui.label(RichText::new(format!("• {state}")).strong().color(widgets::text_color(ui, color)));
     }
 }
 
@@ -1397,13 +1454,230 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new("explorer").arg(url).spawn();
 }
 
+/// Input that can change a numeric field's text, including undo and redo.
+fn number_text_edit(ui: &egui::Ui) -> bool {
+    ui.input(|input| !input.pointer.any_pressed() && input.events.iter().any(|event| matches!(event,
+        egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut
+            | egui::Event::Ime(egui::ImeEvent::Commit(_))
+            | egui::Event::Key { key: egui::Key::Backspace | egui::Key::Delete | egui::Key::Z | egui::Key::Y, pressed: true, .. }
+            | egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::SetValue, data: Some(egui::accesskit::ActionData::Value(_)), ..
+            }))))
+}
+
+fn keyboard_edit(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut
+        | egui::Event::Ime(_)
+        | egui::Event::Key { pressed: true, key: egui::Key::ArrowLeft | egui::Key::ArrowRight
+            | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Home | egui::Key::End
+            | egui::Key::Backspace | egui::Key::Delete | egui::Key::A | egui::Key::Z | egui::Key::Y, .. })
+}
+
+fn keyboard_focus_direction(event: &egui::Event) -> Option<egui::FocusDirection> {
+    use egui::{Event, FocusDirection, Key};
+    match event {
+        Event::Key { key: Key::Tab, pressed: true, modifiers, .. } if modifiers.shift_only() => Some(FocusDirection::Previous),
+        Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => match key {
+            Key::Tab => Some(FocusDirection::Next),
+            Key::ArrowLeft => Some(FocusDirection::Left),
+            Key::ArrowRight => Some(FocusDirection::Right),
+            Key::ArrowUp => Some(FocusDirection::Up),
+            Key::ArrowDown => Some(FocusDirection::Down),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Process earlier edits before pointer or assistive focus changes and commands.
+#[derive(Default)]
+struct DeferredFocusInput {
+    events: VecDeque<Vec<egui::Event>>,
+}
+
+impl egui::plugin::Plugin for DeferredFocusInput {
+    fn debug_name(&self) -> &'static str { "Deferred focus input" }
+
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        if input.viewport_id != egui::ViewportId::ROOT { return; }
+        let key = egui::Id::new("keyboard-input");
+        if input.events.iter().any(|event| matches!(event,
+            egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }))
+        {
+            // Escape cancels an edit that has not been shown yet.
+            ctx.data_mut(|data| data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(key));
+            for events in &mut self.events {
+                events.retain(|event| !keyboard_edit(event) && !matches!(event, egui::Event::Key { pressed: true, .. }));
+            }
+            self.events.retain(|events| !events.is_empty());
+        }
+        let pending = ctx.data(|data| data.get_temp::<(Option<egui::Id>, Vec<egui::Event>)>(key).is_some());
+        let assistive_focus = |event: &egui::Event| matches!(event,
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus, target_tree: egui::accesskit::TreeId::ROOT, data: None, ..
+            }));
+        let changes_focus = input.events.iter().any(|event| assistive_focus(event) || matches!(event,
+            egui::Event::PointerButton { pressed: true, .. }));
+        if (pending && changes_focus) || !self.events.is_empty() {
+            // Preserve input frames: egui does not recognize a drag when its
+            // press and release arrive together in the same pass.
+            if !input.events.is_empty() {
+                self.events.push_back(std::mem::take(&mut input.events));
+            }
+            if !pending {
+                input.events = self.events.pop_front().unwrap_or_default();
+            }
+        }
+        if !pending && let Some(focus) = input.events.iter().position(assistive_focus) {
+            // egui claims assistive focus as its target is drawn. Commands must
+            // wait until then, and earlier input must use the previous focus.
+            let tail = input.events.split_off(if focus == 0 { 1 } else { focus });
+            if !tail.is_empty() { self.events.push_front(tail); }
+        }
+    }
+
+    fn on_end_pass(&mut self, ui: &mut egui::Ui) {
+        if ui.ctx().viewport_id() == egui::ViewportId::ROOT && !self.events.is_empty() {
+            ui.ctx().request_discard("Process input in order before changing focus");
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn defer_keyboard_input(ui: &egui::Ui, owner: Option<egui::Id>, mut events: Vec<egui::Event>) {
+    if events.is_empty() { return; }
+    ui.data_mut(|data| {
+        let key = egui::Id::new("keyboard-input");
+        if let Some((_, remaining)) = data.remove_temp::<(Option<egui::Id>, Vec<egui::Event>)>(key) {
+            events.extend(remaining);
+        }
+        data.insert_temp(key, (owner, events));
+    });
+    ui.ctx().request_discard("Apply keyboard input in order after focus settles");
+    ui.ctx().request_repaint();
+}
+
+/// Process input before Tab, navigate, then deliver the remaining command in order.
+fn apply_keyboard_input(ui: &egui::Ui) -> bool {
+    use egui::FocusDirection;
+    let pending = ui.data_mut(|data| data.remove_temp::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input")));
+    let mut routed = false;
+    if let Some((owner, mut events)) = pending
+        && owner.is_none_or(|id| ui.memory(|memory| memory.has_focus(id)))
+    {
+        let focused = ui.memory(|memory| memory.focused());
+        let rendered_focus = ui.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus"))).flatten();
+        if owner.is_none() && focused != rendered_focus
+            && ui.input(|input| !input.pointer.any_pressed() && !input.key_pressed(egui::Key::Escape))
+        {
+            // Backward Tab applies focus at the start of the next pass. Render
+            // the target first so native selection and Enter's blur can work.
+            ui.input_mut(|input| events.append(&mut input.events));
+            defer_keyboard_input(ui, None, events);
+            ui.memory_mut(|memory| memory.move_focus(FocusDirection::None));
+            return true;
+        }
+        ui.input_mut(|input| {
+            events.append(&mut input.events);
+            input.events = events;
+        });
+        routed = true;
+        ui.ctx().request_repaint();
+    }
+    let split = ui.input(|input| {
+        if input.pointer.any_pressed() || input.key_pressed(egui::Key::Escape) { return None; }
+        let tabs = input.events.iter().enumerate().filter_map(|(index, event)| {
+            let direction = keyboard_focus_direction(event)?;
+            matches!(direction, FocusDirection::Next | FocusDirection::Previous).then_some(index)
+        }).collect::<Vec<_>>();
+        let command = input.events.iter().any(|event| keyboard_edit(event) || matches!(event,
+            egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::Tab));
+        if routed || tabs.len() > 1 || command { tabs.first().copied() } else { None }
+    });
+    if let Some(tab) = split {
+        let tail = ui.input_mut(|input| input.events.split_off(if tab == 0 { 1 } else { tab }));
+        defer_keyboard_input(ui, None, tail);
+        routed = true;
+    }
+    if routed {
+        let direction = ui.input(|input| input.events.iter().rev().find_map(keyboard_focus_direction).unwrap_or(FocusDirection::None));
+        ui.memory_mut(|memory| memory.move_focus(direction));
+    }
+    routed
+}
+
+/// egui 0.36 selects all text after processing input when a number gains focus.
+fn number_field(ui: &mut egui::Ui, widget: egui::DragValue<'_>) -> egui::Response {
+    let id = ui.next_auto_id();
+    let layer = ui.layer_id();
+    let editing_input = ui.input(|input| !input.pointer.any_pressed() && input.events.iter().any(keyboard_edit));
+    let requested_elsewhere = ui.input(|input| input.events.iter().rev().find_map(|event| match event {
+        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::Focus, target_tree: egui::accesskit::TreeId::ROOT, target_node, ..
+        }) => Some(*target_node != id.accesskit_id()),
+        _ => None,
+    }).unwrap_or(false));
+    if editing_input && requested_elsewhere {
+        // AccessKit focus is claimed when its target is drawn. Until then,
+        // the previous field must not receive the target's keyboard input.
+        let events = ui.input_mut(|input| std::mem::take(&mut input.events));
+        ui.input_mut(|input| input.events = events.iter().filter(|event|
+            matches!(event, egui::Event::AccessKitActionRequest(_))).cloned().collect());
+        let response = ui.add(widget);
+        ui.input_mut(|input| input.events = events);
+        return response;
+    }
+    let focused = editing_input && ui.is_enabled() && ui.memory_mut(|memory| {
+        memory.interested_in_focus(id, layer);
+        memory.has_focus(id)
+    });
+    if focused { ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None)); }
+    let gained = focused && ui.ctx().read_response(id).is_none_or(|response| response.gained_focus());
+    if !gained { return ui.add(widget); }
+    let events = ui.input_mut(|input| std::mem::take(&mut input.events));
+    let pending = events.iter().filter(|event| !matches!(event,
+        egui::Event::Key { key: egui::Key::Tab, .. }
+            | egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Focus, .. }))).cloned().collect::<Vec<_>>();
+    // The next pass handles input with the selection in place, preserving
+    // native caret movement, selection, undo, and event order.
+    defer_keyboard_input(ui, Some(id), pending);
+    let response = ui.add(widget);
+    ui.input_mut(|input| input.events = events);
+    response
+}
+
 /// A 0..100% volume slider that also takes the mouse wheel (1% per notch).
-fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> bool {
-    let response = ui.add(
-        Slider::new(value, 0.0..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
-    );
+fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> egui::Response {
+    let mut response = ui.horizontal(|ui| {
+        let slider = ui.add(Slider::new(value, 0.0..=1.0).show_value(false));
+        let original = *value;
+        let focus_before = ui.memory(|memory| memory.focused());
+        let text_edit = number_text_edit(ui);
+        let submitted = ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.key_pressed(egui::Key::Tab));
+        let number = number_field(ui, egui::DragValue::new(value).range(0.0..=1.0).speed(0.01)
+            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+            .custom_parser(|text| {
+                // Live text edits already update the value. Re-parsing the
+                // rounded display on blur could override a slider adjustment.
+                if !text_edit { return None; }
+                let text = text.trim();
+                text.strip_suffix('%').unwrap_or(text).trim().parse::<f64>().ok()
+                    .filter(|value| value.is_finite()).map(|value| value / 100.0)
+            }));
+        let focused = number.has_focus();
+        let explicit_edit = number.dragged() || ui.input(|input| {
+            use egui::accesskit::Action;
+            focused || (submitted && focus_before == Some(number.id))
+                || [Action::SetValue, Action::Increment, Action::Decrement].into_iter()
+                    .any(|action| input.has_accesskit_action_request(number.id, action))
+        });
+        if number.lost_focus() && text_edit && !explicit_edit { *value = original; }
+        if number.gained_focus() || focused || number.lost_focus() { number.union(slider) } else { slider.union(number) }
+    }).inner;
     let notches = viz::wheel_notches(ui, response.id, response.hovered() && !response.dragged());
-    response.changed() | viz::step_by(value, notches, 0.01, 0.0..=1.0)
+    if viz::step_by(value, notches, 0.01, 0.0..=1.0) { response.mark_changed(); }
+    response
 }
 
 #[cfg(test)]
@@ -1475,6 +1749,121 @@ mod tests {
         assert!(!app.dictation.busy());
         assert!(app.dictation_status.0.contains("audio was skipped"));
         assert_eq!(app.dictation_status.1, RED);
+    }
+
+    #[test]
+    fn empty_failed_dictation_reports_the_failure_when_the_shortcut_stops_it() {
+        for skipped in [false, true] {
+            let mut app = App::stopped(Settings::default());
+            app.last_dictation = "Previous phrase".into();
+            let recorder = Recorder::from_samples_for_test(&[]);
+            recorder.report_error_for_test("Mic disconnected");
+            if skipped { recorder.report_skipped_for_test(); }
+            app.dictating = Some(DictationRecording {
+                recorder, model: app.settings.speech_model, hold_to_talk: true,
+            });
+
+            // Hotkey commands run before capture polling, so finishing itself
+            // must preserve failures even when no complete frames were written.
+            app.run_command(&egui::Context::default(), Command::DictateReleased);
+            assert!(app.dictating.is_none() && !app.dictation.busy());
+            assert_eq!(app.dictation_status.1, RED);
+            assert!(app.dictation_status.0.contains("Mic disconnected"));
+            assert_eq!(app.dictation_status.0.contains("audio was skipped"), skipped);
+            assert_eq!(app.last_dictation, "Previous phrase");
+        }
+    }
+
+    #[test]
+    fn dictation_stop_waits_for_the_writer_without_blocking_or_submitting_twice() {
+        let (dictation, transcribe) = Dictation::delayed_for_test();
+        let (recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 96]);
+        let mut app = App::stopped(Settings::default());
+        app.dictation = dictation;
+        app.page = Page::Dictation;
+        app.last_dictation = "Previous phrase".into();
+        app.dictating = Some(DictationRecording {
+            recorder, model: dictation::SpeechModel::TinyEn, hold_to_talk: true,
+        });
+        app.settings.speech_model = dictation::SpeechModel::Small;
+
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::DictateReleased);
+        for _ in 0..3 {
+            app.poll_dictation();
+            app.run_command(&ctx, Command::DictateReleased);
+            app.run_command(&ctx, Command::Dictate);
+        }
+        let recording = app.dictating.as_ref().unwrap();
+        assert!(recording.recorder.is_stopping() && !recording.recorder.ready_to_finish());
+        assert_eq!(recording.model, dictation::SpeechModel::TinyEn);
+        assert!(!app.dictation.busy(), "the WAV must finish before transcription starts");
+        assert_eq!(app.update_blocker(), Some("Wait for speech to text to finish"));
+        let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+        assert!(visible(&texts, "Finishing recording…").is_some());
+        assert!(visible(&texts, "Listening…").is_none());
+        assert!(visible(&texts, "Discard recording").is_some());
+        assert!(visible(&texts, "Previous phrase").is_some());
+        app.run_command(&ctx, Command::ToggleMute);
+        assert!(app.settings.mute, "mic controls remain responsive while finalizing");
+
+        finish.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.dictating.is_some() {
+            app.poll_dictation();
+            assert!(Instant::now() < deadline, "dictation did not finish writing");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.dictation.busy(), "the finished take is handed to the existing worker");
+        app.run_command(&ctx, Command::DictateReleased);
+        transcribe.send(()).unwrap();
+        while app.dictation.busy() || app.dictation_status.0 != "No speech heard" {
+            app.poll_dictation();
+            assert!(Instant::now() < deadline, "the short fixture did not finish transcription");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.last_dictation, "Previous phrase");
+        assert_eq!(app.settings.speech_model, dictation::SpeechModel::Small);
+    }
+
+    #[test]
+    fn discarded_or_failed_dictation_releases_capture_without_waiting_or_typing() {
+        for capture_error in [None, Some("Microphone disconnected")] {
+            let (recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 96]);
+            if let Some(error) = capture_error { recorder.report_error_for_test(error); }
+            let mut app = App::stopped(Settings::default());
+            app.page = Page::Dictation;
+            app.last_dictation = "Previous phrase".into();
+            app.dictating = Some(DictationRecording {
+                recorder, model: app.settings.speech_model, hold_to_talk: false,
+            });
+            if capture_error.is_some() {
+                app.poll_dictation();
+            } else {
+                app.stop_dictation();
+                app.discard_dictation();
+            }
+            let expected = app.dictation_status.clone();
+            for _ in 0..3 {
+                app.poll_dictation();
+                app.run_command(&egui::Context::default(), Command::DictateReleased);
+            }
+            assert!(app.dictating.is_none() && !app.dictation.busy());
+            assert!(app.update_blocker().is_none(), "discard immediately releases the recording slot");
+            let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
+            assert!(visible(&texts, "Finishing recording…").is_none());
+            assert!(visible(&texts, "Listening…").is_none());
+            assert!(visible(&texts, "Discard recording").is_none());
+            assert!(visible(&texts, &expected.0).is_some());
+            assert_eq!(expected, (capture_error.unwrap_or("Dictation recording discarded").into(), if capture_error.is_some() { RED } else { MUTED }));
+
+            finish.send(()).expect("discard must not wait for the writer to drain");
+            app.poll_dictation();
+            assert!(!app.dictation.busy(), "discarded takes never reach transcription");
+            assert_eq!(app.dictation_status, expected);
+            assert_eq!(app.last_dictation, "Previous phrase");
+            assert!(app.update_blocker().is_none());
+        }
     }
 
     #[test]
@@ -1634,6 +2023,77 @@ mod tests {
     }
 
     #[test]
+    fn quitting_cancels_transcription_and_ignores_commands_during_shutdown() {
+        for confirm_first in [false, true] {
+            let (dictation, release) = Dictation::delayed_for_test();
+            let mut app = App::stopped(Settings::default());
+            app.dictation = dictation;
+            app.dictating = Some(DictationRecording {
+                recorder: Recorder::from_samples_for_test(&[0.25; 96]),
+                model: app.settings.speech_model, hold_to_talk: true,
+            });
+            let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+            app.dictation.transcribe(app.settings.speech_model, take);
+            let ctx = egui::Context::default();
+            if confirm_first {
+                app.recorder = Some(Recorder::from_samples_for_test(&[0.25; 96]));
+                app.run_command(&ctx, Command::Quit);
+                assert!(app.confirm_quit && !app.quitting);
+                assert!(!app.dictation.transcription_cancelling(), "asking to quit must let the user keep working");
+                app.quit(&ctx); // the user chooses Discard and quit
+            } else {
+                app.run_command(&ctx, Command::Quit);
+            }
+            assert!(app.quitting && app.dictation.transcription_cancelling());
+            let settings = serde_json::to_value(&app.settings).unwrap();
+            let dirty = app.dirty_since;
+            let hidden = app.hidden;
+            for command in [
+                Command::DictateReleased, Command::Dictate, Command::ToggleMute,
+                Command::ToggleBypass, Command::ToggleRunning, Command::ToggleCollapse, Command::Show,
+            ] {
+                app.commands.0.send(command).unwrap();
+            }
+            if let Some(recorder) = &app.recorder { recorder.report_error_for_test("capture ended during shutdown"); }
+            app.tick(&ctx);
+            assert!(app.dictating.is_some(), "a late shortcut release must not submit the unfinished take");
+            assert_eq!(app.recorder.is_some(), confirm_first, "normal polling stops once quitting starts");
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), settings);
+            assert_eq!(app.dirty_since, dirty);
+            assert_eq!(app.hidden, hidden);
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while app.dictation.busy() || app.dictation_status.0 != "Transcription cancelled" {
+                app.poll_dictation();
+                assert!(Instant::now() < deadline, "quitting failed to cancel speech work");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn collapsing_to_the_strip_keeps_pending_dictation_running() {
+        let (dictation, release) = Dictation::delayed_for_test();
+        let mut app = App::stopped(Settings::default());
+        app.dictation = dictation;
+        let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+        app.dictation.transcribe(app.settings.speech_model, take);
+        let ctx = egui::Context::default();
+        app.set_collapsed(&ctx, true);
+        assert!(app.hidden && !app.quitting);
+        assert!(app.dictation.busy() && !app.dictation.transcription_cancelling());
+        app.run_command(&ctx, Command::Show);
+        assert!(!app.hidden && !app.dictation.transcription_cancelling());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.dictation.busy() || app.dictation_status.0 != "No speech heard" {
+            app.poll_dictation();
+            assert!(Instant::now() < deadline, "hidden dictation did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn failed_default_mic_sync_retries_without_blocking_state_changes() {
         let mut sync = DefaultMicSync::default();
         let now = Instant::now();
@@ -1775,6 +2235,40 @@ mod tests {
         assert!(app.capturing.is_none(), "Clear must end shortcut capture");
         assert!(app.settings.hotkeys.dictate.is_none());
         assert_eq!(app.hotkey_bindings(), vec![("Ctrl+Alt+M".into(), Command::ToggleMute)]);
+    }
+
+    #[test]
+    fn shortcut_capture_does_not_replay_keys_as_text_navigation() {
+        use eframe::App as _;
+        for passes in [1, 2] {
+            let mut app = App::stopped(Settings::default());
+            app.page = Page::Settings;
+            app.settings.hotkeys.mute = Some("Ctrl+Alt+M".into());
+            app.start_capture(Binding::Mute);
+            let ctx = egui::Context::default();
+            ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+            let mut frame = eframe::Frame::_new_kittest();
+            let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
+                events, ..Default::default()
+            }, |ui| app.ui(ui, &mut frame));
+            for _ in 0..3 { draw(&mut app, Vec::new()); }
+            let key = |key, modifiers| egui::Event::Key {
+                key, physical_key: Some(key), pressed: true, repeat: false, modifiers,
+            };
+            draw(&mut app, vec![
+                key(egui::Key::Tab, egui::Modifiers::NONE),
+                key(egui::Key::M, egui::Modifiers::CTRL),
+                egui::Event::Text("m".into()),
+            ]);
+            for _ in 0..3 { draw(&mut app, Vec::new()); }
+            assert_eq!(app.settings.hotkeys.mute.as_deref(), Some("Ctrl+Alt+M"));
+            assert!(app.capturing.is_some(), "the refused first key leaves capture waiting for a new press");
+            assert!(app.dirty_since.is_none());
+            draw(&mut app, vec![key(egui::Key::F13, egui::Modifiers::NONE)]);
+            assert_eq!(app.settings.hotkeys.mute.as_deref(), Some("F13"));
+            assert!(app.capturing.is_none() && app.dirty_since.is_some());
+        }
     }
 
     #[test]
@@ -1946,6 +2440,98 @@ mod tests {
         assert!(visible(&texts, "Listening…").is_none());
         assert!(visible(&texts, "Discard recording").is_none());
         assert!(visible(&texts, "Dictation recording discarded").is_some());
+    }
+
+    #[test]
+    fn the_cancel_transcription_button_keeps_active_capture_and_previous_words() {
+        use eframe::App as _;
+        let (dictation, release) = Dictation::delayed_for_test();
+        let mut app = App::stopped(Settings::default());
+        app.dictation = dictation;
+        app.page = Page::Dictation;
+        app.last_dictation = "Previous transcript".into();
+        app.dictating = Some(DictationRecording {
+            recorder: Recorder::from_samples_for_test(&[0.25; 96]),
+            model: app.settings.speech_model, hold_to_talk: false,
+        });
+        let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+        app.dictation.transcribe(app.settings.speech_model, take);
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 650.0))),
+            events, ..Default::default()
+        }, |ui| app.ui(ui, &mut frame));
+        draw(&mut app, Vec::new());
+        let output = draw(&mut app, Vec::new());
+        let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Cancel transcription" => Some(text.visual_bounding_rect().center()),
+            _ => None,
+        }).expect("cancellation must be visible while transcribing");
+        let tree = output.platform_output.accesskit_update.unwrap();
+        assert!(tree.nodes.iter().any(|(_, node)| node.label() == Some("Cancel transcription")));
+        for pressed in [true, false] {
+            draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        assert!(app.dictation.transcription_cancelling());
+        assert!(app.dictating.is_some(), "cancelling completed takes must not discard a new recording");
+        assert_eq!(app.last_dictation, "Previous transcript");
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 650.0));
+        assert!(visible(&texts, "Cancelling transcription…").is_some());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.dictation.busy() || app.dictation_status.0 != "Transcription cancelled" {
+            app.poll_dictation();
+            assert!(Instant::now() < deadline, "cancellation did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.last_dictation, "Previous transcript");
+        assert!(app.dictating.is_some());
+        let (texts, _) = render(&mut app, egui::vec2(760.0, 650.0));
+        assert!(visible(&texts, "Cancel transcription").is_none());
+        assert!(visible(&texts, "Transcription cancelled").is_some());
+        assert!(visible(&texts, "Listening…").is_some());
+    }
+
+    #[test]
+    #[ignore = "writes transcription cancellation screenshots; needs Python with Pillow"]
+    fn snapshot_transcription_cancellation() {
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            let (dictation, _release) = Dictation::delayed_for_test();
+            let mut app = App::stopped(Settings::default());
+            app.dictation = dictation;
+            app.page = Page::Dictation;
+            app.last_dictation = "Previous transcript remains available to copy.".into();
+            let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+            app.dictation.transcribe(app.settings.speech_model, take);
+            for cancelling in [false, true] {
+                if cancelling { app.dictation.cancel_transcription(); }
+                snapshot::snapshot(&mut app, &format!("dictation-{}-{theme}", if cancelling { "cancelling" } else { "transcribing" }), egui::vec2(700.0, 420.0), 1.0, dark);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes dictation finalization screenshots; needs Python with Pillow"]
+    fn snapshot_dictation_finalization() {
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            let (recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 96]);
+            let mut app = App::stopped(Settings::default());
+            app.page = Page::Dictation;
+            app.last_dictation = "Previous transcript remains available to copy.".into();
+            app.dictating = Some(DictationRecording {
+                recorder, model: app.settings.speech_model, hold_to_talk: true,
+            });
+            app.stop_dictation();
+            for discarded in [false, true] {
+                if discarded { app.discard_dictation(); }
+                snapshot::snapshot(&mut app, &format!("dictation-{}-{theme}", if discarded { "discarded" } else { "finishing" }), egui::vec2(700.0, 420.0), 1.0, dark);
+            }
+            finish.send(()).unwrap();
+        }
     }
 
     /// A 1080p laptop at 150% has about 690 points of height: every page
