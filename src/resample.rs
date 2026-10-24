@@ -43,9 +43,13 @@ impl Resampler {
         }
     }
 
-    /// Set the rate trim (ignored by a passthrough converter).
+    /// Set the rate trim (ignored by a passthrough converter). Non-finite or
+    /// non-positive trims are ignored so a bad drift measurement cannot stall
+    /// or panic the converter.
     pub fn set_trim(&mut self, trim: f64) {
-        self.trim = trim;
+        if trim.is_finite() && trim > 0.0 {
+            self.trim = trim;
+        }
     }
 
     pub fn push(&mut self, samples: &[f32]) {
@@ -217,6 +221,19 @@ mod tests {
         let (slow, even, fast) = (count(0.99), count(1.0), count(1.01));
         assert!((47_990..=48_000).contains(&even), "{even}");
         assert!(slow > even + 400 && fast < even - 400, "{slow} {even} {fast}");
+    }
+
+    #[test]
+    fn invalid_trims_are_ignored_instead_of_stalling_the_converter() {
+        for trim in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let mut r = Resampler::adaptive(48_000, 48_000);
+            r.push(&[0.5; 1000]);
+            r.set_trim(trim);
+            let mut out = [0.0f32; 480];
+            assert_eq!(r.pull(&mut out), 480, "{trim}");
+            assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "{trim}");
+            assert!(r.pull(&mut out) > 0, "a second pull must still make progress at trim {trim}");
+        }
     }
 
     #[test]
