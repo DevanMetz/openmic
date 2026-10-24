@@ -79,3 +79,63 @@ jobs:
             openmic-${{ github.ref_name }}-windows-x64.exe.sha256
             openmic-${{ github.ref_name }}-windows-x64.exe.sig
           body_path: docs/releases/${{ github.ref_name }}.md
+
+  linux:
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require Linux CI to have passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          query="repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=linux"
+          for i in $(seq 1 60); do
+            states=$(gh api "$query" --jq '.check_runs[] | .conclusion // .status')
+            if printf '%s\n' "$states" | grep -qx 'success'; then
+              echo "Linux CI passed on $GITHUB_SHA"
+              exit 0
+            fi
+            if [ -n "$states" ] && ! printf '%s\n' "$states" | grep -Eq 'queued|in_progress|waiting|pending|requested'; then
+              echo "Linux CI did not pass on $GITHUB_SHA ($states)" >&2
+              exit 1
+            fi
+            echo "waiting for Linux CI on $GITHUB_SHA ($states)"
+            sleep 30
+          done
+          echo "timed out waiting for Linux CI on $GITHUB_SHA" >&2
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux
+          save-if: false
+      - name: Verify release version
+        run: |
+          package=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c \
+            "import json, sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'openmic'))")
+          if [ "$GITHUB_REF_NAME" != "v$package" ]; then
+            echo "Release tag does not match Cargo.toml" >&2
+            exit 1
+          fi
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libasound2-dev libxdo-dev libx11-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev
+      - run: cargo build --locked --release
+      - name: Package the Linux build
+        run: |
+          name="openmic-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir "$name"
+          cp target/release/openmic "$name/"
+          cp README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            openmic-${{ github.ref_name }}-linux-x86_64.tar.gz
+            openmic-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+          body_path: docs/releases/${{ github.ref_name }}.md
