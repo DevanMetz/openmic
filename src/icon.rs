@@ -4,6 +4,7 @@
 
 const CYAN: [f32; 3] = [0x38 as f32, 0xbd as f32, 0xf8 as f32];
 const RED: [f32; 3] = [0xf8 as f32, 0x71 as f32, 0x71 as f32];
+#[cfg(windows)]
 const AMBER: [f32; 3] = [0xfb as f32, 0xbf as f32, 0x24 as f32];
 
 /// Square RGBA pixels, `size` x `size`.
@@ -12,6 +13,7 @@ pub fn rgba(size: u32, muted: bool) -> Vec<u8> {
 }
 
 /// The icon while speech to text is listening.
+#[cfg(windows)]
 pub fn listening_rgba(size: u32) -> Vec<u8> {
     draw(size, AMBER, false)
 }

@@ -1,4 +1,5 @@
-//! OpenMic: local real-time microphone cleaner and soundboard for Windows.
+//! OpenMic: local real-time microphone cleaner and soundboard for Windows
+//! and Linux.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window in release
 
@@ -19,6 +20,7 @@ mod record;
 mod resample;
 mod tray;
 mod update;
+mod virtual_mic;
 mod viz;
 mod widgets;
 
@@ -41,6 +43,10 @@ fn main() -> eframe::Result<()> {
         if cfg!(debug_assertions) { " (dev build)" } else { "" },
         if updated { " after an update" } else { "" },
     ));
+    // The Linux virtual microphone must exist before devices are listed.
+    if let Err(e) = virtual_mic::activate() {
+        logfile::warn(format_args!("virtual microphone unavailable: {e:#}"));
+    }
     let settings = config::Settings::load();
     // Windows startup launches straight into the notification area.
     // (A collapsed OpenMic opens as the strip, with the window hidden.)
@@ -56,7 +62,7 @@ fn main() -> eframe::Result<()> {
     } else {
         format!("OpenMic v{}", env!("CARGO_PKG_VERSION"))
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         &title,
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
@@ -68,7 +74,10 @@ fn main() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(move |cc| Ok(Box::new(gui::App::new(settings, &cc.egui_ctx, start_hidden, instance, updated)))),
-    )
+    );
+    // Normal window close and eframe errors both release the virtual mic.
+    virtual_mic::shutdown();
+    result
 }
 
 /// The layout's natural size, and the smallest the window may get (the

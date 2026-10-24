@@ -32,6 +32,10 @@ impl App {
 
     /// The version beside the title; clicking it checks for updates now.
     pub(super) fn draw_version(&mut self, ui: &mut egui::Ui) {
+        if !update::updates_supported() {
+            ui.label(RichText::new(VERSION).weak());
+            return;
+        }
         let status = self.updater.status();
         let idle = !matches!(status, Status::Checking | Status::Downloading(_) | Status::Ready(_));
         let button = ui
@@ -54,6 +58,9 @@ impl App {
     /// Right side of the title row, in a right-to-left layout: widgets are
     /// added from the right edge inward.
     pub(super) fn draw_update_status(&mut self, ui: &mut egui::Ui) {
+        if !update::updates_supported() {
+            return;
+        }
         let recent_check = self.update_checked_at.is_some_and(|t| t.elapsed() < RESULT_SHOWN);
         let blocker = self.update_blocker();
         let phase = if self.update_error.is_some() { UpdateControls::Error } else {

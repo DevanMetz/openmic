@@ -107,6 +107,7 @@ impl DefaultMicSync {
 
 /// Something the tray menu or a global hotkey asked for. Delivered through
 /// a channel so it works while the window is hidden.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))] // tray commands have no Linux source
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Show,
@@ -281,9 +282,10 @@ impl App {
         let mut app = Self::stopped(settings);
         app.updated_at = just_updated.then(Instant::now);
         {
-            // Development builds never replace themselves on their own.
+            // Development builds never replace themselves on their own, and
+            // releases only ship an updater for Windows.
             let ctx = ctx.clone();
-            app.updater = Updater::new(!cfg!(debug_assertions), move || ctx.request_repaint());
+            app.updater = Updater::new(!cfg!(debug_assertions) && cfg!(windows), move || ctx.request_repaint());
         }
         app.tray = Tray::new(ctx, app.commands.0.clone()).ok();
         {
@@ -462,7 +464,14 @@ impl App {
         self.waiting_for_device = false;
         if self.settings.output.is_empty() {
             self.waiting_for_device = true;
-            self.status = ("Install VB-Cable or choose a processed output".into(), AMBER);
+            self.status = (
+                if cfg!(windows) {
+                    "Install VB-Cable or choose a processed output"
+                } else {
+                    "Create the virtual mic or choose a processed output"
+                }.into(),
+                AMBER,
+            );
             return;
         }
         let monitor = &self.settings.monitor_output;
@@ -485,9 +494,14 @@ impl App {
             return;
         }
         // Open the monitor whenever it's plugged in, so switching it on is
-        // instant; it can't share the processed output's device.
-        let monitor = (monitor_present && (self.settings.monitor || *monitor != self.settings.output))
-            .then_some(monitor.as_str());
+        // instant; it can't share the processed output's device. Linux opens
+        // it only while monitoring: PulseAudio clients can hold fewer streams.
+        let monitor_wanted = if cfg!(windows) {
+            self.settings.monitor || *monitor != self.settings.output
+        } else {
+            self.settings.monitor
+        };
+        let monitor = (monitor_present && monitor_wanted).then_some(monitor.as_str());
         match Engine::start(&self.settings.microphone, &self.settings.output, monitor, self.params()) {
             Ok(engine) => {
                 logfile::info(format_args!(
@@ -605,14 +619,18 @@ impl App {
 
     fn toggle_startup(&mut self, enabled: bool) {
         if let Err(e) = config::set_startup(enabled) {
-            logfile::error(format_args!("Windows startup could not be updated: {e:#}"));
+            logfile::error(format_args!(
+                "{} could not be updated: {e:#}",
+                if cfg!(windows) { "Windows startup" } else { "Login startup" }
+            ));
             // Removing a legacy entry can fail after the main entry changed.
             self.settings.start_with_windows = config::startup_enabled();
             self.status = (short(&format!("{:#}", e)), RED);
         } else {
             self.status = (
                 format!(
-                    "Windows startup {}",
+                    "{} {}",
+                    if cfg!(windows) { "Windows startup" } else { "Login startup" },
                     if enabled { "enabled" } else { "disabled" }
                 ),
                 GREEN,
@@ -698,7 +716,10 @@ impl App {
                 if let Err(e) = default_mic::set(&cable_mic) {
                     // One role may have changed before the other failed.
                     // Keep the snapshot both for Stop and the next retry.
-                    logfile::warn(format_args!("default mic not set to VB-Cable: {e:#}"));
+                    logfile::warn(format_args!(
+                        "default mic not set to {}: {e:#}",
+                        if cfg!(windows) { "VB-Cable" } else { "OpenMic Microphone" }
+                    ));
                     self.warn_until = Some((short(&format!("{e:#}")), Instant::now()));
                     return;
                 }
@@ -982,7 +1003,11 @@ impl App {
         let Some(hotkeys) = &mut self.hotkeys else { return };
         let refused = hotkeys.set(bindings);
         if !refused.is_empty() {
-            logfile::warn(format_args!("shortcuts refused by Windows: {}", refused.join(", ")));
+            logfile::warn(format_args!(
+                "shortcuts refused by {}: {}",
+                if cfg!(windows) { "Windows" } else { "the system" },
+                refused.join(", ")
+            ));
             self.hotkey_status = (
                 short(&format!("{} is taken by another app", refused.join(", "))),
                 AMBER,
@@ -1144,7 +1169,7 @@ impl App {
             self.dictation_status = ("Download a speech model on the Dictation page first".into(), AMBER);
             return;
         }
-        // An empty choice falls back to the Windows default microphone.
+        // An empty choice falls back to the system default microphone.
         match Recorder::start(Source::Microphone, &self.settings.microphone) {
             Ok(recorder) => {
                 self.dictating = Some(DictationRecording {
@@ -1220,7 +1245,8 @@ impl App {
                 dictation::Event::Transcribed { text, typing_error } => {
                     self.last_dictation = text;
                     match typing_error {
-                        Some(error) => (format!("Copy the transcript below: {error}"), AMBER),
+                        Some(error) if cfg!(windows) => (format!("Copy the transcript below: {error}"), AMBER),
+                        Some(_) => ("Transcript ready below".into(), MUTED),
                         None => ("Typed".into(), GREEN),
                     }
                 }
@@ -1292,6 +1318,7 @@ impl eframe::App for App {
         // Quit gets one final restoration attempt even if Stop just failed.
         self.default_mic_sync = DefaultMicSync::default();
         self.sync_default_mic();
+        crate::virtual_mic::shutdown();
         self.save_settings();
     }
 
@@ -2869,6 +2896,7 @@ mod tests {
         assert_eq!(app.settings.window_size, Some([744.0, 842.0]), "and the size in points");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_saved_position_off_every_monitor_is_ignored() {
         use eframe::App as _;

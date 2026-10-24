@@ -912,7 +912,7 @@ fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
 #[cfg(not(windows))]
 fn type_text(_text: &str, cancel: &AtomicBool) -> Result<()> {
     check_transcription_cancelled(cancel)?;
-    bail!("typing text is available on Windows")
+    bail!("typing into other apps isn't available on Linux; the transcript is shown to copy")
 }
 
 #[cfg(test)]

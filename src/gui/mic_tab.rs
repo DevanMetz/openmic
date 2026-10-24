@@ -6,13 +6,56 @@ use std::time::Duration;
 
 use eframe::egui::{self, ComboBox, RichText};
 
-use super::routes::{cable_input, VB_CABLE_URL};
-use super::{open_url, App, AMBER, CYAN, GREEN, MUTED, VIOLET};
+#[cfg(windows)]
+use super::routes::VB_CABLE_URL;
+use super::routes::cable_input;
+use super::{App, AMBER, CYAN, GREEN, MUTED, VIOLET};
 use crate::config;
 use crate::denoise::ModelState;
 use crate::engine::Engine;
 use crate::viz;
 use crate::widgets;
+
+/// Platform words for the virtual-cable setup. Linux has no download; it
+/// creates and names its own microphone instead.
+#[cfg(windows)]
+mod text {
+    pub const CABLE_STEP: &str = "Set up VB-Cable";
+    pub const CABLE_ACTION: &str = "Get VB-Cable";
+    pub const CABLE_ACTION_HINT: Option<&str> = Some("Run the installer as administrator");
+    pub const CABLE_STEP_HELP: Option<&str> = Some("If installed, enable CABLE Input in Windows");
+    pub const CABLE_MISSING: &str = "VB-Cable input isn't available.";
+    pub const CABLE_INSTALL_HELP: Option<&str> =
+        Some("If installed, enable CABLE Input in Windows. Otherwise, run VB-Cable's setup as administrator.");
+    pub const CABLE_USE: &str = "Use VB-Cable";
+    pub const CABLE_OTHER_HELP: Option<&str> = Some("For another virtual output, choose its matching input in Discord.");
+    pub const DEFAULT_MIC: &str = "Make CABLE Output my Windows default mic while running";
+    pub const DEFAULT_MIC_HELP: bool = true;
+    pub const DEFAULT_MIC_ON: &str = "In Discord: leave Voice & Video > Input Device on Default";
+    pub const DEFAULT_MIC_OFF: &str = "In Discord: Voice & Video > Input Device > CABLE Output";
+    pub const BADGE_READY: &str = "VB-Cable connected";
+    pub const BADGE_MISSING: &str = "VB-Cable unavailable";
+    pub const DISCORD_MIC: &str = "In Discord, set Voice & Video > Input Device to CABLE Output";
+}
+
+#[cfg(not(windows))]
+mod text {
+    pub const CABLE_STEP: &str = "Set up OpenMic Microphone";
+    pub const CABLE_ACTION: &str = "Create virtual mic";
+    pub const CABLE_ACTION_HINT: Option<&str> = None;
+    pub const CABLE_STEP_HELP: Option<&str> = None;
+    pub const CABLE_MISSING: &str = "OpenMic Microphone isn't available.";
+    pub const CABLE_INSTALL_HELP: Option<&str> = None;
+    pub const CABLE_USE: &str = "Use OpenMic Virtual Cable";
+    pub const CABLE_OTHER_HELP: Option<&str> = None;
+    pub const DEFAULT_MIC: &str = "Make OpenMic Microphone my default mic while running";
+    pub const DEFAULT_MIC_HELP: bool = false;
+    pub const DEFAULT_MIC_ON: &str = "In Discord: leave Voice & Video > Input Device on Default";
+    pub const DEFAULT_MIC_OFF: &str = "In Discord: Voice & Video > Input Device > OpenMic Microphone";
+    pub const BADGE_READY: &str = "OpenMic Microphone ready";
+    pub const BADGE_MISSING: &str = "OpenMic Microphone unavailable";
+    pub const DISCORD_MIC: &str = "In Discord, set Voice & Video > Input Device to OpenMic Microphone";
+}
 
 /// A first-run checklist step: whether it's done, its title, and what it
 /// asks the user to do.
@@ -94,10 +137,10 @@ impl App {
     fn step_action(&mut self, ui: &mut egui::Ui, step: Step) {
         match step {
             Step::Cable => {
-                if ui.small_button("Get VB-Cable").on_hover_text("Run the installer as administrator").clicked() {
-                    open_url(ui.ctx(), VB_CABLE_URL);
+                self.cable_action_button(ui, text::CABLE_ACTION, text::CABLE_ACTION_HINT, true);
+                if let Some(help) = text::CABLE_STEP_HELP {
+                    ui.weak(help);
                 }
-                ui.weak("If installed, enable CABLE Input in Windows");
             }
             Step::Microphone => {
                 ui.weak("pick it under Routing below");
@@ -112,6 +155,33 @@ impl App {
                 if !self.mic_test.busy() && ui.small_button("Test").clicked() {
                     self.start_mic_test();
                 }
+            }
+        }
+    }
+
+    /// "Get VB-Cable" on Windows, the built-in virtual microphone on Linux.
+    fn cable_action_button(&mut self, ui: &mut egui::Ui, label: &str, hover: Option<&str>, small: bool) -> egui::Response {
+        let button = if small { ui.small_button(label) } else { ui.button(label) };
+        let button = match hover {
+            Some(hover) => button.on_hover_text(hover),
+            None => button,
+        };
+        if button.clicked() {
+            #[cfg(windows)]
+            super::open_url(ui.ctx(), VB_CABLE_URL);
+            #[cfg(not(windows))]
+            self.create_virtual_mic();
+        }
+        button
+    }
+
+    #[cfg(not(windows))]
+    fn create_virtual_mic(&mut self) {
+        match crate::virtual_mic::activate() {
+            Ok(()) => self.refresh_devices(true),
+            Err(e) => {
+                crate::logfile::warn(format_args!("virtual microphone not created: {e:#}"));
+                self.status = (super::short(&format!("Virtual mic: {e:#}")), super::RED);
             }
         }
     }
@@ -139,19 +209,19 @@ impl App {
                     None => {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
-                                RichText::new("VB-Cable input isn't available.")
+                                RichText::new(text::CABLE_MISSING)
                                     .color(widgets::text_color(ui, AMBER)),
                             );
-                            if ui.button("Get VB-Cable").clicked() {
-                                open_url(ui.ctx(), VB_CABLE_URL);
-                            }
+                            self.cable_action_button(ui, text::CABLE_ACTION, None, false);
                         });
-                        ui.weak("If installed, enable CABLE Input in Windows. Otherwise, run VB-Cable's setup as administrator.");
+                        if let Some(help) = text::CABLE_INSTALL_HELP {
+                            ui.weak(help);
+                        }
                     }
                     Some(cable) if self.settings.output != cable => {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("A different processed output is selected.").color(widgets::text_color(ui, AMBER)));
-                            if ui.button("Use VB-Cable").clicked() {
+                            if ui.button(text::CABLE_USE).clicked() {
                                 self.settings.output = cable;
                                 self.touch();
                                 if self.running() {
@@ -159,13 +229,15 @@ impl App {
                                 }
                             }
                         });
-                        ui.weak("For another virtual output, choose its matching input in Discord.");
+                        if let Some(help) = text::CABLE_OTHER_HELP {
+                            ui.weak(help);
+                        }
                     }
                     Some(_) => {
                         let changed = ui
                             .checkbox(
                                 &mut self.settings.default_mic,
-                                "Make CABLE Output my Windows default mic while running",
+                                text::DEFAULT_MIC,
                             )
                             .on_hover_text(
                                 "Apps set to the default microphone (Discord's default) hear your \
@@ -175,11 +247,13 @@ impl App {
                         if changed {
                             self.touch();
                         }
-                        ui.weak(if self.settings.default_mic {
-                            "In Discord: leave Voice & Video > Input Device on Default"
-                        } else {
-                            "In Discord: Voice & Video > Input Device > CABLE Output"
-                        });
+                        if text::DEFAULT_MIC_HELP {
+                            ui.weak(if self.settings.default_mic {
+                                text::DEFAULT_MIC_ON
+                            } else {
+                                text::DEFAULT_MIC_OFF
+                            });
+                        }
                     }
                 }
             });
@@ -195,9 +269,9 @@ impl App {
             |ui| {
                 refresh = ui.small_button("Refresh").clicked();
                 if cable {
-                    widgets::badge(ui, "VB-Cable connected", GREEN);
+                    widgets::badge(ui, text::BADGE_READY, GREEN);
                 } else {
-                    widgets::badge(ui, "VB-Cable unavailable", AMBER);
+                    widgets::badge(ui, text::BADGE_MISSING, AMBER);
                 }
             },
             |ui| {
@@ -485,10 +559,10 @@ fn preset_chip(ui: &mut egui::Ui, preset: &config::Preset, current: &config::Pro
 
 fn step_title(step: Step, default_mic: bool) -> &'static str {
     match step {
-        Step::Cable => "Set up VB-Cable",
+        Step::Cable => text::CABLE_STEP,
         Step::Microphone => "Choose your microphone",
         Step::Discord if default_mic => "In Discord, set Voice & Video > Input Device to Default",
-        Step::Discord => "In Discord, set Voice & Video > Input Device to CABLE Output",
+        Step::Discord => text::DISCORD_MIC,
         Step::Test => "Test your mic: hear yourself raw and cleaned",
     }
 }

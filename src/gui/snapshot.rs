@@ -15,6 +15,16 @@ use super::App;
 use crate::config::Settings;
 use crate::engine::ScopeFrame;
 
+#[cfg(windows)]
+const DEFAULT_MIC_HELP: &str = "In Discord: leave Voice & Video > Input Device on Default";
+#[cfg(not(windows))]
+const DEFAULT_MIC_HELP: &str = "Make OpenMic Microphone my default mic while running";
+
+#[cfg(windows)]
+const DICTATION_HELP: &str = "Your words are typed into the app you're using. Set your Shortcut above.";
+#[cfg(not(windows))]
+const DICTATION_HELP: &str = "Your words appear below to copy into the app you're using. Set your Shortcut above.";
+
 struct Canvas {
     width: usize,
     height: usize,
@@ -182,7 +192,7 @@ fn native_helper_text_and_links_remain_readable_when_the_system_theme_changes() 
                 let labels: &[&str] = match page {
                     super::Page::Voice => &[
                         "Microphone", "Processed output", "Monitor output",
-                        "In Discord: leave Voice & Video > Input Device on Default",
+                        DEFAULT_MIC_HELP,
                         "How loud you are going in", "Keeps your voice, drops the room",
                         "Start OpenMic to see your voice live", "DeepFilterNet",
                     ],
@@ -196,7 +206,7 @@ fn native_helper_text_and_links_remain_readable_when_the_system_theme_changes() 
                         "Recording stays on this computer.",
                     ],
                     super::Page::Dictation => &[
-                        "Shortcut", "Model", "Your words are typed into the app you're using. Set your Shortcut above.",
+                        "Shortcut", "Model", DICTATION_HELP,
                     ],
                     super::Page::Settings => &[
                         "Mute mic", "Bypass processing", "Stop all clips", "Speech to text",
