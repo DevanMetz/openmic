@@ -35,6 +35,22 @@ pub enum SpeechModel {
     Small,
 }
 
+#[cfg(test)]
+thread_local! {
+    static MODEL_DIRECTORY_FOR_TEST: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn use_model_directory_for_test(path: &Path) -> impl Drop {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MODEL_DIRECTORY_FOR_TEST.with(|directory| { directory.replace(self.0.take()); });
+        }
+    }
+    Restore(MODEL_DIRECTORY_FOR_TEST.with(|directory| directory.replace(Some(path.to_owned()))))
+}
+
 impl SpeechModel {
     pub const ALL: [SpeechModel; 5] = [Self::TinyEn, Self::BaseEn, Self::SmallEn, Self::Base, Self::Small];
 
@@ -72,6 +88,10 @@ impl SpeechModel {
     }
 
     fn dir(self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(directory) = MODEL_DIRECTORY_FOR_TEST.with(|directory| directory.borrow().clone()) {
+            return directory.join(self.repo().0);
+        }
         config::settings_path()
             .parent()
             .map(Path::to_owned)
@@ -89,6 +109,9 @@ impl SpeechModel {
     pub fn remove(self) -> Result<()> {
         remove_model_files(&self.dir())
     }
+
+    #[cfg(test)]
+    pub(crate) fn directory_for_test(self) -> PathBuf { self.dir() }
 }
 
 fn remove_model_files(dir: &Path) -> Result<()> {
@@ -138,6 +161,8 @@ pub struct Dictation {
     /// Shared by the current batch; cancelled takes keep their old flag.
     transcription_cancel: Arc<AtomicBool>,
     download: Option<Download>,
+    #[cfg(test)]
+    next_download: Option<(Receiver<Result<()>>, u64, u64)>,
 }
 
 struct TranscriptionWorker {
@@ -163,6 +188,8 @@ impl Dictation {
             pending: Arc::default(),
             transcription_cancel: Arc::default(),
             download: None,
+            #[cfg(test)]
+            next_download: None,
         }
     }
 
@@ -225,10 +252,23 @@ impl Dictation {
             return;
         }
         let (done, total, cancel) = (Arc::default(), Arc::default(), Arc::default());
+        #[cfg(test)]
+        let test_download = self.next_download.take();
+        #[cfg(test)]
+        if let Some((_, received, expected)) = &test_download {
+            AtomicU64::store(&done, *received, Ordering::Relaxed);
+            AtomicU64::store(&total, *expected, Ordering::Relaxed);
+        }
         let spawned = {
             let (done, total, cancel) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
             let wake = Arc::clone(&self.wake);
             thread::Builder::new().name("openmic-model-download".into()).spawn(move || {
+                #[cfg(test)]
+                let result = if let Some((completion, _, _)) = test_download {
+                    completion.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("Model download fixture closed")))
+                        .and_then(|()| check_download_cancelled(&cancel))
+                } else { download_model(model, &done, &total, &cancel) };
+                #[cfg(not(test))]
                 let result = download_model(model, &done, &total, &cancel);
                 wake();
                 result
@@ -241,6 +281,14 @@ impl Dictation {
                 (self.wake)();
             }
         }
+    }
+
+    /// Hold a GUI-initiated download without making a network request.
+    #[cfg(test)]
+    pub(crate) fn hold_next_download_for_test(&mut self, done: u64, total: u64) -> Sender<Result<()>> {
+        let (completion, wait) = crossbeam_channel::bounded(1);
+        self.next_download = Some((wait, done, total));
+        completion
     }
 
     pub fn cancel_download(&self) {

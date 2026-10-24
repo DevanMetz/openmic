@@ -1061,6 +1061,230 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_rename_completion_returns_to_the_clip_or_search() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("rename-{index}.wav"))).collect();
+        let key = |key| [true, false].into_iter().map(|pressed| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+        }).collect();
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.25, 1.5] {
+                    for (filter, draft, stays_visible) in [("", "Renamed target", true),
+                        ("target", "Renamed target", true), ("target", "Chime", false), ("target", " ", false)]
+                    {
+                        for finish in [egui::Key::Enter, egui::Key::Escape] {
+                            let mut app = app_with(&paths);
+                            app.settings.sounds[11].name = Some("target".into());
+                            app.settings.sounds[11].starred = true;
+                            app.settings.sounds[11].volume = 0.43561;
+                            app.settings.sounds[11].start = 0.12345;
+                            app.settings.sounds[11].end = Some(0.812345);
+                            app.settings.sound_volume = 0.61347;
+                            app.pad_filter = filter.into();
+                            for path in [&paths[0], &paths[11]] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                            let mut expected = app.settings.clone();
+                            if finish == egui::Key::Enter { expected.sounds[11].name = (!draft.trim().is_empty()).then(|| draft.to_owned()); }
+                            let ctx = egui::Context::default();
+                            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                            ctx.enable_accesskit();
+                            app.play_clip(0, &ctx);
+                            app.toggle_clip(0, &ctx);
+                            let playing = app.playing.clone();
+                            let progress = app.pad_progress.clone();
+                            let status = app.sound_status.clone();
+                            let size = egui::vec2(700.0, 420.0) / zoom;
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.label() == Some("Rename target")).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                            })]);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, key(egui::Key::Enter));
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, vec![egui::Event::Text(draft.into())]);
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, key(finish));
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                            let hidden = !stays_visible && finish == egui::Key::Enter;
+                            let target = if hidden { *tree.nodes.iter().find(|(_, node)|
+                                node.role() == Role::TextInput && node.placeholder() == Some("Search clips")).map(|(id, _)| id).unwrap()
+                            } else { owner };
+                            assert_eq!(tree.focus, target, "{finish:?} returns to the clip or search: filter={filter:?}, draft={draft:?}, zoom={zoom}, passes={passes}");
+                            let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                            let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                            assert!(output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect)
+                                && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the returned focus is visible");
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                            assert_eq!(app.playing, playing);
+                            assert_eq!(app.pad_progress, progress);
+                            assert_eq!(app.sound_status, status);
+                            assert_eq!(app.pad_filter, filter);
+                            assert_eq!(app.dirty_since.is_some(), finish == egui::Key::Enter);
+                            assert!(app.renaming_pad.is_none() && app.clip_loads.is_none());
+                            assert!(paths.iter().all(|path| path.is_file()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes rename completion screenshots; needs Python with Pillow"]
+    fn snapshot_soundboard_rename_completion() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("rename-{index}.wav"))).collect();
+        let key_event = |key, pressed, repeat| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat, modifiers: egui::Modifiers::NONE,
+        };
+        let key = |key| [true, false].into_iter().map(|pressed| key_event(key, pressed, false)).collect();
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            for zoom in [1.0, 1.25, 1.5] {
+                for (state, filter, draft, finish) in [
+                    ("saved", "", "Renamed target", Some(egui::Key::Enter)),
+                    ("cancelled", "", "Chime", Some(egui::Key::Escape)),
+                    ("filtered", "target", "Chime", Some(egui::Key::Enter)),
+                    ("blank", "target", " ", Some(egui::Key::Enter)),
+                    ("opening-enter", "", "Café chime", None),
+                    ("opening-space", "target", "Café chime", None),
+                    ("opening-batched", "", "Café chime", None),
+                ] {
+                    let mut app = app_with(&paths);
+                    app.settings.sounds[11].name = Some("target".into());
+                    app.settings.sounds[11].starred = true;
+                    app.settings.sounds[11].volume = 0.43561;
+                    app.settings.sounds[11].start = 0.12345;
+                    app.settings.sounds[11].end = Some(0.812345);
+                    app.settings.sound_volume = 0.61347;
+                    app.pad_filter = filter.into();
+                    for path in [&paths[0], &paths[11]] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                    let mut expected = app.settings.clone();
+                    if finish == Some(egui::Key::Enter) { expected.sounds[11].name = (!draft.trim().is_empty()).then(|| draft.to_owned()); }
+                    app.play_clip(0, &egui::Context::default());
+                    app.toggle_clip(0, &egui::Context::default());
+                    let playing = app.playing.clone();
+                    let progress = app.pad_progress.clone();
+                    let status = app.sound_status.clone();
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.enable_accesskit();
+                    let size = egui::vec2(700.0, 420.0) / zoom;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.label() == Some("Rename target")).map(|(id, _)| id).unwrap();
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                    })]);
+                    events.extend(vec![Vec::new(); 8]);
+                    if let Some(finish) = finish {
+                        events.push(key(egui::Key::Enter));
+                        events.extend(vec![Vec::new(); 8]);
+                        events.push(vec![egui::Event::Text(draft.into())]);
+                        events.extend(vec![Vec::new(); 3]);
+                        events.push(key(finish));
+                    } else {
+                        let activation = if state == "opening-space" { egui::Key::Space } else { egui::Key::Enter };
+                        let mut opening = vec![key_event(activation, true, false)];
+                        if activation == egui::Key::Space { opening.push(egui::Event::Text(" ".into())); }
+                        if state == "opening-batched" { opening.push(egui::Event::Text(draft.into())); }
+                        events.push(opening);
+                        events.extend(vec![Vec::new(); 8]);
+                        if state != "opening-batched" { events.push(vec![egui::Event::Text(draft.into())]); }
+                        events.extend(vec![Vec::new(); 3]);
+                        for _ in 0..3 {
+                            let mut repeat = vec![key_event(activation, true, true)];
+                            if activation == egui::Key::Space { repeat.push(egui::Event::Text(" ".into())); }
+                            events.push(repeat);
+                        }
+                        events.push(vec![key_event(activation, false, false)]);
+                    }
+                    events.extend(vec![Vec::new(); 8]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("board-rename-{state}-{}-{theme}", (zoom * 100.0) as u32), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(expected).unwrap());
+                    assert_eq!(app.playing, playing);
+                    assert_eq!(app.pad_progress, progress);
+                    assert_eq!(app.sound_status, status);
+                    assert_eq!(app.pad_filter, filter);
+                    assert_eq!(app.dirty_since.is_some(), finish == Some(egui::Key::Enter));
+                    assert_eq!(app.renaming_pad.is_some(), finish.is_none());
+                    assert!(app.clip_loads.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_completion_respects_the_next_keyboard_or_assistive_focus() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("rename-{index}.wav"))).collect();
+        let key = |key| [true, false].into_iter().map(|pressed| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+        }).collect();
+        let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        });
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.5] {
+                    for finish in [egui::Key::Enter, egui::Key::Escape] {
+                        for navigation in ["Tab", "Search"] {
+                            let mut app = app_with(&paths);
+                            app.settings.sounds[11].name = Some("target".into());
+                            app.settings.sounds[11].volume = 0.43561;
+                            app.settings.sounds[11].start = 0.12345;
+                            app.settings.sounds[11].end = Some(0.812345);
+                            let mut expected = app.settings.clone();
+                            if finish == egui::Key::Enter { expected.sounds[11].name = Some("Chime".into()); }
+                            let ctx = egui::Context::default();
+                            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                            ctx.enable_accesskit();
+                            let size = egui::vec2(700.0, 420.0) / zoom;
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let tree = output.platform_output.accesskit_update.unwrap();
+                            let owner = *tree.nodes.iter().find(|(_, node)| node.label() == Some("Rename target")).map(|(id, _)| id).unwrap();
+                            let target = *tree.nodes.iter().find(|(_, node)| if navigation == "Tab" {
+                                node.label() == Some("Add target to the strip")
+                            } else { node.placeholder() == Some("Search clips") }).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, vec![focus(owner)]);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, key(egui::Key::Enter));
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, vec![egui::Event::Text("Chime".into())]);
+                            draw_board_size(&mut app, &ctx, size, key(finish));
+                            let next = if navigation == "Tab" { key(egui::Key::Tab) }
+                                else { vec![focus(target), egui::Event::Text("rename".into())] };
+                            draw_board_size(&mut app, &ctx, size, next);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target,
+                                "the input immediately after {finish:?} keeps its chosen focus: navigation={navigation}, zoom={zoom}, passes={passes}");
+                            assert_eq!(app.pad_filter, if navigation == "Search" { "rename" } else { "" });
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                            assert_eq!(app.dirty_since.is_some(), finish == egui::Key::Enter);
+                            assert!(app.renaming_pad.is_none() && app.playing.is_empty() && app.clip_loads.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rename_focus_stays_visible_when_search_and_order_change() {
         use egui::accesskit::{Action, ActionRequest, TreeId};
         let dir = tempfile::tempdir().unwrap();
@@ -1146,6 +1370,408 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_clip_keeps_a_visible_focus_destination_without_reusing_the_key() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("remove-{index}.wav"))).collect();
+        let key = |key, pressed, modifiers| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers,
+        };
+        let focus = |target_node| vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        })];
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.25, 1.5] {
+                    for (count, index, filter, next) in [(12, 5, "", "Play clip-6"),
+                        (12, 11, "", "Play clip-10"), (12, 5, "target next", "Play target next"),
+                        (12, 5, "target", "Search clips"), (10, 5, "target", "Play clip-6"),
+                        (1, 0, "", "Add your first clips")]
+                    {
+                        for activation in ["Enter", "Space", "assistive click", "menu"] {
+                            let mut app = app_with(&paths[..count]);
+                            for (i, pad) in app.settings.sounds.iter_mut().enumerate() {
+                                pad.name = Some(format!("clip-{i}"));
+                                pad.volume = 0.43561;
+                                pad.start = 0.12345;
+                                pad.end = Some(0.812345);
+                            }
+                            app.settings.sounds[index].name = Some(if filter == "target next" { "target next remove" } else { "target" }.into());
+                            if filter == "target next" { app.settings.sounds[8].name = Some("target next".into()); }
+                            app.settings.sound_volume = 0.61347;
+                            app.settings.overlap_clips = true;
+                            app.pad_filter = filter.into();
+                            for path in &paths[..count] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                            let mut expected = app.settings.clone();
+                            expected.sounds.remove(index);
+                            let ctx = egui::Context::default();
+                            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                            crate::widgets::configure_text_styles(&ctx);
+                            ctx.enable_accesskit();
+                            if count > 1 { app.play_clip(0, &ctx); app.toggle_clip(0, &ctx); }
+                            app.play_clip(index, &ctx);
+                            let mut progress = app.pad_progress.clone();
+                            progress.remove(&clip_key(&paths[index]));
+                            let size = egui::vec2(700.0, 420.0) / zoom;
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let name = app.settings.sounds[index].display_name();
+                            let owner_label = if activation == "menu" { format!("Pause {name}") } else { format!("Remove {name}") };
+                            let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.label() == Some(owner_label.as_str())).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, focus(owner));
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let remove = if activation == "menu" {
+                                draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::F10, true, egui::Modifiers::SHIFT), key(egui::Key::F10, false, egui::Modifiers::SHIFT)]);
+                                for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                let remove = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                    .find(|(_, node)| node.label() == Some("Remove from soundboard")).map(|(id, _)| id).unwrap();
+                                draw_board_size(&mut app, &ctx, size, focus(remove));
+                                for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                remove
+                            } else { owner };
+                            let held = if activation == "Space" { egui::Key::Space } else { egui::Key::Enter };
+                            let input = if activation == "assistive click" {
+                                vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                    action: Action::Click, target_tree: TreeId::ROOT, target_node: remove, data: None,
+                                })]
+                            } else { vec![key(held, true, egui::Modifiers::NONE)] };
+                            draw_board_size(&mut app, &ctx, size, input);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                            let destination = *tree.nodes.iter().find(|(_, node)| if next == "Search clips" {
+                                node.role() == Role::TextInput && node.placeholder() == Some(next)
+                            } else { node.role() == Role::Button && node.label() == Some(next) }).map(|(id, _)| id).unwrap();
+                            assert_eq!(tree.focus, destination,
+                                "removal continues at {next}: count={count}, index={index}, activation={activation}, zoom={zoom}, passes={passes}");
+                            let bounds = tree.nodes.iter().find(|(id, _)| *id == destination).unwrap().1.bounds().unwrap();
+                            let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                            assert!(output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect)
+                                && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the destination is fully visible");
+                            if next.starts_with("Play ") {
+                                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(pad)
+                                    if (pad.rect.height() - 108.0).abs() < 0.01 && pad.rect.contains(rect.center())
+                                        && shape.clip_rect.expand(0.5 / zoom).contains_rect(pad.rect))),
+                                    "the whole destination pad is visible: count={count}, index={index}, activation={activation}, zoom={zoom}, passes={passes}");
+                            }
+                            if activation != "assistive click" {
+                                for _ in 0..3 {
+                                    let mut input = vec![key(held, true, egui::Modifiers::NONE)];
+                                    if held == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                                    draw_board_size(&mut app, &ctx, size, input);
+                                }
+                            }
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                            assert_eq!(app.pad_filter, filter);
+                            assert_eq!(app.pad_progress, progress);
+                            assert_eq!(app.engine.as_ref().unwrap().clip_progress().len(), usize::from(count > 1));
+                            assert_eq!(app.sound_status.0, format!("Removed {name}"));
+                            assert!(app.dirty_since.is_some());
+                            assert!(app.playing.is_empty() && app.clip_loads.is_none() && app.renaming_pad.is_none());
+                            assert!(!egui::Popup::is_any_open(&ctx));
+                            assert!(paths.iter().all(|path| path.is_file()));
+                            if activation != "assistive click" {
+                                let mut input = vec![key(held, false, egui::Modifiers::NONE), key(held, true, egui::Modifiers::NONE)];
+                                if held == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                                input.push(key(held, false, egui::Modifiers::NONE));
+                                if let Some(name) = next.strip_prefix("Play ") {
+                                    draw_board_size(&mut app, &ctx, size, input);
+                                    let path = &app.settings.sounds.iter().find(|pad| pad.display_name() == name).unwrap().path;
+                                    assert_eq!(app.playing, [clip_key(path)], "a fresh activation in the release batch still plays the chosen clip");
+                                } else if held == egui::Key::Space && next == "Search clips" {
+                                    draw_board_size(&mut app, &ctx, size, input);
+                                    assert_eq!(app.pad_filter, format!("{filter} "), "a fresh space after release is accepted in search");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes removal focus screenshots; needs Python with Pillow"]
+    fn snapshot_soundboard_focus_after_removal() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("remove-{index}.wav"))).collect();
+        let key = |key, modifiers| [true, false].into_iter().map(|pressed| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers,
+        }).collect();
+        let focus = |target_node| vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        })];
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            for zoom in [1.0, 1.25, 1.5] {
+                for (state, count, index, filter, menu) in [("next", 12, 5, "", false),
+                    ("previous", 12, 11, "", true), ("search", 12, 5, "target", true),
+                    ("threshold", 10, 5, "target", false), ("empty", 1, 0, "", false)]
+                {
+                    let mut app = app_with(&paths[..count]);
+                    for (i, pad) in app.settings.sounds.iter_mut().enumerate() {
+                        pad.name = Some(format!("clip-{i}"));
+                        pad.volume = 0.43561;
+                        pad.start = 0.12345;
+                        pad.end = Some(0.812345);
+                    }
+                    app.settings.sounds[index].name = Some("target".into());
+                    app.settings.sounds[index].starred = true;
+                    app.settings.sound_volume = 0.61347;
+                    app.settings.overlap_clips = true;
+                    app.pad_filter = filter.into();
+                    for path in &paths[..count] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                    let mut expected = app.settings.clone();
+                    expected.sounds.remove(index);
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.enable_accesskit();
+                    if count > 1 { app.play_clip(0, &ctx); app.toggle_clip(0, &ctx); }
+                    app.play_clip(index, &ctx);
+                    let mut progress = app.pad_progress.clone();
+                    progress.remove(&clip_key(&paths[index]));
+                    let size = egui::vec2(700.0, 420.0) / zoom;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.label() == Some(if menu { "Pause target" } else { "Remove target" })).map(|(id, _)| id).unwrap();
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(focus(owner));
+                    events.extend(vec![Vec::new(); 8]);
+                    if menu {
+                        events.push(key(egui::Key::F10, egui::Modifiers::SHIFT));
+                        events.extend(vec![Vec::new(); 8]);
+                        for input in &events { draw_board_size(&mut app, &ctx, size, input.clone()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let remove = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some("Remove from soundboard")).map(|(id, _)| id).unwrap();
+                        events.push(focus(remove));
+                        events.extend(vec![Vec::new(); 8]);
+                    }
+                    events.push(key(egui::Key::Enter, egui::Modifiers::NONE));
+                    events.extend(vec![Vec::new(); 8]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("board-remove-{state}-{}-{theme}", (zoom * 100.0) as u32), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(expected).unwrap());
+                    assert_eq!(app.pad_filter, filter);
+                    assert_eq!(app.pad_progress, progress);
+                    assert!(app.playing.is_empty() && app.clip_loads.is_none() && app.renaming_pad.is_none());
+                    assert_eq!(app.sound_status.0, "Removed target");
+                    assert!(app.dirty_since.is_some());
+                    assert!(paths.iter().all(|path| path.is_file()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn holding_the_key_that_opens_rename_keeps_the_editor_active() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("held-rename-{index}.wav"))).collect();
+        let key = |key, pressed, repeat| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat, modifiers: egui::Modifiers::NONE,
+        };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.25, 1.5] {
+                    for activation in [egui::Key::Enter, egui::Key::Space] {
+                        for filter in ["", "target"] {
+                            for (batched, cancel) in [(true, false), (false, false), (false, true)] {
+                                let mut app = app_with(&paths);
+                                app.settings.sounds[11].name = Some("target".into());
+                                app.settings.sounds[11].starred = true;
+                                app.settings.sounds[11].volume = 0.43561;
+                                app.settings.sounds[11].start = 0.12345;
+                                app.settings.sounds[11].end = Some(0.812345);
+                                app.settings.sound_volume = 0.61347;
+                                app.pad_filter = filter.into();
+                                for path in [&paths[0], &paths[11]] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                                let mut expected = app.settings.clone();
+                                let original = serde_json::to_value(&expected).unwrap();
+                                let ctx = egui::Context::default();
+                                ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                                crate::widgets::configure_text_styles(&ctx);
+                                ctx.enable_accesskit();
+                                app.play_clip(0, &ctx);
+                                app.toggle_clip(0, &ctx);
+                                let playing = app.playing.clone();
+                                let progress = app.pad_progress.clone();
+                                let engine_progress = app.engine.as_ref().unwrap().clip_progress();
+                                let status = app.sound_status.clone();
+                                let size = egui::vec2(700.0, 420.0) / zoom;
+                                for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                    .find(|(_, node)| node.label() == Some("Rename target")).map(|(id, _)| id).unwrap();
+                                draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                                })]);
+                                for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                let mut opening = vec![key(activation, true, false)];
+                                if activation == egui::Key::Space { opening.push(egui::Event::Text(" ".into())); }
+                                if batched { opening.push(egui::Event::Text("Café chime".into())); }
+                                draw_board_size(&mut app, &ctx, size, opening);
+                                for _ in 0..4 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                if !batched { draw_board_size(&mut app, &ctx, size, vec![egui::Event::Text("Café chime".into())]); }
+                                let mut editor = None;
+                                for repeat in 0..4 {
+                                    if repeat > 0 {
+                                        let mut events = vec![key(activation, true, true)];
+                                        if activation == egui::Key::Space { events.push(egui::Event::Text(" ".into())); }
+                                        draw_board_size(&mut app, &ctx, size, events);
+                                    }
+                                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                    assert!(app.renaming_pad.is_some(),
+                                        "held {activation:?} must keep editing: batched={batched}, cancel={cancel}, filter={filter:?}, zoom={zoom}, passes={passes}, repeat={repeat}");
+                                    let tree = output.platform_output.accesskit_update.unwrap();
+                                    let (id, node) = tree.nodes.iter().find(|(_, node)| node.role() == Role::TextInput
+                                        && node.placeholder() != Some("Search clips")).unwrap();
+                                    if let Some(editor) = editor { assert_eq!(*id, editor); } else { editor = Some(*id); }
+                                    assert_eq!(tree.focus, *id, "the same inline editor keeps focus");
+                                    assert_eq!(node.value(), Some("Café chime"), "batched typing stays intact and held Space adds no text");
+                                    let bounds = node.bounds().unwrap();
+                                    let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                                    assert!(rect.top() >= 44.0 && rect.bottom() <= size.y && rect.left() >= 176.0 && rect.right() <= size.x
+                                        && output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect)
+                                            && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the focused editor stays visible: {rect:?}");
+                                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                                    assert!(app.dirty_since.is_none() && app.clip_loads.is_none());
+                                    assert_eq!(app.playing, playing);
+                                    assert_eq!(app.pad_progress, progress);
+                                    assert_eq!(app.engine.as_ref().unwrap().clip_progress(), engine_progress);
+                                    assert_eq!(app.sound_status, status);
+                                    assert_eq!(app.pad_filter, filter);
+                                }
+                                if cancel {
+                                    draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::Escape, true, false), key(egui::Key::Escape, false, false)]);
+                                } else {
+                                    let mut events = vec![key(activation, false, false), key(activation, true, false)];
+                                    if activation == egui::Key::Space { events.push(egui::Event::Text(" ".into())); }
+                                    draw_board_size(&mut app, &ctx, size, events);
+                                    if activation == egui::Key::Space {
+                                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                        let tree = output.platform_output.accesskit_update.unwrap();
+                                        assert_eq!(tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1.value(), Some("Café chime "),
+                                            "a fresh Space edits the name normally");
+                                        draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::Space, false, false), key(egui::Key::Enter, true, false)]);
+                                    }
+                                    expected.sounds[11].name = Some("Café chime".into());
+                                }
+                                for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                let tree = output.platform_output.accesskit_update.unwrap();
+                                let hidden = !cancel && !filter.is_empty();
+                                let target = if hidden { *tree.nodes.iter().find(|(_, node)| node.placeholder() == Some("Search clips")).map(|(id, _)| id).unwrap() }
+                                    else { owner };
+                                assert_eq!(tree.focus, target);
+                                let completed_key = if cancel { activation } else { egui::Key::Enter };
+                                for _ in 0..3 {
+                                    let mut events = vec![key(completed_key, true, true)];
+                                    if completed_key == egui::Key::Space { events.push(egui::Event::Text(" ".into())); }
+                                    let output = draw_board_size(&mut app, &ctx, size, events);
+                                    assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+                                    assert!(app.renaming_pad.is_none(), "the completed or cancelled edit stays closed until release");
+                                }
+                                assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                                assert_eq!(app.dirty_since.is_some(), !cancel);
+                                assert_eq!(app.pad_filter, filter);
+                                if hidden {
+                                    draw_board_size(&mut app, &ctx, size, vec![key(completed_key, false, false), egui::Event::Text("query".into())]);
+                                    assert!(app.pad_filter.contains("query"), "search typing works after releasing the completion key");
+                                } else {
+                                    draw_board_size(&mut app, &ctx, size, vec![key(completed_key, false, false),
+                                        key(egui::Key::Enter, true, false), key(egui::Key::Enter, false, false)]);
+                                    for _ in 0..4 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                    let tree = output.platform_output.accesskit_update.unwrap();
+                                    assert!(app.renaming_pad.is_some(), "a fresh Enter reopens rename");
+                                    assert_eq!(tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1.value(), Some(if cancel { "target" } else { "Café chime" }));
+                                }
+                                assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                                assert_eq!(app.playing, playing);
+                                assert_eq!(app.pad_progress, progress);
+                                assert_eq!(app.engine.as_ref().unwrap().clip_progress(), engine_progress);
+                                assert_eq!(app.sound_status, status);
+                                assert!(app.clip_loads.is_none() && paths.iter().all(|path| path.is_file()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn holding_enter_after_a_rename_does_not_reopen_the_editor() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("rename-{index}.wav"))).collect();
+        let key = |pressed| egui::Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter),
+            pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.5] {
+                    for filter in ["", "target"] {
+                        let mut app = app_with(&paths);
+                        app.settings.sounds[11].name = Some("target".into());
+                        app.settings.sounds[11].volume = 0.43561;
+                        app.settings.sounds[11].start = 0.12345;
+                        app.settings.sounds[11].end = Some(0.812345);
+                        app.pad_filter = filter.into();
+                        let mut expected = app.settings.clone();
+                        expected.sounds[11].name = Some("Chime".into());
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        ctx.enable_accesskit();
+                        let size = egui::vec2(700.0, 420.0) / zoom;
+                        for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some("Rename target")).map(|(id, _)| id).unwrap();
+                        draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                            action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                        })]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        draw_board_size(&mut app, &ctx, size, vec![key(true), key(false)]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        draw_board_size(&mut app, &ctx, size, vec![egui::Event::Text("Chime".into())]);
+                        draw_board_size(&mut app, &ctx, size, vec![key(true)]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let target = output.platform_output.accesskit_update.unwrap().focus;
+                        for _ in 0..3 {
+                            let output = draw_board_size(&mut app, &ctx, size, vec![key(true)]);
+                            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+                            assert!(app.renaming_pad.is_none(), "held Enter keeps the rename closed; filter={filter:?}, zoom={zoom}, passes={passes}");
+                        }
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(expected).unwrap());
+                        assert_eq!(app.pad_filter, filter);
+                        assert!(app.playing.is_empty() && app.clip_loads.is_none());
+                        if filter.is_empty() {
+                            draw_board_size(&mut app, &ctx, size, vec![key(false), key(true), key(false)]);
+                            for _ in 0..4 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            assert!(app.renaming_pad.is_some(), "a new Enter after release opens the editor");
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let tree = output.platform_output.accesskit_update.unwrap();
+                            assert_eq!(tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1.value(), Some("Chime"));
+                        } else {
+                            draw_board_size(&mut app, &ctx, size, vec![key(false), egui::Event::Text("query".into())]);
+                            assert!(app.pad_filter.contains("query"), "typing in search continues after Enter is released");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn keyboard_menu_removal_does_not_delete_a_neighbor_with_the_same_name() {
         let dir = tempfile::tempdir().unwrap();
         let paths = [wav(dir.path(), "keep.wav"), wav(dir.path(), "remove.wav")];
@@ -1195,17 +1821,24 @@ mod tests {
 
     #[test]
     fn focused_menu_actions_survive_waveform_results_and_shortcut_changes() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
         let dir = tempfile::tempdir().unwrap();
         let paths = [wav(dir.path(), "keep.wav"), wav(dir.path(), "target.wav")];
         let key = |key| vec![egui::Event::Key {
             key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
         }];
-        for dark in [true, false] {
+        for (dark, zoom) in [(true, 1.0), (false, 1.0), (true, 1.25), (false, 1.25), (true, 1.5), (false, 1.5)] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
             for change in ["waveform ready", "waveform failed", "shortcut cleared"] {
                 let mut app = app_with(&paths);
+                app.settings.sounds[1].volume = 0.43561;
+                app.settings.sounds[1].start = 3.12345;
+                app.settings.sounds[1].end = Some(4.812345);
                 let ctx = egui::Context::default();
+                ctx.options_mut(|options| options.zoom_factor = zoom);
                 ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
                 ctx.enable_accesskit();
+                let draw = |app: &mut App, events| draw_board_size(app, &ctx, size, events);
                 let pending = if change == "shortcut cleared" {
                     app.settings.sounds[1].hotkey = Some("Ctrl+Alt+Shift+PrintScreen".into());
                     app.cache_clip(paths[1].clone(), CachedClip::read(&paths[1], &AtomicBool::new(false)).unwrap());
@@ -1213,15 +1846,24 @@ mod tests {
                 } else {
                     Some(delayed(&mut app, &paths[1..2]))
                 };
-                open_trim_menu(&mut app, &ctx, "target");
+                let output = draw(&mut app, Vec::new());
+                let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                    .find(|(_, node)| node.label() == Some("Rename target")).map(|(id, _)| id).unwrap();
+                draw(&mut app, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                })]);
+                for _ in 0..6 { draw(&mut app, Vec::new()); }
+                draw(&mut app, vec![egui::Event::Key {
+                    key: egui::Key::F10, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::SHIFT,
+                }]);
                 if pending.is_some() {
                     app.clip_loads.as_mut().unwrap().requests.front_mut().unwrap().play = false;
                 }
-                for _ in 0..6 { draw_board(&mut app, &ctx, Vec::new()); }
+                for _ in 0..6 { draw(&mut app, Vec::new()); }
                 let label = if pending.is_some() { "Remove from soundboard" } else { "Show on the strip" };
                 let mut target = None;
                 for _ in 0..30 {
-                    let output = draw_board(&mut app, &ctx, key(egui::Key::Tab));
+                    let output = draw(&mut app, key(egui::Key::Tab));
                     let tree = output.platform_output.accesskit_update.unwrap();
                     if tree.nodes.iter().any(|(id, node)| *id == tree.focus && node.label() == Some(label)) {
                         target = Some(tree.focus);
@@ -1229,6 +1871,7 @@ mod tests {
                     }
                 }
                 let target = target.expect("Tab reaches the menu action before its content changes");
+                for _ in 0..6 { draw(&mut app, Vec::new()); }
                 if let Some((done, _)) = pending {
                     let result = if change == "waveform ready" {
                         CachedClip::read(&paths[1], &AtomicBool::new(false))
@@ -1240,10 +1883,19 @@ mod tests {
                 } else {
                     app.settings.sounds[1].hotkey = None;
                 }
-                let output = draw_board(&mut app, &ctx, Vec::new());
-                assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target,
+                for _ in 0..6 { draw(&mut app, Vec::new()); }
+                let output = draw(&mut app, Vec::new());
+                assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, target,
                     "{label} keeps focus after {change}; dark={dark}");
-                draw_board(&mut app, &ctx, key(egui::Key::Enter));
+                let bounds = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                    egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect)
+                    && output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect)
+                        && matches!(&shape.shape, egui::Shape::Rect(paint) if paint.rect.intersects(rect))),
+                    "{label} stays visible after {change} at {zoom}: {rect:?}");
+                draw(&mut app, key(egui::Key::Enter));
                 if change == "shortcut cleared" {
                     assert!(!app.settings.sounds[0].starred && app.settings.sounds[1].starred);
                 } else {
@@ -1251,6 +1903,676 @@ mod tests {
                 }
                 assert!(app.playing.is_empty() && app.clip_loads.is_none());
                 assert!(paths.iter().all(|path| path.is_file()));
+            }
+        }
+    }
+
+    #[test]
+    fn capturing_shortcuts_does_not_edit_the_focused_search_or_volume() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|i| wav(dir.path(), &format!("capture-{i}.wav"))).collect();
+        let key = |key, pressed, repeat, modifiers| egui::Event::Key { key, physical_key: Some(key), pressed, repeat, modifiers };
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        let ctrl_alt = egui::Modifiers { alt: true, ..ctrl };
+        let cases = [(Role::Slider, egui::Key::ArrowRight, ctrl, None),
+            (Role::Slider, egui::Key::ArrowLeft, egui::Modifiers::ALT, None),
+            (Role::Slider, egui::Key::ArrowRight, egui::Modifiers::NONE, None),
+            (Role::TextInput, egui::Key::Q, ctrl_alt, Some("@")),
+            (Role::TextInput, egui::Key::T, egui::Modifiers::NONE, Some("t")),
+            (Role::TextInput, egui::Key::Tab, egui::Modifiers::NONE, None),
+            (Role::TextInput, egui::Key::Tab, egui::Modifiers::SHIFT, None),
+            (Role::TextInput, egui::Key::A, ctrl, None),
+            (Role::TextInput, egui::Key::Home, ctrl, None),
+            (Role::TextInput, egui::Key::ArrowLeft, egui::Modifiers::NONE, None)];
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for (role, captured, modifiers, text) in cases {
+                    let mut app = app_with(&paths);
+                    app.settings.sounds[11].name = Some("target".into());
+                    app.settings.sounds[11].starred = true;
+                    app.settings.sounds[11].hotkey = Some("Ctrl+Alt+P".into());
+                    app.settings.sounds[11].volume = 0.43561;
+                    app.settings.sounds[11].start = 0.12345;
+                    app.settings.sounds[11].end = Some(0.812345);
+                    app.settings.sound_volume = 0.61347;
+                    app.settings.strength = 0.71347;
+                    app.settings.highpass_hz = 132.456;
+                    app.pad_filter = "tar".into();
+                    let mut expected = serde_json::to_value(&app.settings).unwrap();
+                    let combo = crate::hotkeys::combo(captured, modifiers).ok();
+                    if let Some(combo) = &combo { expected["sounds"][11]["hotkey"] = serde_json::json!(combo); }
+                    let binding = super::super::Binding::Pad(paths[11].clone());
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    crate::widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    app.cache_clip(paths[0].clone(), CachedClip::read(&paths[0], &AtomicBool::new(false)).unwrap());
+                    app.play_clip(0, &ctx);
+                    app.toggle_clip(0, &ctx);
+                    let playing = app.playing.clone();
+                    let progress = app.pad_progress.clone();
+                    let status = app.sound_status.clone();
+                    let size = egui::vec2(700.0, 420.0) / 1.5;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)| {
+                        node.role() == role && if role == Role::TextInput { node.placeholder() == Some("Search clips") }
+                            else { node.numeric_value() == Some(f64::from(0.61347f32)) }
+                    }).map(|(id, _)| id).unwrap();
+                    draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                    })]);
+                    for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let cursor = egui::TextEdit::load_state(&ctx, egui::Id::new("soundboard-search")).unwrap().cursor.char_range();
+                    app.start_capture(binding.clone());
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    for repeat in 0..4 {
+                        let mut input = vec![key(captured, true, repeat > 0, modifiers)];
+                        if let Some(text) = text { input.push(egui::Event::Text(text.into())); }
+                        draw_board_size(&mut app, &ctx, size, input);
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected, "capture must not adjust a slider: {captured:?}, {modifiers:?}, passes={passes}, repeat={repeat}");
+                        assert_eq!(app.pad_filter, "tar", "capture must not type into search: {captured:?}, passes={passes}, repeat={repeat}");
+                        assert_eq!(egui::TextEdit::load_state(&ctx, egui::Id::new("soundboard-search")).unwrap().cursor.char_range(), cursor,
+                            "capture preserves the caret and selection: {captured:?}, passes={passes}, repeat={repeat}");
+                        let tree = output.platform_output.accesskit_update.unwrap();
+                        assert_eq!(tree.focus, owner, "capture must not navigate away: {captured:?}, passes={passes}, repeat={repeat}");
+                        let bounds = tree.nodes.iter().find(|(id, _)| *id == owner).unwrap().1.bounds().unwrap();
+                        let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                        assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                            && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))),
+                            "capture keeps the focused control visible: {captured:?}, {modifiers:?}, passes={passes}, repeat={repeat}");
+                        assert_eq!(app.capturing.as_ref(), combo.is_none().then_some(&binding));
+                        assert_eq!(app.dirty_since.is_some(), combo.is_some());
+                        assert_eq!(app.playing, playing);
+                        assert_eq!(app.pad_progress, progress);
+                        assert_eq!(app.sound_status, status);
+                        assert!(app.renaming_pad.is_none() && app.clip_loads.is_none());
+                    }
+                    if combo.is_none() {
+                        draw_board_size(&mut app, &ctx, size, vec![key(captured, false, false, modifiers)]);
+                        draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::Escape, true, false, egui::Modifiers::NONE), key(egui::Key::Escape, false, false, egui::Modifiers::NONE)]);
+                        assert!(app.capturing.is_none());
+                    }
+                    // Releasing capture's key restores the focused control's ordinary keyboard use.
+                    let fresh = if role == Role::Slider { egui::Key::ArrowRight } else { egui::Key::M };
+                    let mut input = vec![key(captured, false, false, modifiers), key(fresh, true, false, egui::Modifiers::NONE), key(fresh, false, false, egui::Modifiers::NONE)];
+                    if role == Role::TextInput { input.push(egui::Event::Text("m".into())); }
+                    draw_board_size(&mut app, &ctx, size, input);
+                    if role == Role::Slider {
+                        assert!(app.settings.sound_volume > 0.61347, "the fresh arrow adjusts volume after release");
+                        expected["sound_volume"] = serde_json::json!(app.settings.sound_volume);
+                    } else { assert_eq!(app.pad_filter, "tarm"); }
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                    assert!(paths.iter().all(|path| path.is_file()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completing_capture_preserves_fresh_input_later_in_the_same_frame() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|i| wav(dir.path(), &format!("capture-batch-{i}.wav"))).collect();
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        let key = |key, physical_key, pressed, modifiers| egui::Event::Key { key, physical_key, pressed, repeat: false, modifiers };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for mode in ["text", "same-key", "navigation", "volume", "held-repeat", "physical-key", "held-escape"] {
+                    let mut app = app_with(&paths);
+                    app.settings.sounds[11].name = Some("target".into());
+                    app.settings.sounds[11].starred = true;
+                    app.settings.sounds[11].hotkey = Some("Ctrl+Alt+P".into());
+                    app.settings.sound_volume = 0.61347;
+                    app.pad_filter = "tar".into();
+                    let binding = super::super::Binding::Pad(paths[11].clone());
+                    let mut expected = serde_json::to_value(&app.settings).unwrap();
+                    let physical_collision = mode == "physical-key";
+                    let cancel = mode == "held-escape";
+                    let (logical, physical, modifiers) = if cancel {
+                        (egui::Key::Escape, Some(egui::Key::Escape), egui::Modifiers::NONE)
+                    } else if physical_collision {
+                        (egui::Key::A, Some(egui::Key::Q), egui::Modifiers { alt: true, ..ctrl })
+                    } else { (egui::Key::T, Some(egui::Key::T), ctrl) };
+                    if !cancel {
+                        expected["sounds"][11]["hotkey"] = serde_json::json!(crate::hotkeys::combo(physical.unwrap_or(logical), modifiers).unwrap());
+                    }
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    ctx.enable_accesskit();
+                    let size = egui::vec2(700.0, 420.0) / 1.5;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let role = if mode == "volume" { Role::Slider } else { Role::TextInput };
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)| {
+                        node.role() == role && if role == Role::TextInput { node.placeholder() == Some("Search clips") }
+                            else { node.numeric_value() == Some(f64::from(0.61347f32)) }
+                    }).map(|(id, _)| id).unwrap();
+                    draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                    })]);
+                    for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    app.start_capture(binding);
+                    let mut input = vec![key(logical, physical, true, modifiers)];
+                    if !cancel { input.push(egui::Event::Text(if physical_collision { "@" } else { "t" }.into())); }
+                    if mode != "held-repeat" && !physical_collision && !cancel { input.push(key(logical, physical, false, modifiers)); }
+                    match mode {
+                        "navigation" => input.extend([key(egui::Key::Tab, None, true, egui::Modifiers::NONE), key(egui::Key::Tab, None, false, egui::Modifiers::NONE)]),
+                        "volume" => input.extend([key(egui::Key::ArrowRight, None, true, egui::Modifiers::NONE), key(egui::Key::ArrowRight, None, false, egui::Modifiers::NONE)]),
+                        "same-key" => input.extend([key(logical, physical, true, egui::Modifiers::NONE), egui::Event::Text("t".into()), key(logical, physical, false, egui::Modifiers::NONE)]),
+                        "physical-key" => input.extend([key(logical, Some(egui::Key::A), true, egui::Modifiers::NONE), egui::Event::Text("a".into()), key(logical, Some(egui::Key::A), false, egui::Modifiers::NONE)]),
+                        _ => input.extend([key(egui::Key::M, None, true, egui::Modifiers::NONE), egui::Event::Text("m".into()), key(egui::Key::M, None, false, egui::Modifiers::NONE)]),
+                    }
+                    if mode == "held-repeat" || physical_collision {
+                        input.extend([key(logical, physical, true, modifiers), egui::Event::Text(if physical_collision { "@" } else { "t" }.into())]);
+                    }
+                    draw_board_size(&mut app, &ctx, size, input);
+                    if cancel { draw_board_size(&mut app, &ctx, size, vec![key(logical, physical, true, modifiers)]); }
+                    for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    assert!(app.capturing.is_none());
+                    let query = match mode { "text" | "held-repeat" | "held-escape" => "tarm", "same-key" => "tart", "physical-key" => "tara", _ => "tar" };
+                    assert_eq!(app.pad_filter, query, "fresh input after capture must be delivered in order: {mode}, passes={passes}");
+                    if mode == "volume" {
+                        assert!((app.settings.sound_volume - 0.62).abs() < 0.001, "the fresh arrow adjusts volume");
+                        expected["sound_volume"] = serde_json::json!(app.settings.sound_volume);
+                    }
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                    assert_eq!(app.dirty_since.is_some(), !cancel);
+                    if mode == "navigation" { assert_ne!(output.platform_output.accesskit_update.unwrap().focus, owner, "the fresh Tab navigates after capture"); }
+                    else { assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner, "ordinary input keeps its control focused: {mode}"); }
+                    assert!(app.playing.is_empty() && app.pad_progress.is_empty() && app.renaming_pad.is_none() && app.clip_loads.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capture_owns_clipboard_composition_and_multiple_held_keys() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|i| wav(dir.path(), &format!("capture-text-{i}.wav"))).collect();
+        let key = |key, physical_key, pressed, modifiers| egui::Event::Key { key, physical_key, pressed, repeat: false, modifiers };
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        let ctrl_alt = egui::Modifiers { alt: true, ..ctrl };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for mode in ["copy", "cut", "paste", "ime", "multiple", "cancel"] {
+                    let mut app = app_with(&paths);
+                    app.settings.sounds[11].name = Some("target".into());
+                    app.settings.sounds[11].hotkey = Some("Ctrl+Alt+P".into());
+                    app.settings.sounds[11].starred = true;
+                    app.settings.sound_volume = 0.61347;
+                    app.settings.strength = 0.71347;
+                    app.settings.highpass_hz = 132.456;
+                    app.pad_filter = "tar".into();
+                    let mut expected = serde_json::to_value(&app.settings).unwrap();
+                    let binding = super::super::Binding::Pad(paths[11].clone());
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    ctx.enable_accesskit();
+                    let size = egui::vec2(700.0, 420.0) / 1.5;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.placeholder() == Some("Search clips")).map(|(id, _)| id).unwrap();
+                    draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                    })]);
+                    for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::A, None, true, ctrl), key(egui::Key::A, None, false, ctrl)]);
+                    let cursor = egui::TextEdit::load_state(&ctx, egui::Id::new("soundboard-search")).unwrap().cursor.char_range().unwrap();
+                    assert_ne!(cursor.primary.index, cursor.secondary.index, "search starts with selected text");
+                    app.start_capture(binding.clone());
+                    if mode == "multiple" || mode == "cancel" {
+                        draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::T, Some(egui::Key::T), true, egui::Modifiers::NONE), egui::Event::Text("t".into())]);
+                        assert_eq!(app.capturing.as_ref(), Some(&binding));
+                        assert_eq!(app.pad_filter, "tar");
+                    }
+                    let (logical, physical, modifiers) = match mode {
+                        "copy" => (egui::Key::C, None, ctrl),
+                        "cut" => (egui::Key::X, None, ctrl),
+                        "paste" => (egui::Key::V, None, ctrl),
+                        "cancel" => (egui::Key::Escape, Some(egui::Key::Escape), egui::Modifiers::NONE),
+                        // AltGr can produce a character with a different physical shortcut key.
+                        _ => (egui::Key::A, Some(egui::Key::Q), ctrl_alt),
+                    };
+                    if mode != "cancel" {
+                        expected["sounds"][11]["hotkey"] = serde_json::json!(crate::hotkeys::combo(physical.unwrap_or(logical), modifiers).unwrap());
+                    }
+                    for repeat in 0..4 {
+                        let mut input = vec![key(logical, physical, true, modifiers)];
+                        match mode {
+                            "copy" => input.push(egui::Event::Copy),
+                            "cut" => input.push(egui::Event::Cut),
+                            "paste" => input.push(egui::Event::Paste("clipboard text".into())),
+                            "ime" => input.extend([egui::Event::Ime(egui::ImeEvent::Preedit { text: "\u{5019}\u{88dc}".into(), active_range_chars: Some(0..2) }),
+                                egui::Event::Ime(egui::ImeEvent::Commit("\u{78ba}\u{5b9a}".into())), egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: 1, after_chars: 1 })]),
+                            "multiple" => input.push(egui::Event::Text("@".into())),
+                            _ => {}
+                        }
+                        if mode == "multiple" || mode == "cancel" {
+                            input.extend([key(egui::Key::T, Some(egui::Key::T), true, egui::Modifiers::NONE), egui::Event::Text("t".into())]);
+                        }
+                        let output = draw_board_size(&mut app, &ctx, size, input);
+                        assert!(!output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(_))),
+                            "capture must not copy or cut the selection: {mode}, repeat={repeat}");
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        assert!(app.capturing.is_none());
+                        assert_eq!(app.pad_filter, "tar", "capture preserves selected text: {mode}, passes={passes}, repeat={repeat}");
+                        assert_eq!(egui::TextEdit::load_state(&ctx, egui::Id::new("soundboard-search")).unwrap().cursor.char_range(), Some(cursor));
+                        assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner);
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                        assert_eq!(app.dirty_since.is_some(), mode != "cancel");
+                    }
+                    // Another fresh key still types while the shortcut key remains held.
+                    draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::M, None, true, egui::Modifiers::NONE), egui::Event::Text("m".into()), key(egui::Key::M, None, false, egui::Modifiers::NONE)]);
+                    assert_eq!(app.pad_filter, "m");
+                    let mut input = vec![key(logical, physical, false, modifiers), key(egui::Key::T, Some(egui::Key::T), false, egui::Modifiers::NONE)];
+                    input.extend([key(egui::Key::A, None, true, ctrl), key(egui::Key::A, None, false, ctrl)]);
+                    draw_board_size(&mut app, &ctx, size, input);
+                    let output = draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::C, None, true, ctrl), egui::Event::Copy, key(egui::Key::C, None, false, ctrl)]);
+                    assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == "m")),
+                        "normal clipboard shortcuts work again after release: {mode}");
+                    assert_eq!(app.pad_filter, "m");
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                    assert!(app.playing.is_empty() && app.pad_progress.is_empty() && app.renaming_pad.is_none() && app.clip_loads.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn setting_a_clip_shortcut_returns_focus_and_owns_its_activation_keys() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|i| wav(dir.path(), &format!("clip-{i}.wav"))).collect();
+        let (commands, _receiver) = crossbeam_channel::unbounded();
+        // Only App::ui runs here; no global shortcuts are registered with Windows.
+        let mut manager = Some(crate::hotkeys::Hotkeys::new(&egui::Context::default(), commands).unwrap());
+        let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+            action, target_tree: TreeId::ROOT, target_node, data: None,
+        });
+        let key = |key, pressed, repeat, modifiers| egui::Event::Key { key, physical_key: Some(key), pressed, repeat, modifiers };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for label in ["Play target", "Rename target", "Remove target from the strip", "Remove target"] {
+                    for opener in [egui::Key::Enter, egui::Key::Space] {
+                        for finish in ["save-enter", "save-space", "invalid-enter", "invalid-space", "escape"] {
+                            let mut app = app_with(&paths);
+                            app.hotkeys = manager.take();
+                            app.settings.sounds[11].name = Some("target".into());
+                            app.settings.sounds[11].starred = true;
+                            app.settings.sounds[11].volume = 0.43561;
+                            app.settings.sounds[11].start = 0.12345;
+                            app.settings.sounds[11].end = Some(0.812345);
+                            app.settings.sounds[11].hotkey = Some("Ctrl+Alt+P".into());
+                            app.settings.sound_volume = 0.61347;
+                            app.settings.strength = 0.71347;
+                            app.settings.highpass_hz = 132.456;
+                            let original = serde_json::to_value(&app.settings).unwrap();
+                            let binding = super::super::Binding::Pad(paths[11].clone());
+                            let ctx = egui::Context::default();
+                            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                            crate::widgets::configure_text_styles(&ctx);
+                            ctx.enable_accesskit();
+                            for path in [&paths[0], &paths[11]] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                            app.play_clip(0, &ctx);
+                            app.toggle_clip(0, &ctx);
+                            let playing = app.playing.clone();
+                            let progress = app.pad_progress.clone();
+                            let status = app.sound_status.clone();
+                            let size = egui::vec2(700.0, 420.0) / 1.5;
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, vec![action(Action::Focus, owner)]);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::F10, true, false, egui::Modifiers::SHIFT), key(egui::Key::F10, false, false, egui::Modifiers::SHIFT)]);
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let set = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.label() == Some("Set…")).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, vec![action(Action::Focus, set)]);
+                            let mut input = vec![key(opener, true, false, egui::Modifiers::NONE)];
+                            if opener == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                            draw_board_size(&mut app, &ctx, size, input);
+                            for repeat in 0..4 {
+                                if repeat > 0 {
+                                    let mut input = vec![key(opener, true, true, egui::Modifiers::NONE)];
+                                    if opener == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                                    draw_board_size(&mut app, &ctx, size, input);
+                                }
+                                for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                assert_eq!(app.capturing.as_ref(), Some(&binding), "Set must wait for a new combination: {label}, {opener:?}, {finish}, passes={passes}, repeat={repeat}");
+                                assert!(!egui::Popup::is_any_open(&ctx));
+                                let tree = output.platform_output.accesskit_update.unwrap();
+                                assert_eq!(tree.focus, owner, "capture returns focus to its pad control: {label}");
+                                let bounds = tree.nodes.iter().find(|(id, _)| *id == owner).unwrap().1.bounds().unwrap();
+                                let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                                assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                                    && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the capture owner stays visible");
+                                assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                                assert!(app.dirty_since.is_none() && app.hotkey_bindings().is_empty());
+                                assert_eq!(app.playing, playing);
+                                assert_eq!(app.pad_progress, progress);
+                                assert_eq!(app.sound_status, status);
+                                assert!(app.renaming_pad.is_none() && app.clip_loads.is_none());
+                            }
+                            let completion = if finish == "escape" { egui::Key::Escape }
+                                else if finish.ends_with("space") { egui::Key::Space } else { egui::Key::Enter };
+                            let save = finish.starts_with("save");
+                            let invalid = finish.starts_with("invalid");
+                            let modifiers = if save { egui::Modifiers::CTRL } else { egui::Modifiers::NONE };
+                            let mut input = vec![key(opener, false, false, egui::Modifiers::NONE), key(completion, true, false, modifiers)];
+                            if completion == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                            if completion == egui::Key::Escape { input.push(key(completion, false, false, modifiers)); }
+                            draw_board_size(&mut app, &ctx, size, input);
+                            let mut expected = original;
+                            let combo = if completion == egui::Key::Space { "Ctrl+Space" } else { "Ctrl+Enter" };
+                            if save { expected["sounds"][11]["hotkey"] = serde_json::json!(combo); }
+                            for repeat in 0..4 {
+                                if repeat > 0 && completion != egui::Key::Escape {
+                                    let mut input = vec![key(completion, true, true, modifiers)];
+                                    if completion == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                                    draw_board_size(&mut app, &ctx, size, input);
+                                }
+                                let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                assert_eq!(app.capturing.as_ref(), invalid.then_some(&binding), "{finish} owns its key while held: {label}, passes={passes}, repeat={repeat}");
+                                assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                                assert_eq!(app.dirty_since.is_some(), save);
+                                assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner, "completion preserves focus: {label}, {finish}, passes={passes}, repeat={repeat}");
+                                assert_eq!(app.playing, playing);
+                                assert_eq!(app.pad_progress, progress);
+                                assert_eq!(app.sound_status, status);
+                                assert!(app.renaming_pad.is_none() && app.clip_loads.is_none() && !egui::Popup::is_any_open(&ctx));
+                            }
+                            if invalid {
+                                assert_eq!(app.hotkey_status.1, super::super::AMBER);
+                                draw_board_size(&mut app, &ctx, size, vec![key(completion, false, false, modifiers), key(egui::Key::Escape, true, false, egui::Modifiers::NONE), key(egui::Key::Escape, false, false, egui::Modifiers::NONE)]);
+                                assert!(app.capturing.is_none());
+                                let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                                assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner);
+                            }
+                            assert_eq!(app.hotkey_status.0, if save { format!("{combo} set") } else { "Shortcut unchanged".into() });
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                            assert!(paths.iter().all(|path| path.is_file()));
+                            assert!(!app.hotkey_bindings().is_empty());
+                            manager = app.hotkeys.take();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn opening_clip_capture_preserves_the_following_combination_and_pad_focus() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|i| wav(dir.path(), &format!("capture-open-{i}.wav"))).collect();
+        let (commands, _receiver) = crossbeam_channel::unbounded();
+        // Only App::ui runs; no shortcuts are registered with Windows.
+        let mut manager = Some(crate::hotkeys::Hotkeys::new(&egui::Context::default(), commands).unwrap());
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        let key = |key, pressed, modifiers| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers };
+        let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+            action, target_tree: TreeId::ROOT, target_node, data: None,
+        });
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for label in ["Play target", "Rename target", "Remove target from the strip", "Remove target"] {
+                    for opener in ["enter", "space", "assistive", "pointer"] {
+                        for completion in [egui::Key::Q, egui::Key::Enter, egui::Key::Space, egui::Key::Escape] {
+                            let mut app = app_with(&paths);
+                            app.hotkeys = manager.take();
+                            app.settings.sounds[11].name = Some("target".into());
+                            app.settings.sounds[11].starred = true;
+                            app.settings.sounds[11].hotkey = Some("Ctrl+Alt+P".into());
+                            app.settings.sounds[11].volume = 0.43561;
+                            app.settings.sounds[11].start = 0.12345;
+                            app.settings.sounds[11].end = Some(0.812345);
+                            app.settings.sound_volume = 0.61347;
+                            app.settings.strength = 0.71347;
+                            app.settings.highpass_hz = 132.456;
+                            let mut expected = serde_json::to_value(&app.settings).unwrap();
+                            let save = completion != egui::Key::Escape;
+                            let modifiers = if save { ctrl } else { egui::Modifiers::NONE };
+                            let combo = save.then(|| crate::hotkeys::combo(completion, modifiers).unwrap());
+                            if let Some(combo) = &combo { expected["sounds"][11]["hotkey"] = serde_json::json!(combo); }
+                            let ctx = egui::Context::default();
+                            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                            crate::widgets::configure_text_styles(&ctx);
+                            ctx.enable_accesskit();
+                            for path in [&paths[0], &paths[11]] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                            app.play_clip(0, &ctx);
+                            app.toggle_clip(0, &ctx);
+                            let playing = app.playing.clone();
+                            let progress = app.pad_progress.clone();
+                            let status = app.sound_status.clone();
+                            let size = egui::vec2(700.0, 420.0) / 1.5;
+                            for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, vec![action(Action::Focus, owner)]);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::F10, true, egui::Modifiers::SHIFT), key(egui::Key::F10, false, egui::Modifiers::SHIFT)]);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            let set = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.label() == Some("Set…")).map(|(id, _)| id).unwrap();
+                            draw_board_size(&mut app, &ctx, size, vec![action(Action::Focus, set)]);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            let edit = ctx.data(|data| data.get_temp::<Vec<egui::Id>>(
+                                egui::Id::new(("shortcut-capture-openers", ctx.viewport_id())))).unwrap().into_iter().find(|id| id.value() == set.0).unwrap();
+                            let pos = ctx.read_response(edit).unwrap().rect.center();
+                            let pointer = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                            let mut input = match opener {
+                                "assistive" => vec![action(Action::Click, set)],
+                                "pointer" => {
+                                    draw_board_size(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos), pointer(true)]);
+                                    vec![pointer(false)]
+                                }
+                                _ => {
+                                    let opening_key = if opener == "space" { egui::Key::Space } else { egui::Key::Enter };
+                                    let mut input = vec![key(opening_key, true, egui::Modifiers::NONE)];
+                                    if opening_key == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                                    input.push(key(opening_key, false, egui::Modifiers::NONE));
+                                    input
+                                }
+                            };
+                            input.push(key(completion, true, modifiers));
+                            if completion == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                            draw_board_size(&mut app, &ctx, size, input);
+                            for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                            assert!(app.capturing.is_none(), "the same-frame combination completes clip capture: {label}, {opener}, {completion:?}, passes={passes}");
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                            assert_eq!(app.dirty_since.is_some(), save);
+                            assert_eq!(app.hotkey_status.0, combo.map_or_else(|| "Shortcut unchanged".into(), |combo| format!("{combo} set")));
+                            for _ in 0..3 {
+                                let mut repeat = vec![key(completion, true, modifiers)];
+                                if completion == egui::Key::Space { repeat.push(egui::Event::Text(" ".into())); }
+                                draw_board_size(&mut app, &ctx, size, repeat);
+                            }
+                            let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                            assert!(app.capturing.is_none() && app.renaming_pad.is_none() && app.clip_loads.is_none() && !egui::Popup::is_any_open(&ctx));
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner, "completion restores its pad control: {label}, {opener}, {completion:?}");
+                            assert_eq!(app.playing, playing);
+                            assert_eq!(app.pad_progress, progress);
+                            assert_eq!(app.sound_status, status);
+                            assert!(paths.iter().all(|path| path.is_file()));
+                            manager = app.hotkeys.take();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_a_clip_shortcut_waits_for_the_activation_key_to_be_released() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [wav(dir.path(), "other.wav"), wav(dir.path(), "target.wav")];
+        let key = |key, pressed, modifiers| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers,
+        };
+        let focus = |target_node| vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        })];
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.5] {
+                    for held in [egui::Key::Enter, egui::Key::Space] {
+                        let mut app = app_with(&paths);
+                        app.settings.sounds[1].hotkey = Some("Ctrl+Alt+Shift+PrintScreen".into());
+                        app.settings.sounds[1].volume = 0.43561;
+                        app.settings.sounds[1].start = 0.12345;
+                        app.settings.sounds[1].end = Some(0.812345);
+                        app.settings.sound_volume = 0.61347;
+                        for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                        let mut expected = app.settings.clone();
+                        expected.sounds[1].hotkey = None;
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        crate::widgets::configure_text_styles(&ctx);
+                        ctx.enable_accesskit();
+                        app.play_clip(0, &ctx);
+                        app.toggle_clip(0, &ctx);
+                        let playing = app.playing.clone();
+                        let progress = app.pad_progress.clone();
+                        let status = app.sound_status.clone();
+                        let size = egui::vec2(700.0, 420.0) / zoom;
+                        for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some("Play target")).map(|(id, _)| id).unwrap();
+                        draw_board_size(&mut app, &ctx, size, focus(owner));
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        draw_board_size(&mut app, &ctx, size, vec![key(egui::Key::F10, true, egui::Modifiers::SHIFT), key(egui::Key::F10, false, egui::Modifiers::SHIFT)]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let tree = output.platform_output.accesskit_update.unwrap();
+                        let clear = *tree.nodes.iter().find(|(_, node)| node.label() == Some("Clear")).map(|(id, _)| id).unwrap();
+                        let strip = *tree.nodes.iter().find(|(_, node)| node.label() == Some("Show on the strip")).map(|(id, _)| id).unwrap();
+                        draw_board_size(&mut app, &ctx, size, focus(clear));
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        draw_board_size(&mut app, &ctx, size, vec![key(held, true, egui::Modifiers::NONE)]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        for _ in 0..3 {
+                            let mut input = vec![key(held, true, egui::Modifiers::NONE)];
+                            if held == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                            let output = draw_board_size(&mut app, &ctx, size, input);
+                            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, strip);
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap(),
+                                "held {held:?} after Clear must not toggle the strip; zoom={zoom}, passes={passes}");
+                        }
+                        assert_eq!(app.playing, playing);
+                        assert_eq!(app.pad_progress, progress);
+                        assert_eq!(app.sound_status, status);
+                        assert!(app.capturing.is_none() && app.clip_loads.is_none() && egui::Popup::is_any_open(&ctx));
+                        let mut input = vec![key(held, false, egui::Modifiers::NONE), key(held, true, egui::Modifiers::NONE)];
+                        if held == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                        input.push(key(held, false, egui::Modifiers::NONE));
+                        draw_board_size(&mut app, &ctx, size, input);
+                        expected.sounds[1].starred = true;
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(expected).unwrap(), "a new press after release toggles the strip");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_a_clip_shortcut_keeps_the_menu_focus_and_other_settings() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [wav(dir.path(), "other.wav"), wav(dir.path(), "target.wav")];
+        let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        });
+        let key = |key, modifiers| [true, false].into_iter().map(|pressed| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers,
+        }).collect();
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.25, 1.5] {
+                    for action in ["Enter", "Space", "Invoke"] {
+                        let mut app = app_with(&paths);
+                        app.settings.sounds[0].hotkey = Some("Ctrl+Alt+F8".into());
+                        app.settings.sounds[1].hotkey = Some("Ctrl+Alt+Shift+PrintScreen".into());
+                        app.settings.sounds[1].volume = 0.43561;
+                        app.settings.sounds[1].start = 0.12345;
+                        app.settings.sounds[1].end = Some(0.812345);
+                        app.settings.sound_volume = 0.61347;
+                        for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                        let mut expected = app.settings.clone();
+                        expected.sounds[1].hotkey = None;
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        ctx.enable_accesskit();
+                        app.play_clip(0, &ctx);
+                        let playing = app.playing.clone();
+                        let progress = app.pad_progress.clone();
+                        let status = app.sound_status.clone();
+                        let size = egui::vec2(700.0, 420.0) / zoom;
+                        for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some("Play target")).map(|(id, _)| id).unwrap();
+                        draw_board_size(&mut app, &ctx, size, vec![focus(owner)]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        draw_board_size(&mut app, &ctx, size, key(egui::Key::F10, egui::Modifiers::SHIFT));
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let clear = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some("Clear")).map(|(id, _)| id).unwrap();
+                        draw_board_size(&mut app, &ctx, size, vec![focus(clear)]);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let events = if action == "Invoke" {
+                            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                action: Action::Click, target_tree: TreeId::ROOT, target_node: clear, data: None,
+                            })]
+                        } else { key(if action == "Enter" { egui::Key::Enter } else { egui::Key::Space }, egui::Modifiers::NONE) };
+                        draw_board_size(&mut app, &ctx, size, events);
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                        assert!(tree.nodes.iter().any(|(id, node)| *id == tree.focus && node.role() == Role::CheckBox
+                            && node.label() == Some("Show on the strip") && !node.is_disabled()),
+                            "clearing the shortcut leaves the next usable menu control focused: action={action}, zoom={zoom}, passes={passes}, focus={:?}", tree.focus);
+                        let bounds = tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1.bounds().unwrap();
+                        let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                        assert!(output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect)
+                            && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the next focused control is visible");
+                        assert!(egui::Popup::is_any_open(&ctx));
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap(),
+                            "clearing cannot also toggle the newly focused strip checkbox");
+                        assert_eq!(app.playing, playing);
+                        assert_eq!(app.pad_progress, progress);
+                        assert_eq!(app.sound_status, status);
+                        assert!(app.dirty_since.is_some() && app.capturing.is_none() && app.clip_loads.is_none());
+                        draw_board_size(&mut app, &ctx, size, key(egui::Key::Escape, egui::Modifiers::NONE));
+                        for _ in 0..8 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                        assert_eq!(draw_board_size(&mut app, &ctx, size, Vec::new()).platform_output.accesskit_update.unwrap().focus, owner,
+                            "Escape still returns to the menu's original pad");
+                        assert!(!egui::Popup::is_any_open(&ctx));
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                    }
+                }
             }
         }
     }
@@ -1332,12 +2654,175 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes capture input ownership screenshots; needs Python with Pillow"]
+    fn snapshot_soundboard_shortcut_input_ownership() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|i| wav(dir.path(), &format!("capture-input-{i}.wav"))).collect();
+        let (commands, _receiver) = crossbeam_channel::unbounded();
+        let mut manager = Some(crate::hotkeys::Hotkeys::new(&egui::Context::default(), commands).unwrap());
+        let key = |key, physical_key, pressed, modifiers| egui::Event::Key { key, physical_key, pressed, repeat: false, modifiers };
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            for zoom in [1.0, 1.25, 1.5] {
+                for (scene, role, saved) in [("search-saved", Role::TextInput, true), ("search-rejected", Role::TextInput, false),
+                    ("volume-saved", Role::Slider, true), ("volume-rejected", Role::Slider, false)]
+                {
+                    let mut app = app_with(&paths);
+                    app.hotkeys = manager.take();
+                    app.settings.sounds[11].name = Some("target".into());
+                    app.settings.sounds[11].starred = true;
+                    app.settings.sounds[11].hotkey = Some("Ctrl+Alt+P".into());
+                    app.settings.sounds[11].volume = 0.43561;
+                    app.settings.sounds[11].start = 0.12345;
+                    app.settings.sounds[11].end = Some(0.812345);
+                    app.settings.sound_volume = 0.61347;
+                    app.settings.strength = 0.71347;
+                    app.settings.highpass_hz = 132.456;
+                    app.pad_filter = "tar".into();
+                    let binding = super::super::Binding::Pad(paths[11].clone());
+                    app.start_capture(binding.clone());
+                    let mut expected = serde_json::to_value(&app.settings).unwrap();
+                    let (logical, physical, modifiers) = if role == Role::Slider {
+                        (egui::Key::ArrowRight, None, if saved { ctrl } else { egui::Modifiers::NONE })
+                    } else if saved { (egui::Key::A, Some(egui::Key::Q), egui::Modifiers { alt: true, ..ctrl }) }
+                    else { (egui::Key::T, Some(egui::Key::T), egui::Modifiers::NONE) };
+                    if saved { expected["sounds"][11]["hotkey"] = serde_json::json!(crate::hotkeys::combo(physical.unwrap_or(logical), modifiers).unwrap()); }
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    crate::widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for path in [&paths[0], &paths[11]] { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                    app.play_clip(0, &ctx);
+                    app.toggle_clip(0, &ctx);
+                    let playing = app.playing.clone();
+                    let progress = app.pad_progress.clone();
+                    let status = app.sound_status.clone();
+                    let size = egui::vec2(700.0, 420.0) / zoom;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)| {
+                        node.role() == role && if role == Role::TextInput { node.placeholder() == Some("Search clips") }
+                            else { node.numeric_value() == Some(f64::from(0.61347f32)) }
+                    }).map(|(id, _)| id).unwrap();
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+                    })]);
+                    events.extend(vec![Vec::new(); 8]);
+                    for _ in 0..4 {
+                        let mut input = vec![key(logical, physical, true, modifiers)];
+                        if role == Role::TextInput { input.push(egui::Event::Text(if saved { "@" } else { "t" }.into())); }
+                        events.push(input);
+                    }
+                    events.push(vec![key(logical, physical, false, modifiers)]);
+                    events.extend(vec![Vec::new(); 8]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("board-capture-input-{scene}-{}-{theme}", (zoom * 100.0) as u32), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(app.capturing.as_ref(), (!saved).then_some(&binding));
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+                    assert_eq!(app.pad_filter, "tar");
+                    assert_eq!(app.playing, playing);
+                    assert_eq!(app.pad_progress, progress);
+                    assert_eq!(app.sound_status, status);
+                    assert_eq!(app.dirty_since.is_some(), saved);
+                    manager = app.hotkeys.take();
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes clip-menu shortcut clearing screenshots; needs Python with Pillow"]
+    fn snapshot_clip_shortcut_clearing() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [wav(dir.path(), "other.wav"), wav(dir.path(), "target.wav")];
+        let focus = |target_node| vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        })];
+        let key = |key, modifiers| [true, false].into_iter().map(|pressed| egui::Event::Key {
+            key, physical_key: Some(key), pressed, repeat: false, modifiers,
+        }).collect();
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            for zoom in [1.0, 1.25, 1.5] {
+                for state in ["clear", "cleared"] {
+                    let mut app = app_with(&paths);
+                    app.settings.sounds[0].hotkey = Some("Ctrl+Alt+F8".into());
+                    app.settings.sounds[1].hotkey = Some("Ctrl+Alt+Shift+PrintScreen".into());
+                    app.settings.sounds[1].volume = 0.43561;
+                    app.settings.sounds[1].start = 0.12345;
+                    app.settings.sounds[1].end = Some(0.812345);
+                    app.settings.sound_volume = 0.61347;
+                    for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                    let mut expected = app.settings.clone();
+                    if state == "cleared" { expected.sounds[1].hotkey = None; }
+                    app.play_clip(0, &egui::Context::default());
+                    let playing = app.playing.clone();
+                    let progress = app.pad_progress.clone();
+                    let status = app.sound_status.clone();
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.enable_accesskit();
+                    let size = egui::vec2(700.0, 420.0) / zoom;
+                    for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.label() == Some("Play target")).map(|(id, _)| id).unwrap();
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(focus(owner));
+                    for _ in 0..8 { events.push(Vec::new()); }
+                    events.push(key(egui::Key::F10, egui::Modifiers::SHIFT));
+                    for _ in 0..8 { events.push(Vec::new()); }
+                    for input in &events { draw_board_size(&mut app, &ctx, size, input.clone()); }
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    let clear = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.label() == Some("Clear")).map(|(id, _)| id).unwrap();
+                    events.push(focus(clear));
+                    events.extend(vec![Vec::new(); 8]);
+                    if state == "cleared" {
+                        let held = if zoom == 1.25 { egui::Key::Space } else { egui::Key::Enter };
+                        let press = || egui::Event::Key { key: held, physical_key: Some(held),
+                            pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+                        events.push(vec![press()]);
+                        for _ in 0..3 {
+                            let mut input = vec![press()];
+                            if held == egui::Key::Space { input.push(egui::Event::Text(" ".into())); }
+                            events.push(input);
+                        }
+                        events.push(vec![egui::Event::Key { key: held, physical_key: Some(held),
+                            pressed: false, repeat: false, modifiers: egui::Modifiers::NONE }]);
+                    }
+                    events.extend(vec![Vec::new(); 8]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("board-shortcut-{state}-{}-{theme}", (zoom * 100.0) as u32), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(expected).unwrap());
+                    assert_eq!(app.playing, playing);
+                    assert_eq!(app.pad_progress, progress);
+                    assert_eq!(app.sound_status, status);
+                    assert_eq!(app.dirty_since.is_some(), state == "cleared");
+                    assert!(app.capturing.is_none() && app.clip_loads.is_none());
+                    assert_eq!(app.trim_clip.as_deref(), Some(paths[1].as_path()));
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "writes keyboard menu screenshots; needs Python with Pillow"]
     fn snapshot_soundboard_keyboard_menu() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
         let dir = tempfile::tempdir().unwrap();
         let path = wav(dir.path(), "target.wav");
-        let size = egui::vec2(700.0, 420.0);
-        for (dark, theme) in [(true, "dark"), (false, "light")] {
+        for (dark, theme, zoom, scale) in [
+            (true, "dark", 1.0, "standard"), (false, "light", 1.0, "standard"),
+            (true, "dark", 1.25, "medium"), (false, "light", 1.25, "medium"),
+            (true, "dark", 1.5, "zoomed"), (false, "light", 1.5, "zoomed"),
+        ] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
             for (caption, name, shortcut) in [
                 ("menu", "target", None),
                 ("long-menu", "Quarterly meeting — opening music and final countdown for stage announcements", Some("Ctrl+Alt+Shift+PrintScreen")),
@@ -1347,11 +2832,12 @@ mod tests {
                 app.settings.sounds[32].name = Some(name.into());
                 app.settings.sounds[32].hotkey = shortcut.map(str::to_owned);
                 app.settings.sounds[32].volume = 0.5;
-                app.settings.sounds[32].start = 0.15;
-                app.settings.sounds[32].end = Some(0.75);
+                app.settings.sounds[32].start = if shortcut.is_some() { 3.15 } else { 0.15 };
+                app.settings.sounds[32].end = Some(if shortcut.is_some() { 4.75 } else { 0.75 });
                 app.cache_clip(path.clone(), CachedClip::read(&path, &AtomicBool::new(false)).unwrap());
                 let original = app.settings.sounds.clone();
                 let ctx = egui::Context::default();
+                ctx.options_mut(|options| options.zoom_factor = zoom);
                 ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
                 ctx.enable_accesskit();
                 let output = draw_board_size(&mut app, &ctx, size, Vec::new());
@@ -1369,12 +2855,25 @@ mod tests {
                     if output.platform_output.accesskit_update.unwrap().focus == target { focused = true; break; }
                 }
                 assert!(focused);
-                events.extend(std::iter::repeat_n(Vec::new(), 6));
-                events.push(vec![egui::Event::Key {
+                for _ in 0..6 { draw_board_size(&mut app, &ctx, size, Vec::new()); events.push(Vec::new()); }
+                let open = vec![egui::Event::Key {
                     key: egui::Key::F10, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::SHIFT,
-                }]);
+                }];
+                draw_board_size(&mut app, &ctx, size, open.clone());
+                events.push(open);
+                for _ in 0..6 { draw_board_size(&mut app, &ctx, size, Vec::new()); events.push(Vec::new()); }
+                if shortcut.is_some() {
+                    let output = draw_board_size(&mut app, &ctx, size, Vec::new());
+                    events.push(Vec::new());
+                    let target_node = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.label() == Some("Remove from soundboard")).map(|(id, _)| id).unwrap();
+                    events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+                    })]);
+                    events.extend(std::iter::repeat_n(Vec::new(), 8));
+                }
                 let image = super::super::snapshot::snapshot_with_events(
-                    &mut app, &format!("board-keyboard-{caption}-{theme}"), size, 1.25, dark, events,
+                    &mut app, &format!("board-keyboard-{caption}-{scale}-{theme}"), size, zoom, dark, events,
                 );
                 println!("SNAPSHOT {}", image.display());
                 assert_eq!(app.settings.sounds, original);
@@ -1510,20 +3009,42 @@ mod tests {
 
     #[test]
     fn trim_menu_tab_navigation_reaches_only_named_usable_controls() {
-        use egui::accesskit::Role;
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
         let dir = tempfile::tempdir().unwrap();
         let path = wav(dir.path(), "trim.wav");
         let key = |key, modifiers| vec![egui::Event::Key {
             key, physical_key: None, pressed: true, repeat: false, modifiers,
         }];
-        let size = egui::vec2(700.0, 420.0);
-        for dark in [true, false] {
+        let visible = |output: &egui::FullOutput, size: egui::Vec2, zoom, passes, long| {
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            let node = &tree.nodes.iter().find(|(id, _)| *id == tree.focus).unwrap().1;
+            let bounds = node.bounds().unwrap();
+            let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+            // Native bounds and scroll clips can round to opposite pixel edges.
+            assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(rect)
+                && output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect) && match &shape.shape {
+                    egui::Shape::Rect(shape) => shape.rect.intersects(rect),
+                    egui::Shape::Text(shape) => shape.visual_bounding_rect().intersects(rect), _ => false,
+                }), "the focused {:?} fits at {zoom}; passes={passes}, long={long}: {rect:?}; paint/clip={:?}", node.label(),
+                output.shapes.iter().filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(paint) if paint.rect.intersects(rect) => Some((paint.rect, shape.clip_rect)), _ => None,
+                }).collect::<Vec<_>>());
+        };
+        for (dark, zoom, passes, long) in [true, false].into_iter().flat_map(|dark|
+            [1.0, 1.25, 1.5].into_iter().flat_map(move |zoom|
+                [1, 2].into_iter().flat_map(move |passes| [false, true].map(move |long| (dark, zoom, passes, long)))))
+        {
+            let size = egui::vec2(700.0, 420.0) / zoom;
             let mut app = app_with(std::slice::from_ref(&path));
-            app.settings.sounds[0].start = 0.12345;
-            app.settings.sounds[0].end = Some(0.812345);
+            app.settings.sounds[0].volume = 0.43561;
+            app.settings.sounds[0].start = if long { 3.12345 } else { 0.12345 };
+            app.settings.sounds[0].end = Some(if long { 4.812345 } else { 0.812345 });
+            if long { app.settings.sounds[0].hotkey = Some("Ctrl+Alt+Shift+PrintScreen".into()); }
             app.cache_clip(path.clone(), CachedClip::read(&path, &AtomicBool::new(false)).unwrap());
             let original = app.settings.sounds.clone();
             let ctx = egui::Context::default();
+            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
             ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
             ctx.enable_accesskit();
             let output = draw_board_size(&mut app, &ctx, size, Vec::new());
@@ -1541,6 +3062,7 @@ mod tests {
             let mut stops = Vec::new();
             let mut output = draw_board_size(&mut app, &ctx, size, Vec::new());
             for _ in 0..20 {
+                for _ in 0..6 { output = draw_board_size(&mut app, &ctx, size, Vec::new()); }
                 let tree = output.platform_output.accesskit_update.as_ref().unwrap();
                 let node = &tree.nodes.iter().find(|(id, _)| *id == tree.focus).expect("each Tab stop has an accessible control").1;
                 assert!(matches!(node.role(), Role::Slider | Role::SpinButton | Role::CheckBox | Role::Button),
@@ -1548,21 +3070,73 @@ mod tests {
                 let name = node.label().map(str::to_owned).or_else(|| node.labelled_by().iter().find_map(|label|
                     tree.nodes.iter().find(|(id, node)| id == label && node.role() == Role::Label)
                         .and_then(|(_, node)| node.value()).map(str::to_owned))).expect("each focused control identifies itself");
+                visible(&output, size, zoom, passes, long);
                 let last = name == "Remove from soundboard";
                 visited.push(name);
                 stops.push(tree.focus);
                 if last { break; }
                 output = draw_board_size(&mut app, &ctx, size, key(egui::Key::Tab, egui::Modifiers::NONE));
             }
-            assert_eq!(visited, ["Volume", "Volume", "Show on the strip", "Start", "End", "Reset", "Remove from soundboard"]);
-            for expected in stops.into_iter().rev().skip(1) {
+            let mut expected = vec!["Volume", "Volume"];
+            if long { expected.push("Clear"); }
+            expected.extend(["Show on the strip", "Start", "End", "Reset", "Remove from soundboard"]);
+            assert_eq!(visited, expected);
+            for &expected in stops.iter().rev().skip(1) {
                 draw_board_size(&mut app, &ctx, size, key(egui::Key::Tab, egui::Modifiers::SHIFT));
-                for _ in 0..3 { output = draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                for _ in 0..6 { output = draw_board_size(&mut app, &ctx, size, Vec::new()); }
                 assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, expected,
                     "Shift+Tab follows the same usable controls in reverse");
+                visible(&output, size, zoom, passes, long);
+            }
+            for target_node in stops {
+                draw_board_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+                })]);
+                for _ in 0..6 { output = draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, target_node);
+                visible(&output, size, zoom, passes, long);
+            }
+            let target = output.platform_output.accesskit_update.as_ref().unwrap().focus;
+            if long && zoom == 1.5 {
+                let bounds = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                let pos = egui::pos2((bounds.x0 + bounds.x1) as f32 * 0.5, (bounds.y0 + bounds.y1) as f32 * 0.5);
+                for delta in [1000.0, -1000.0] {
+                    draw_board_size(&mut app, &ctx, size, vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, delta),
+                            modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move },
+                    ]);
+                    for _ in 0..8 { output = draw_board_size(&mut app, &ctx, size, Vec::new()); }
+                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                    assert_eq!(tree.focus, target, "wheel scrolling keeps the menu's keyboard focus");
+                    let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                    assert_eq!(bounds.y1 <= f64::from(size.y), delta < 0.0,
+                        "wheel scrolling can move away from the focused action and back: {bounds:?}");
+                    if delta < 0.0 { visible(&output, size, zoom, passes, long); }
+                }
+            }
+            if long && zoom == 1.0 {
+                for next_zoom in [1.5, 1.25, 1.0] {
+                    ctx.options_mut(|options| options.zoom_factor = next_zoom);
+                    let next_size = egui::vec2(700.0, 420.0) / next_zoom;
+                    for _ in 0..8 { output = draw_board_size(&mut app, &ctx, next_size, Vec::new()); }
+                    assert!(egui::Popup::is_any_open(&ctx), "text resizing keeps the menu open");
+                    assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, target,
+                        "text resizing preserves the focused menu action");
+                    visible(&output, next_size, next_zoom, passes, long);
+                }
             }
             for _ in 0..3 { draw_board_size(&mut app, &ctx, size, Vec::new()); }
             assert_eq!(app.settings.sounds, original, "keyboard navigation preserves both endpoints exactly");
+            assert!(app.dirty_since.is_none() && app.playing.is_empty() && app.clip_loads.is_none());
+            draw_board_size(&mut app, &ctx, size, key(egui::Key::Escape, egui::Modifiers::NONE));
+            for _ in 0..6 { output = draw_board_size(&mut app, &ctx, size, Vec::new()); }
+            assert!(!egui::Popup::is_any_open(&ctx) && app.trim_clip.is_none());
+            assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, pad,
+                "Escape returns to the same pad after scrolling its menu");
+            visible(&output, size, zoom, passes, long);
+            assert_eq!(app.settings.sounds, original);
             assert!(app.dirty_since.is_none() && app.playing.is_empty() && app.clip_loads.is_none());
         }
     }

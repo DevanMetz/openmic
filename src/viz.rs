@@ -10,11 +10,13 @@ use crate::config::Settings;
 use crate::dsp::{self, Model, GATE_THRESHOLD_RANGE, HIGHPASS_HZ, HIGHPASS_RANGE, INPUT_GAIN_RANGE, OUTPUT_GAIN_RANGE, VOICE_THRESHOLD};
 use crate::engine::{ScopeFrame, SCOPE_FRAMES};
 use crate::gui::{AMBER, CYAN, GREEN, RED, VIOLET};
+use crate::widgets;
 
 const VOICE_RANGE: std::ops::RangeInclusive<f32> = 0.05..=0.95;
 /// The bottom of the level pictures, dBFS.
 const FLOOR_DB: f32 = -70.0;
 const PICTURE_HEIGHT: f32 = 34.0;
+const MIN_PICTURE_WIDTH: f32 = 80.0;
 const SWITCH_WIDTH: f32 = 30.0;
 const TITLE_WIDTH: f32 = 176.0;
 const VALUE_WIDTH: f32 = 92.0;
@@ -60,8 +62,11 @@ fn draw_row(ui: &mut egui::Ui, row: &Row, paint: impl FnOnce(&egui::Painter, Rec
     let mut link = false;
     let picture_id = ui.make_persistent_id(("voice-picture", row.id));
     let picture = ui
-        .horizontal(|ui| {
+        .horizontal_wrapped(|ui| {
             ui.set_min_height(PICTURE_HEIGHT + 10.0);
+            let row_width = ui.available_width();
+            let spacing = ui.spacing().item_spacing.x;
+            let stacked = row_width < SWITCH_WIDTH + TITLE_WIDTH + MIN_PICTURE_WIDTH + VALUE_WIDTH + 3.0 * spacing;
             // The switch, or a gap the same width.
             let sense = if row.on.is_some() { Sense::click() } else { Sense::hover() };
             let (rect, mut response) = ui.allocate_exact_size(Vec2::new(SWITCH_WIDTH, PICTURE_HEIGHT), sense);
@@ -78,21 +83,22 @@ fn draw_row(ui: &mut egui::Ui, row: &Row, paint: impl FnOnce(&egui::Painter, Rec
                 if response.has_focus() {
                     ui.painter().rect_stroke(rect, 5.0, Stroke::new(2.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
                 }
-                if response.gained_focus() {
-                    response.scroll_to_me(Some(egui::Align::Center));
-                }
+                widgets::scroll_on_focus(&response);
                 let response = response
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text(if on { "On: click to turn off" } else { "Off: click to turn on" });
                 response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, response.enabled(), on, row.title));
             }
             ui.vertical(|ui| {
-                ui.set_width(TITLE_WIDTH);
+                ui.set_width(TITLE_WIDTH.min((row_width - SWITCH_WIDTH - spacing).max(0.0)));
                 let title = RichText::new(row.title).strong();
                 ui.label(if active { title } else { title.weak() });
                 ui.label(RichText::new(row.explain).small().weak());
             });
-            let width = (ui.available_width() - VALUE_WIDTH - ui.spacing().item_spacing.x).max(80.0);
+            // Keep the picture and its value together on a second line when
+            // the window cannot fit the switch, title, picture and value.
+            let available = if stacked { row_width } else { ui.available_rect_before_wrap().width() };
+            let width = (available - VALUE_WIDTH - spacing).max(MIN_PICTURE_WIDTH);
             let (_, rect) = ui.allocate_space(Vec2::new(width, PICTURE_HEIGHT));
             let picture = ui.interact(rect, picture_id, Sense::click_and_drag()).on_hover_cursor(row.cursor);
             let painter = ui.painter_at(rect);
@@ -104,9 +110,7 @@ fn draw_row(ui: &mut egui::Ui, row: &Row, paint: impl FnOnce(&egui::Painter, Rec
             if picture.has_focus() {
                 painter.rect_stroke(rect, 5.0, Stroke::new(2.0, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
             }
-            if picture.gained_focus() {
-                picture.scroll_to_me(Some(egui::Align::Center));
-            }
+            widgets::scroll_on_focus(&picture);
             ui.vertical(|ui| {
                 ui.set_width(VALUE_WIDTH);
                 let value = RichText::new(&row.value).monospace();
@@ -115,9 +119,7 @@ fn draw_row(ui: &mut egui::Ui, row: &Row, paint: impl FnOnce(&egui::Painter, Rec
                     // egui's text selection overwrites the link's assistive role.
                     ui.style_mut().interaction.selectable_labels = false;
                     let response = ui.link(RichText::new(text).small()).on_hover_text("Switch the noise model");
-                    if response.gained_focus() {
-                        response.scroll_to_me(Some(egui::Align::Center));
-                    }
+                    widgets::scroll_on_focus(&response);
                     link = response.clicked();
                 }
             });
@@ -175,7 +177,10 @@ fn dashed(painter: &egui::Painter, rect: Rect, y: f32, color: Color32) {
 }
 
 fn idle(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) {
-    painter.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), color);
+    let mut job = egui::epaint::text::LayoutJob::simple_singleline(text.to_owned(), FontId::proportional(11.0), color);
+    job.wrap = egui::epaint::text::TextWrapping::truncate_at_width(rect.width());
+    let galley = painter.layout_job(job);
+    painter.galley(rect.center() - galley.size() * 0.5, galley, color);
 }
 
 /// Change `value` by a relative drag (up or right increases), `per_px` a pixel.

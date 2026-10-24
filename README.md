@@ -74,17 +74,25 @@ The **Get set up** checklist at the top of the **Voice** page walks through thes
 
 When the five seconds are up, **Finishing mic test…** shows while the WAV finishes and loads in the background. Microphone controls stay responsive, and the previous preview is kept if the new take fails. **Cancel test** discards the new test while recording or finishing so you can record again or listen to the previous preview.
 
+Use **Tab** or **Shift+Tab** to reach **Bypass**, the mic-test buttons and the previews. Controls wrap and scroll into view at larger text sizes. Cancelling returns focus to **Test my mic** or **Record again**, ready for another test.
+
 The defaults (DeepFilterNet 3, voice gate, rumble filter) aim to send only your voice.
 
 ## Devices that connect late
 
 OpenMic keeps saved microphone and monitor choices when they are missing at launch. With **Start processing automatically** enabled, or after you click **Start**, it waits for all selected devices to connect. The processed output returns to VB-Cable at launch whenever it is available. **Stop** cancels the wait; connecting a device afterwards does not restart processing. Use **Refresh** under **Routing** on the **Voice** page to replace a missing device with an available one.
 
+Holding **Enter** or **Space** on **Start**, **Stop**, **Mute** or **Unmute** changes the state once. Release and press again for another change. The same button keeps keyboard focus when its name changes, including while waiting for a device; focus stays visible when you resize, zoom or switch pages.
+
+When sidebar space is tight, navigation scrolls above the status panel. **Tab** and **Shift+Tab** reveal the focused page while the processing and mute buttons stay at the bottom.
+
+Routing selectors scroll into view with **Tab** and **Shift+Tab**, and stay within the window when you zoom. Long device names are shortened in the selectors and menus; hover to see the full name. Press **Enter** to open a focused selector, **Tab** to move between devices, and **Enter** to choose. **Escape** closes the menu without changing the route.
+
 If a device is unplugged while processing, OpenMic shows **reconnecting…** and starts again as soon as it is back; VB-Cable stays your default microphone meanwhile. **Stop** cancels the wait. Use **Refresh** if you want to select a different device or its name has changed. The headphone monitor only needs to be connected while **Headphone monitor** is on.
 
 ## Adjusting
 
-The **Voice** page lists each setting as a row, in the order your voice passes through them. Each row has its name, a short line saying what it does, a live picture of it working, and its value. Drag inside a picture to change the setting, scroll over it for fine steps, and double-click it to reset. **Tab** and **Shift+Tab** focus controls and scroll them into view. In a focused picture, **Up** or **Right** increases the value and **Down** or **Left** decreases it by the same fine step as scrolling; **Home** and **End** select its minimum and maximum. A switch turns a setting on or off; rows that are off are dimmed.
+The **Voice** page lists each setting as a row, in the order your voice passes through them. Each row has its name, a short line saying what it does, a live picture of it working, and its value. On narrow windows or at larger text sizes, the picture and value move below the name and switch. Drag inside a picture to change the setting, scroll over it for fine steps, and double-click it to reset. **Tab** and **Shift+Tab** focus controls and scroll them into view; resizing keeps the focused control visible. In a focused picture, **Up** or **Right** increases the value and **Down** or **Left** decreases it by the same fine step as scrolling; **Home** and **End** select its minimum and maximum. A switch turns a setting on or off; rows that are off are dimmed.
 
 | Row | What it does | Drag | Wheel step |
 |---|---|---|---|
@@ -98,9 +106,15 @@ The **Voice** page lists each setting as a row, in the order your voice passes t
 
 Pick a starting point from the preset chips above the rows (**Balanced**, **Mechanical keyboard**, **Quiet room**, **Noisy room**, **Low CPU**). **+** saves your current settings as a preset; right-click a saved one to delete it. Click the model name under **Remove noise** to switch between DeepFilterNet and RNNoise. **Bypass** skips noise reduction and both gates; input gain, the rumble filter, output gain and microphone mute still apply. OpenMic reopens at the size and place you left it.
 
+Preset chips scroll into view with **Tab** and **Shift+Tab** and keep focus when the window resizes. Long saved names shorten to one line; hover to read the full name. Focus **+** and press **Enter** or **Space** to name and save your current settings. **Enter** saves the name; **Escape** closes the menu and keeps your draft. Focus a saved preset and press **Shift+F10** to reach **Delete preset**; **Escape** returns to that preset.
+
+Keyboard saves and deletes keep **+** visible after the preset list changes. Holding **Enter** or **Space** opens, saves, or deletes once; release and press again for the next action. Saving or deleting with the mouse preserves where you scrolled.
+
 Settings are saved automatically using atomic file replacement, so an interrupted write leaves the previous settings intact. If saving fails, the status panel shows **Settings not saved · retrying…**; hover over it for details. OpenMic retries while it runs.
 
 If OpenMic cannot read its settings file at startup, it shows a recovery screen and keeps audio stopped. The file is protected from autosave and shutdown writes. Use **Open settings folder** to repair or restore it, or move it to a backup location to start fresh, then click **Retry loading**. A failed load does not silently replace your preferences with defaults or an older copy.
+
+Holding **Enter** or **Space** on **Retry loading** retries once. Release and press again after repairing the file. A failed keyboard retry keeps **Retry loading** visible; a successful one moves focus to **Start** or **Stop**. Moving focus, pressing **Escape**, or retrying with the mouse preserves your choice, and you can scroll to read long errors.
 
 ## Soundboard
 
@@ -108,17 +122,23 @@ Drop one or more audio files onto the main window from any page to add them to t
 
 Clips load in the background so microphone controls stay responsive. The Soundboard page shows import progress and **Cancel import**; cancellation keeps the pads already added. Drop more files or use **Add clips** while an import runs to add them to the queue. If search has focus, completed imports keep your query so you can continue typing.
 
+The pad grid uses fewer columns in narrow windows or at larger text sizes. Import, search and playback controls wrap and scroll into view with keyboard focus. Resizing keeps focus on the same clip or control and keeps the whole focused pad visible, including while you rename it. Tall clip menus scroll to reveal the focused control.
+
 Open the **Soundboard** page, click **Add clips**, then click a pad to play it. Click a playing pad to pause it; click again to resume from the same position. Strip pads work the same way; pad hotkeys trigger the clip from the beginning. **Stop clips** ends playback and clears paused clips. Each pad shows the clip's length and keeps its progress visible while paused. Drag a pad onto another to reorder the board; with more than nine clips, a search box filters them by name. **Tab** and **Shift+Tab** move between pad controls and scroll the focused pad into view. Click **☆ Add to strip** on a pad to put it on the strip; **★ On strip** removes it again. Right-click a pad, or focus any of its controls and press **Shift+F10**, to set its own volume, a hotkey, or its trim: drag the start or end on the waveform (or type them) to play only part of the clip. The keyboard menu starts at the volume slider; **Tab** moves between its controls, and **Escape** returns to the pad. Trimming doesn't change the file. Use the × on a pad to remove it from the board; the audio file stays on disk. **Clip volume** affects the whole soundboard. Turn on **Let clips overlap** to layer pads instead of each one replacing the last (up to 16 at once). Clips are mixed into the same processed output Discord receives, and route changes preserve their playheads and paused state. **Mute** silences your voice without silencing the soundboard. Recording has its own **Record** page.
+
+Removing a clip with the keyboard moves focus to the next visible pad, or the previous pad when the last visible one is removed. If no clips match the search, focus returns to search; removing the last clip focuses **Add your first clips**.
 
 Click a volume's percentage, or focus it with **Tab**, to type a value from 0 to 100. For example, `50` and `50%` both set half volume. Changes apply to playing clips immediately. **Tab** and **Shift+Tab** scroll focused playback controls into view on short screens.
 
-Hover over a pad's name and click it to rename it. Press **Enter** or click elsewhere to save, or **Escape** to cancel. The display name is saved for the board, search and strip; the audio file keeps its original name. Leaving the name blank restores the filename label.
+Click a pad's name to rename it, or focus the name with **Tab** and press **Enter** or **Space**. Holding the opening key opens the editor once; release before pressing again to edit or save. Press **Enter** or click elsewhere to save, or **Escape** to cancel. Saving or cancelling with the keyboard returns focus to the name; if saving hides the clip from the current search, focus returns to search. The display name is saved for the board, search and strip; the audio file keeps its original name. Leaving the name blank restores the filename label.
 
 If you edit a clip's audio file outside OpenMic, the next time you start the pad or open its trim controls, OpenMic reloads the audio and updates its duration and waveform.
 
 Editing a pad's trim or source file leaves its current playback intact. Playing and paused pads show the duration of their loaded selection. Restarting the pad applies the latest trim and reloads any changed audio.
 
-The strip highlights playing pads in green and paused pads in amber. Hover a pad for its current action. When more pads are starred than fit, scroll over the pads with the mouse wheel or a horizontal touchpad gesture; **Tab** also scrolls the focused pad into view. The microphone and expand button stay in place. Right-click a strip pad, or focus it and press **Shift+F10**, to open the Soundboard and scroll to that pad for its controls and full error details. A paused clip can resume its loaded audio even if the source file has become unavailable.
+The strip highlights playing pads in green and paused pads in amber. Long names shorten to fit; hover a pad for its full name and current action. When more pads are starred than fit, scroll over the pads with the mouse wheel or a horizontal touchpad gesture. **Tab** and **Shift+Tab** move from the microphone through the pads, preset and expand button; **Enter** or **Space** activates the focused control. Focused controls show an outline. Focusing a pad or resizing its area scrolls it into view. The microphone and expand button stay in place. Right-click a strip pad, or focus it and press **Shift+F10**, to open the Soundboard and scroll to that pad for its controls and full error details. A paused clip can resume its loaded audio even if the source file has become unavailable.
+
+Hover details appear above or below the strip and stay within the screen without taking keyboard focus. Screen readers can read the full name, action and error without hovering.
 
 Trim waveforms load in the background, including while OpenMic is stopped. The menu shows **Loading waveform…** until the controls are ready, or **Retry waveform** if the file could not be read. Opening the menu preserves the saved trim and never starts playback. If an edited file is shorter than the saved points, the menu shows those points and offers **Reset** to use the full current clip. Closing it cancels an unfinished preview unless the pad is also waiting to play.
 
@@ -128,7 +148,11 @@ To make a clip, choose **Microphone** (the selected raw mic) or **Computer audio
 
 The **Device** line shows the device opened for the current recording and keeps that name with the finished take. Changing microphone routing or the Windows default device applies to the next recording.
 
+**Tab** and **Shift+Tab** move between recording controls and scroll them into view. Controls wrap when you zoom the interface, and long output-device names are shortened with the full name on hover. In the output-device selector, **Enter** opens the menu, **Tab** moves between devices, **Enter** chooses one, and **Escape** closes it without changing the device.
+
 **Stop recording** stops capture and finishes the WAV in the background. The Record page shows **Finishing** while the disk writer drains the remaining audio; microphone controls stay responsive. Wait for **Take ready** before saving or adding it to the soundboard.
+
+Stopping with the keyboard keeps focus on the finishing status, then moves to **Name** when your take is ready or **Record** if it is empty. Holding **Enter** or **Space** leaves the ready name and controls unchanged; release before the next action. Moving focus or changing pages while the take finishes preserves your new focus.
 
 If writing a recording fails, OpenMic stops and reports the error. When possible, it recovers the complete audio frames already on disk so you can save the partial take; a recovered take carries a warning. Capture failures are reported even if the take is empty.
 
@@ -136,11 +160,19 @@ Saving a take replaces an existing WAV only after the new file is complete, incl
 
 **Save WAV** and **Add to soundboard** save in the background, so microphone controls stay responsive even when copying a long take to another drive. The Record page shows **Saving** until the file is ready. A take added to the soundboard keeps an active search query so you can continue typing. If you quit during a save, OpenMic waits for it to finish; a failed save keeps the window and take open for retry.
 
+Keyboard saves move focus to the saving status, then return to **Record** when the save succeeds or to the save control when it fails. Discarding a take with the keyboard also returns to **Record**. Holding **Enter** or **Space** performs the action once; release before starting another recording. Moving focus or changing pages during a save preserves your new focus.
+
 If you quit with a recording running or a take still unsaved, OpenMic asks whether to return to it or discard it and quit. Discarding stops capture and removes the temporary WAV without waiting for its writer to drain. Closing to the notification area keeps the recording available without asking.
 
 ## Hotkeys and the notification area
 
 Set shortcuts for **Mute mic**, **Bypass processing**, **Stop all clips** and **Speech to text** on the **Settings** page, and for each pad from its right-click menu. Click **Set…**, then press the combination; Esc cancels. Shortcuts need Ctrl or Alt so they can't swallow ordinary typing, except the spare keys F13–F24 that macro pads and stream decks send. A shortcut given to a new action is taken from its old one. If another app already owns a combination, the Settings page says so.
+
+Shortcut controls wrap within narrow windows and scroll into view with **Tab** and **Shift+Tab**. Long combinations shorten to one line; hover to read the full shortcut. Focus **Set…** and press **Enter** or **Space** to capture a combination; **Escape** cancels and returns to that control. **Clear** removes the chosen shortcut and keeps keyboard navigation usable even when global shortcuts are unavailable. Holding **Enter** or **Space** while clearing changes only that binding; release and press again to activate the next control. In a clip menu, **Clear** moves keyboard focus to **Show on the strip**.
+
+Holding **Enter** or **Space** on **Set…** opens capture once. Release that key before using it in the new combination; you can enter the combination immediately after activating **Set…**. If a key is rejected, you can immediately try another combination or press **Escape** to cancel. After saving or cancelling, release a captured key before using it to activate another control. Choosing **Set…** from a clip's keyboard menu returns focus to the pad. Capture preserves text, selected words, volume and keyboard focus, including when you use arrow keys, clipboard shortcuts or an input method. **Enter** or **Space** activates **Cancel** when that button is focused. **Escape** cancels and keeps the pad focused.
+
+Focused settings stay visible when you resize the window. Clicking **Cancel** or **Clear** in a shortcut row keeps the page where you scrolled.
 
 Closing the window hides OpenMic to the notification area, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
 
@@ -148,9 +180,17 @@ Closing the window hides OpenMic to the notification area, where processing and 
 
 OpenMic checks GitHub Releases once a day. To check right away, click the version number at the top of the sidebar. When there's a newer version, the top of the window shows **vX.Y.Z available**: click **What's new** to read the release notes, then **Update** and **Restart to update**. OpenMic checks the download against the release's SHA-256 checksum and its Ed25519 signature (made by the release workflow's private key; the public key is built into OpenMic, so a tampered release is refused), replaces its executable in place (so shortcuts and **Start with Windows** keep working), and opens again as the new version. Nothing installs until you click, so an update never interrupts a call. Untick **Check for updates daily** on the **Settings** page to stop the daily check. If OpenMic's folder isn't writable (for example under Program Files), download the new version from the releases page instead.
 
+Keyboard update actions run once while **Enter** or **Space** is held; release before the next action. **Update** and **Retry update** move focus to **Cancel**, then to the next update action when downloading finishes. Cancelling or blocking a restart returns focus to the version number. Installation errors focus **Dismiss**, then return to **Restart to update**. Moving focus or changing pages during a download preserves your choice.
+
+Opening **What's new** with the keyboard moves focus into the notes window. Use **Page Up**, **Page Down**, **Home** or **End** to scroll while a control in that window has focus. **Close** or **Escape** returns focus to **What's new**, or to the version number if the update has moved on.
+
+Links and folder buttons also open once while **Enter** or **Space** is held, including **Releases page**, **Get VB-Cable**, **Open log folder** and **Open settings folder**. Release and press again to open another window.
+
 ## Speech to text
 
 On the **Dictation** page, pick a model under **Speech to text** and click **Download** (once; English-only Tiny, Base or Small, or Base and Small for any language). Then set its **Shortcut** at the top of the page. Hold it while you speak and let go: OpenMic transcribes what your selected microphone heard and types it into the app you're using, such as Discord's message box. Choose **Press to start, again to stop** for longer dictation (it stops by itself after 5 minutes). Transcription runs on your PC; the last result can be copied from the Dictation page, including when typing into the target app fails. Apps running as administrator don't accept typed text from OpenMic.
+
+Starting **Download** with the keyboard moves focus to **Cancel**. Cancelling, finishing a download or using **Remove** returns focus to the model selector. Holding **Enter** or **Space** performs the action once; release before taking the next action. Moving focus, changing pages or choosing the next model during a download preserves your choice. If dictation makes a focused **Remove** button unavailable, focus returns to the model selector.
 
 When dictation stops, **Finishing recording…** shows while the WAV writer drains its remaining audio in the background. The next take can start once this finishes, or immediately after you discard it.
 
@@ -158,7 +198,9 @@ While listening or finishing a take, **Discard recording** on the Dictation page
 
 After recording, **Cancel transcription** discards the current transcription and any queued takes before they type. OpenMic shows **Cancelling transcription…** until the worker finishes its current model step. The previous transcript stays available to copy, and new recordings can be transcribed normally.
 
-**Tab** and **Shift+Tab** scroll focused Dictation controls into view on short screens. Shortcut warnings and new recordings preserve keyboard focus, and background status changes preserve your transcript selection.
+Keyboard cancellation keeps focus on the progress status until transcription stops, then moves to **Copy**, or the model selector if there is no previous transcript. Activating **Discard recording** from the keyboard returns focus to the same controls. Release **Enter** or **Space** before taking the next action. Moving focus or changing pages while cancellation finishes preserves your choice.
+
+**Tab** and **Shift+Tab** scroll focused Dictation controls into view on short screens. In the model selector, **Enter** opens the menu, **Tab** moves between models, **Enter** chooses one, and **Escape** closes it without changing the model. Choosing a model returns focus to the selector. Shortcut warnings and new recordings preserve keyboard focus, and background status changes preserve your transcript selection.
 
 Quitting cancels pending transcription and model downloads immediately. Closing to the notification area keeps them running.
 

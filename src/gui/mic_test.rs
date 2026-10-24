@@ -57,6 +57,8 @@ pub(super) struct MicTest {
     cleaning: Option<Cleaning>,
     player: Option<(Player, Version)>,
     status: Option<Status>,
+    /// Focus recording after cancellation; keyboard input also reveals it.
+    record_focus: Option<bool>,
 }
 
 impl MicTest {
@@ -306,9 +308,9 @@ impl App {
         }
     }
 
-    /// The test's controls: one row.
+    /// The test's controls wrap to fit the current window width.
     pub(super) fn draw_mic_test(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if let Some((recorder, started)) = &self.mic_test.recording {
                 if recorder.is_stopping() {
                     ui.spinner();
@@ -318,27 +320,31 @@ impl App {
                 }
             } else if self.mic_test.loading.is_some() {
                 ui.spinner();
-            } else if ui
-                .button(if self.mic_test.raw.is_some() { "Record again" } else { "Test my mic" })
-                .on_hover_text("Record 5 seconds, then hear it raw and cleaned on your headphones or speakers")
-                .clicked()
-            {
-                self.start_mic_test();
+            } else {
+                let record = ui.button(if self.mic_test.raw.is_some() { "Record again" } else { "Test my mic" })
+                    .on_hover_text("Record 5 seconds, then hear it raw and cleaned on your headphones or speakers");
+                let reveal = self.mic_test.record_focus.take();
+                if reveal.is_some() { record.request_focus(); }
+                if reveal != Some(false) { widgets::scroll_on_focus(&record); }
+                if record.clicked() { self.start_mic_test(); }
             }
-            if self.mic_test.recording() && ui.small_button("Cancel test")
-                .on_hover_text("Discard this mic test; keep the previous preview")
-                .clicked()
-            {
-                self.cancel_mic_test();
+            if self.mic_test.recording() {
+                let cancel = ui.small_button("Cancel test").on_hover_text("Discard this mic test; keep the previous preview");
+                widgets::scroll_on_focus(&cancel);
+                if cancel.clicked() {
+                    self.cancel_mic_test();
+                    self.mic_test.record_focus = Some(ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released()));
+                    ui.ctx().request_repaint();
+                }
             }
             if self.mic_test.raw.is_some() && !self.mic_test.recording() {
                 for (version, label) in [(Version::Raw, "⏵ Raw"), (Version::Cleaned, "⏵ Cleaned")] {
                     let playing = self.mic_test.player.as_ref().is_some_and(|(_, v)| *v == version)
                         || (version == Version::Cleaned && self.mic_test.cleaning.as_ref().is_some_and(|cleaning| cleaning.then_play));
-                    if ui.selectable_label(playing, label)
-                        .on_hover_text(if playing { "Stop preview" } else { "Play preview" })
-                        .clicked()
-                    {
+                    let preview = ui.selectable_label(playing, label)
+                        .on_hover_text(if playing { "Stop preview" } else { "Play preview" });
+                    widgets::scroll_on_focus(&preview);
+                    if preview.clicked() {
                         if playing {
                             self.stop_test();
                             self.mic_test.status = Some(("Playback stopped".into(), MUTED));
@@ -371,6 +377,306 @@ mod tests {
         let (done, job) = crossbeam_channel::bounded(1);
         app.mic_test.cleaning = Some(Cleaning { result: job, raw, params, then_play, report_status: true });
         done
+    }
+
+    fn draw_mic_frame(app: &mut App, ctx: &egui::Context, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
+        use eframe::App as _;
+        let mut frame = eframe::Frame::_new_kittest();
+        ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
+        }, |ui| app.ui(ui, &mut frame))
+    }
+
+    fn mic_preview_app() -> App {
+        let mut app = App::stopped(Settings::default());
+        app.settings.setup.dismissed = true;
+        app.settings.microphone = "Test microphone".into();
+        app.settings.output = "CABLE Input (VB-Audio Virtual Cable)".into();
+        app.inputs = vec![app.settings.microphone.clone()];
+        app.outputs = vec![app.settings.output.clone(), "Headphones".into()];
+        app.mic_test.raw = Some(Arc::new(vec![0.1; 480]));
+        app.mic_test.cleaned = Some((Arc::new(vec![0.05; 480]), app.test_params(), ModelState::DeepFilter));
+        app
+    }
+
+    #[test]
+    fn mic_test_controls_fit_and_scroll_into_view_at_zoom() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let size = egui::vec2(700.0, 420.0) / 1.5;
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for assistive in [false, true] {
+                    for stage in ["idle", "ready", "cleanup", "recording", "finishing", "loading"] {
+                        let mut app = App::stopped(Settings::default());
+                        app.settings.setup.dismissed = true;
+                        app.settings.microphone = "Test microphone".into();
+                        app.settings.output = "CABLE Input (VB-Audio Virtual Cable)".into();
+                        app.inputs = vec![app.settings.microphone.clone()];
+                        app.outputs = vec![app.settings.output.clone(), "Headphones".into()];
+                        let raw = Arc::new(vec![0.1; 480]);
+                        let cleaned = Arc::new(vec![0.05; 480]);
+                        if stage != "idle" {
+                            app.mic_test.raw = Some(Arc::clone(&raw));
+                            app.mic_test.cleaned = Some((Arc::clone(&cleaned), app.test_params(), ModelState::DeepFilter));
+                        }
+                        let (_done, job) = crossbeam_channel::bounded(1);
+                        let (_loaded, load) = crossbeam_channel::bounded(1);
+                        match stage {
+                            "cleanup" => app.mic_test.cleaning = Some(Cleaning { result: job, raw: Arc::clone(&raw),
+                                params: app.test_params(), then_play: false, report_status: true }),
+                            "recording" | "finishing" => {
+                                let mut recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+                                if stage == "finishing" { recorder.stop_capture(); }
+                                app.mic_test.recording = Some((recorder, Instant::now()));
+                            }
+                            "loading" => app.mic_test.loading = Some(Loading { result: load, cancel: Arc::new(AtomicBool::new(false)) }),
+                            _ => {}
+                        }
+                        app.mic_test.status = Some(("Compare Raw and Cleaned, then change your settings and listen again.".into(), MUTED));
+                        let original = serde_json::to_value(&app.settings).unwrap();
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        widgets::configure_text_styles(&ctx);
+                        ctx.enable_accesskit();
+                        for _ in 0..3 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                        let labels: &[&str] = match stage {
+                            "idle" => &["Bypass", "Test my mic"],
+                            "ready" | "cleanup" => &["Bypass", "Record again", "⏵ Raw", "⏵ Cleaned"],
+                            _ => &["Bypass", "Cancel test"],
+                        };
+                        for &label in labels {
+                            let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                            let target = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                                matches!(node.role(), Role::Button | Role::CheckBox) && node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                            let key = |modifiers| egui::Event::Key {
+                                key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers,
+                            };
+                            if assistive {
+                                draw_mic_frame(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: target, data: None,
+                                })]);
+                            } else {
+                                let mut reached = false;
+                                for _ in 0..80 {
+                                    let output = draw_mic_frame(&mut app, &ctx, size, vec![key(egui::Modifiers::NONE)]);
+                                    if output.platform_output.accesskit_update.unwrap().focus == target { reached = true; break; }
+                                }
+                                assert!(reached, "Tab reaches {label} during {stage}");
+                            }
+                            for modifiers in [None, Some(egui::Modifiers::SHIFT), Some(egui::Modifiers::NONE)] {
+                                if let Some(modifiers) = modifiers { draw_mic_frame(&mut app, &ctx, size, vec![key(modifiers)]); }
+                                for _ in 0..8 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                            }
+                            let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                            assert_eq!(tree.focus, target);
+                            let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                            let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                                egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                            assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                                && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))),
+                                "{label} is visible during {stage}; passes={passes}, assistive={assistive}: {rect:?}");
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                            assert!(app.dirty_since.is_none() && app.mic_test.player.is_none());
+                            if stage != "idle" {
+                                assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                                assert!(Arc::ptr_eq(&app.mic_test.cleaned.as_ref().unwrap().0, &cleaned));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_mic_test_returns_focus_to_record_without_playing_the_preview() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let size = egui::vec2(700.0, 420.0) / 1.5;
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for activation in ["keyboard", "assistive", "pointer"] {
+                    let mut app = App::stopped(Settings::default());
+                    app.settings.setup.dismissed = true;
+                    app.settings.output = "CABLE Input (VB-Audio Virtual Cable)".into();
+                    app.outputs = vec![app.settings.output.clone()];
+                    let raw = Arc::new(vec![0.1; 480]);
+                    app.mic_test.raw = Some(Arc::clone(&raw));
+                    let (loaded, result) = crossbeam_channel::bounded(1);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    app.mic_test.loading = Some(Loading { result, cancel: Arc::clone(&cancel) });
+                    let original = serde_json::to_value(&app.settings).unwrap();
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                    let target = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.role() == Role::Button && node.label() == Some("Cancel test")).map(|(id, _)| id).unwrap();
+                    let action = |action| egui::Event::AccessKitActionRequest(ActionRequest {
+                        action, target_tree: TreeId::ROOT, target_node: target, data: None,
+                    });
+                    draw_mic_frame(&mut app, &ctx, size, vec![action(Action::Focus)]);
+                    for _ in 0..8 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                    let routing_position = |output: &egui::FullOutput| output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                        .find(|(_, node)| node.role() == Role::Label && node.value() == Some("ROUTING")).unwrap().1.bounds().unwrap().y0;
+                    let before = routing_position(&draw_mic_frame(&mut app, &ctx, size, Vec::new()));
+                    if activation == "pointer" {
+                        let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                        let bounds = output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                        let pos = egui::pos2((bounds.x0 + bounds.x1) as f32 * 0.5, (bounds.y0 + bounds.y1) as f32 * 0.5);
+                        for pressed in [true, false] {
+                            draw_mic_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                            }]);
+                        }
+                    } else {
+                        let event = if activation == "assistive" { action(Action::Click) } else { egui::Event::Key {
+                            key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                        } };
+                        draw_mic_frame(&mut app, &ctx, size, vec![event]);
+                    }
+                    for _ in 0..8 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                    if activation == "pointer" { assert_eq!(routing_position(&output), before, "mouse cancellation keeps the page's scroll position"); }
+                    let tree = output.platform_output.accesskit_update.unwrap();
+                    let record = *tree.nodes.iter().find(|(_, node)| node.role() == Role::Button && node.label() == Some("Record again"))
+                        .map(|(id, _)| id).unwrap();
+                    assert_eq!(tree.focus, record, "{activation} cancellation returns focus to recording; passes={passes}");
+                    assert!(cancel.load(Ordering::Relaxed));
+                    assert!(loaded.send(Ok(Some(vec![0.9; 480]))).is_err());
+                    assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                    assert!(!app.mic_test.busy() && app.mic_test.player.is_none());
+                    assert_eq!(app.mic_test.status, Some(("Mic test cancelled".into(), MUTED)));
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                    assert!(app.dirty_since.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mic_preview_focus_survives_cleanup_and_page_changes() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let size = egui::vec2(700.0, 420.0) / 1.5;
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for scene in ["cleanup result", "checklist completion", "preset added"] {
+                    for label in ["Bypass", "Record again", "⏵ Raw", "⏵ Cleaned"] {
+                        let mut app = mic_preview_app();
+                        app.settings.setup.dismissed = false;
+                        let raw = Arc::clone(app.mic_test.raw.as_ref().unwrap());
+                        let done = pending_cleanup(&mut app, false);
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = 1.5; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        widgets::configure_text_styles(&ctx);
+                        ctx.enable_accesskit();
+                        for _ in 0..3 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                        let target = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| matches!(node.role(), Role::Button | Role::CheckBox) && node.label() == Some(label))
+                            .map(|(id, _)| id).unwrap();
+                        draw_mic_frame(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                            action: Action::Focus, target_tree: TreeId::ROOT, target_node: target, data: None,
+                        })]);
+                        for _ in 0..8 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                        match scene {
+                            "cleanup result" => {
+                                done.send((vec![0.05; 480], ModelState::DeepFilterFailed)).unwrap();
+                                app.poll_mic_test();
+                            }
+                            "checklist completion" => { app.settings.setup.discord = true; app.settings.setup.tested = true; }
+                            "preset added" => app.settings.presets.push(crate::config::Preset {
+                                name: "Desk".into(), processing: app.settings.processing(),
+                            }),
+                            _ => unreachable!(),
+                        }
+                        let original = serde_json::to_value(&app.settings).unwrap();
+                        for _ in 0..8 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                        let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                        assert_eq!(tree.focus, target, "{label} keeps focus after {scene}; passes={passes}");
+                        assert!(tree.nodes.iter().any(|(id, node)| *id == target && node.label() == Some(label)));
+                        assert!(Arc::ptr_eq(app.mic_test.raw.as_ref().unwrap(), &raw));
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                        assert!(app.dirty_since.is_none() && app.mic_test.player.is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes mic-test focus screenshots; needs Python with Pillow"]
+    fn snapshot_mic_test_keyboard_focus() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for (zoom, scale) in [(1.0, "standard"), (1.5, "zoomed")] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for (dark, theme) in [(true, "dark"), (false, "light")] {
+                for (stage, label) in [
+                    ("idle", "Test my mic"), ("raw", "⏵ Raw"), ("pending", "⏵ Cleaned"),
+                    ("no-cable", "Record again"), ("custom-output", "Record again"),
+                    ("recording", "Cancel test"), ("finishing", "Cancel test"),
+                    ("loading", "Cancel test"), ("cancelled", "Cancel test"),
+                ] {
+                    let mut app = mic_preview_app();
+                    let (_done, result) = crossbeam_channel::bounded(1);
+                    let (_loaded, load) = crossbeam_channel::bounded(1);
+                    app.mic_test.status = Some(("Now compare: Raw, then Cleaned".into(), GREEN));
+                    match stage {
+                        "idle" => { app.mic_test.raw = None; app.mic_test.cleaned = None; app.mic_test.status = None; }
+                        "no-cable" => app.outputs = vec!["Headphones".into()],
+                        "custom-output" => app.settings.output = "Headphones".into(),
+                        "pending" => {
+                            app.mic_test.cleaning = Some(Cleaning { result, raw: Arc::clone(app.mic_test.raw.as_ref().unwrap()),
+                                params: app.test_params(), then_play: true, report_status: true });
+                            app.mic_test.status = Some(("Applying your settings…".into(), CYAN));
+                        }
+                        "recording" | "finishing" => {
+                            let mut recorder = Recorder::from_samples_for_test(&[0.25; 480]);
+                            if stage == "finishing" { recorder.stop_capture(); }
+                            app.mic_test.recording = Some((recorder, Instant::now()));
+                            app.mic_test.status = Some(if stage == "finishing" {
+                                ("Finishing mic test…".into(), CYAN)
+                            } else { ("Speak normally…".into(), AMBER) });
+                        }
+                        "loading" | "cancelled" => {
+                            app.mic_test.loading = Some(Loading { result: load, cancel: Arc::new(AtomicBool::new(false)) });
+                            app.mic_test.status = Some(("Finishing mic test…".into(), CYAN));
+                        }
+                        _ => {}
+                    }
+                    let original = serde_json::to_value(&app.settings).unwrap();
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { draw_mic_frame(&mut app, &ctx, size, Vec::new()); }
+                    let output = draw_mic_frame(&mut app, &ctx, size, Vec::new());
+                    let target = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.role() == Role::Button && node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                    let action = |action| egui::Event::AccessKitActionRequest(ActionRequest {
+                        action, target_tree: TreeId::ROOT, target_node: target, data: None,
+                    });
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(vec![action(Action::Focus)]);
+                    events.extend(vec![Vec::new(); 8]);
+                    if stage == "cancelled" { events.push(vec![action(Action::Click)]); }
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("mic-test-keyboard-{stage}-{scale}-{theme}"), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                    assert!(app.dirty_since.is_none() && app.mic_test.player.is_none());
+                }
+            }
+        }
     }
 
     #[test]

@@ -53,6 +53,19 @@ enum RecordingDestination {
     Soundboard(String),
 }
 
+pub(super) fn focus_soundboard_control(ctx: &egui::Context, target: egui::Id) {
+    widgets::finish_keyboard_activation(ctx);
+    ctx.memory_mut(|memory| memory.request_focus(target));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("soundboard-focus-reveal"), target));
+    ctx.request_repaint();
+}
+
+fn add_clips_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("soundboard-add")), |ui| {
+        ui.add(egui::Button::new(RichText::new(label).color(Color32::BLACK)).fill(CYAN))
+    }).inner
+}
+
 impl App {
     pub(super) fn reveal_pad(&mut self, index: usize, ctx: &egui::Context) {
         if self.quitting { return; }
@@ -119,6 +132,8 @@ impl App {
                 })
             })
         } else { Vec::new() };
+        // Preserve deferred typing before consuming the action opening the editor.
+        if first_frame { widgets::finish_keyboard_activation(ui.ctx()); }
         let response = ui.place(
             rect,
             egui::TextEdit::singleline(&mut edit.text)
@@ -139,12 +154,21 @@ impl App {
             // arrived in the same batch as the action opening this editor.
             super::defer_keyboard_input(ui, Some(response.id), pending);
         }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if cancel || (!first_frame && (response.lost_focus() || enter)) {
+            let restore = ui.input(|input| input.focused && (cancel || enter)
+                && !input.pointer.any_down() && !input.pointer.any_released())
+                && (response.has_focus() || (response.lost_focus() && ui.memory(|memory| memory.focused()).is_none()));
             response.surrender_focus();
-            self.finish_pad_rename(false);
-        } else if !first_frame && (response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-            response.surrender_focus();
-            self.finish_pad_rename(true);
+            self.finish_pad_rename(!cancel);
+            if restore {
+                let filter = self.pad_filter.trim().to_lowercase();
+                let hidden = self.settings.sounds.len() > SEARCH_FROM && self.settings.sounds.iter()
+                    .find(|pad| pad.path == path).is_some_and(|pad| !pad.display_name().to_lowercase().contains(&filter));
+                let target = if hidden { egui::Id::new("soundboard-search") } else { ui.id().with(("sound_name", path)) };
+                focus_soundboard_control(ui.ctx(), target);
+            }
         }
     }
 
@@ -426,6 +450,19 @@ impl App {
             Ok(_) => {
                 self.recording_save = Some(RecordingSave { job, add_to_board });
                 self.record_status = ("Saving recording…".into(), CYAN);
+                if self.page == super::Page::Record
+                    && ctx.input(|input| input.focused && !input.pointer.any_down() && !input.pointer.any_released())
+                    && let Some(owner) = ctx.memory(|memory| memory.focused())
+                    && let Some((controls, status)) = ctx.data(|data|
+                        data.get_temp::<(Vec<egui::Id>, egui::Id)>(egui::Id::new("recording-controls")))
+                    && controls.contains(&owner)
+                {
+                    ctx.data_mut(|data| {
+                        data.insert_temp(egui::Id::new("recording-save-return"), owner);
+                        data.insert_temp(egui::Id::new("recording-next-focus"), (owner, Some(status)));
+                    });
+                    ctx.request_repaint();
+                }
             }
             Err(error) => self.record_status = (format!("Could not start saving: {error}"), RED),
         }
@@ -439,6 +476,21 @@ impl App {
             Err(TryRecvError::Disconnected) => Err(anyhow::anyhow!("Recording save stopped unexpectedly; try again")),
         };
         let add_to_board = save.add_to_board;
+        let controls = ctx.data(|data| data.get_temp::<(Vec<egui::Id>, egui::Id)>(egui::Id::new("recording-controls")));
+        let (return_focus, pending_focus) = ctx.data_mut(|data| {
+            let return_focus = data.get_temp::<egui::Id>(egui::Id::new("recording-save-return"));
+            let pending_focus = data.get_temp::<(egui::Id, Option<egui::Id>)>(egui::Id::new("recording-next-focus"));
+            data.remove::<egui::Id>(egui::Id::new("recording-save-return"));
+            data.remove::<(egui::Id, Option<egui::Id>)>(egui::Id::new("recording-next-focus"));
+            (return_focus, pending_focus)
+        });
+        let focused = ctx.memory(|memory| memory.focused());
+        // A fast save may finish before the pending move to its status is drawn.
+        let focus_owner = controls.as_ref().and_then(|(_, status)| {
+            if focused == Some(*status) { Some(*status) }
+            else { pending_focus.filter(|(owner, target)| focused == Some(*owner) && *target == Some(*status)).map(|(owner, _)| owner) }
+        }).filter(|_| self.page == super::Page::Record);
+        let succeeded = result.is_ok();
         self.recording_save = None;
         match result {
             Ok(path) => {
@@ -462,6 +514,11 @@ impl App {
                 self.record_status = (format!("{error:#}"), RED);
             }
         }
+        if let Some(owner) = focus_owner {
+            let target = if succeeded { None } else { return_focus.or_else(|| controls.as_ref().and_then(|(controls, _)| controls.first().copied())) };
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("recording-next-focus"), (owner, target)));
+            ctx.request_repaint();
+        }
     }
 
     fn draw_recording(&mut self, ui: &mut egui::Ui) {
@@ -475,6 +532,27 @@ impl App {
         let mut save = false;
         let mut add = false;
         let mut discard = false;
+        let mut discard_focus = None;
+        let mut record_button = None;
+        let mut stop_control = None;
+        let mut take_controls = Vec::new();
+        let capture_transition = ui.data(|data|
+            data.get_temp::<(bool, bool, Option<egui::Id>)>(egui::Id::new("recording-capture-focus")))
+            .filter(|(was_active, was_finishing, _)| *was_active && (!active || finishing != *was_finishing))
+            .and_then(|(_, was_finishing, stop)| {
+                let status = ui.data(|data| data.get_temp::<(Vec<egui::Id>, egui::Id)>(egui::Id::new("recording-controls")))
+                    .map(|(_, status)| status);
+                let owner = if was_finishing { status } else { stop }?;
+                let target = if finishing { status } else if take_ready { Some(egui::Id::new("recording-name")) } else { None };
+                Some((owner, target))
+            });
+        let next_focus = ui.data_mut(|data| {
+            let id = egui::Id::new("recording-next-focus");
+            let focus = data.get_temp::<(egui::Id, Option<egui::Id>)>(id);
+            data.remove::<(egui::Id, Option<egui::Id>)>(id);
+            focus
+        }).or(capture_transition).filter(|(owner, _)| ui.memory(|memory| memory.has_focus(*owner))
+            && ui.input(|input| input.focused && !input.pointer.any_down() && !input.pointer.any_released()));
         widgets::card(
             ui,
             "RECORD A CLIP",
@@ -497,15 +575,17 @@ impl App {
                 );
             },
             |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Source").weak());
                     ui.add_enabled_ui(!active && !take_ready, |ui| {
-                        ui.selectable_value(&mut self.record_source, Source::Microphone, "Microphone");
-                        ui.selectable_value(&mut self.record_source, Source::Computer, "Computer audio");
+                        let microphone = ui.selectable_value(&mut self.record_source, Source::Microphone, "Microphone");
+                        widgets::scroll_on_focus(&microphone);
+                        let computer = ui.selectable_value(&mut self.record_source, Source::Computer, "Computer audio");
+                        widgets::scroll_on_focus(&computer);
                     });
                 });
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Device").weak());
+                    let device = ui.label(RichText::new("Device").weak());
                     let recorded_device = self.recorder.as_ref().map(Recorder::device_name)
                         .or_else(|| self.take.as_ref().map(|take| take.device_name()));
                     match (self.record_source, recorded_device) {
@@ -533,23 +613,27 @@ impl App {
                                 self.record_output.clone()
                             };
                             ui.add_enabled_ui(!active && !take_ready, |ui| {
-                                ComboBox::from_id_salt("record-output")
-                                    .width(360.0)
-                                    .selected_text(label)
+                                let mut selected = false;
+                                let output = ComboBox::from_id_salt("record-output")
+                                    .width(ui.available_width().min(360.0))
+                                    .selected_text(label.as_str())
+                                    .truncate()
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.record_output,
-                                            String::new(),
-                                            "Windows default output",
-                                        );
-                                        for output in &outputs {
-                                            ui.selectable_value(
-                                                &mut self.record_output,
-                                                output.clone(),
-                                                output,
-                                            );
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                                        for (value, name) in std::iter::once(("", "Windows default output"))
+                                            .chain(outputs.iter().map(|name| (name.as_str(), name.as_str())))
+                                        {
+                                            let choice = ui.selectable_value(&mut self.record_output, value.to_owned(), name)
+                                                .on_hover_text(name);
+                                            widgets::scroll_on_focus(&choice);
+                                            if choice.clicked() {
+                                                selected = true;
+                                                ui.close();
+                                            }
                                         }
-                                    });
+                                    }).response.on_hover_text(label).labelled_by(device.id);
+                                if selected { output.request_focus(); }
+                                widgets::scroll_on_focus(&output);
                             });
                         }
                     }
@@ -563,20 +647,22 @@ impl App {
                     let elapsed = recorder.elapsed();
                     let window = 6 * PEAKS_PER_SECOND;
                     let peaks = recorder.recent_peaks(window);
-                    ui.horizontal(|ui| {
+                    ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("recording-capture")), |ui| ui.horizontal_wrapped(|ui| {
                         if finishing {
                             ui.spinner();
                             ui.colored_label(widgets::text_color(ui, CYAN), "Finishing your take…");
                         } else {
-                            stop = ui
-                                .add(egui::Button::new(RichText::new("Stop recording").color(Color32::BLACK)).fill(RED))
-                                .clicked();
+                            let stop_button = ui
+                                .add(egui::Button::new(RichText::new("Stop recording").color(Color32::BLACK)).fill(RED));
+                            widgets::scroll_on_focus(&stop_button);
+                            stop = stop_button.clicked();
+                            stop_control = Some(stop_button.id);
                             let pulse = 0.55 + 0.45 * (ui.input(|i| i.time) * 4.0).sin() as f32;
                             ui.label(RichText::new("⏺").color(RED.gamma_multiply(pulse)));
                             ui.label(RichText::new(clock_time(elapsed)).color(widgets::text_color(ui, RED)).monospace());
                         }
                         ui.weak(format!("· {}", file_size(recorder.bytes())));
-                    });
+                    }));
                     ui.add_space(6.0);
                     // The last six seconds, scrolling in from the right.
                     widgets::waveform(ui, &peaks, Some(window), 64.0, if finishing { CYAN } else { RED });
@@ -596,42 +682,74 @@ impl App {
                         ui.colored_label(widgets::text_color(ui, AMBER), "This take is silent.");
                     }
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         let label = ui.label("Name");
-                        ui.add_enabled(!saving, egui::TextEdit::singleline(&mut self.record_name).desired_width(260.0))
+                        let name = ui.add_enabled(!saving, egui::TextEdit::singleline(&mut self.record_name)
+                            .id(egui::Id::new("recording-name")).desired_width(260.0))
                             .labelled_by(label.id);
+                        take_controls.push(name.id);
+                        widgets::scroll_on_focus(&name);
                         ui.weak(clock_time(take.duration()));
                     });
-                    ui.horizontal(|ui| {
+                    ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("recording-actions")), |ui| ui.horizontal_wrapped(|ui| {
                         ui.add_enabled_ui(!saving, |ui| {
-                            add = ui.button("Add to soundboard").clicked();
-                            save = ui.button("Save WAV…").clicked();
-                            discard = ui.small_button("Discard take").clicked();
+                            let add_button = ui.button("Add to soundboard");
+                            widgets::scroll_on_focus(&add_button);
+                            add = add_button.clicked();
+                            let save_button = ui.button("Save WAV…");
+                            widgets::scroll_on_focus(&save_button);
+                            save = save_button.clicked();
+                            let discard_button = ui.small_button("Discard take");
+                            widgets::scroll_on_focus(&discard_button);
+                            discard = discard_button.clicked();
+                            if discard && discard_button.has_focus() { discard_focus = Some(discard_button.id); }
+                            take_controls.extend([add_button.id, save_button.id, discard_button.id]);
                         });
                         if saving {
                             ui.spinner();
                         }
-                    });
+                    }));
                 } else {
-                    ui.horizontal(|ui| {
-                        start = ui
-                            .add(egui::Button::new(RichText::new("⏺  Record").color(Color32::BLACK)).fill(RED))
-                            .clicked();
+                    ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("recording-start")), |ui| ui.horizontal_wrapped(|ui| {
+                        let record = ui.add(egui::Button::new(RichText::new("⏺  Record").color(Color32::BLACK)).fill(RED));
+                        widgets::scroll_on_focus(&record);
+                        start = record.clicked();
+                        record_button = Some(record);
                         ui.weak("Recording stays on this computer.");
-                    });
+                    }));
                 }
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(RichText::new(&self.record_status.0).color(widgets::text_color(ui, self.record_status.1)))
-                    .truncate().show_tooltip_when_elided(false))
-                    .on_hover_text(&self.record_status.0);
+                let mut label = egui::Label::new(RichText::new(&self.record_status.0).color(widgets::text_color(ui, self.record_status.1)))
+                    .truncate().show_tooltip_when_elided(false);
+                if saving || finishing { label = label.sense(egui::Sense::focusable_noninteractive()).selectable(false); }
+                let status = ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("recording-status")), |ui| ui.add(label))
+                    .inner.on_hover_text(&self.record_status.0);
+                widgets::scroll_on_focus(&status);
+                ui.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("recording-controls"), (std::mem::take(&mut take_controls), status.id));
+                    // Track the rendered phase even if the writer finishes between frames.
+                    data.insert_temp(egui::Id::new("recording-capture-focus"), (active, finishing, stop_control));
+                });
             },
         );
+        if let Some((owner, target)) = next_focus
+            && ui.memory(|memory| memory.focused().is_none_or(|focused| focused == owner))
+            && let Some(response) = target.and_then(|target| ui.ctx().read_response(target))
+                .or_else(|| if target.is_none() { record_button } else { None })
+            && response.enabled() && response.sense.is_focusable()
+        {
+            widgets::finish_keyboard_activation(ui.ctx());
+            response.request_focus();
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
         if start {
             self.start_recording();
         }
         if stop {
+            widgets::finish_keyboard_activation(ui.ctx());
             self.stop_recording();
         }
+        if add || save { widgets::finish_keyboard_activation(ui.ctx()); }
         if add {
             self.start_recording_save(RecordingDestination::Soundboard(self.record_name.clone()), ui.ctx());
         }
@@ -639,15 +757,46 @@ impl App {
             self.save_recording(ui.ctx());
         }
         if discard {
+            if let Some(owner) = discard_focus
+                && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+            {
+                widgets::finish_keyboard_activation(ui.ctx());
+                ui.data_mut(|data| data.insert_temp(egui::Id::new("recording-next-focus"), (owner, None::<egui::Id>)));
+                ui.ctx().request_repaint();
+            }
             self.take = None;
             self.record_status = ("Take discarded".into(), MUTED);
         }
     }
 
     /// A pad's volume, hotkey, strip visibility, trim and removal.
-    fn pad_menu(&mut self, ui: &mut egui::Ui, index: usize, remove: &mut Option<usize>, focus_volume: bool) {
-        let Some(pad) = self.settings.sounds.get(index).cloned() else { return };
+    fn pad_menu(&mut self, ui: &mut egui::Ui, index: usize, remove: &mut Option<(usize, bool)>, focus_volume: bool) {
         ui.set_width(320.0);
+        let max_height = ui.ctx().content_rect().height() - egui::Frame::popup(ui.style()).total_margin().sum().y;
+        // Areas remember their previous height. Allow newly loaded trim controls
+        // to grow the menu, while auto-shrink keeps short menus compact.
+        ScrollArea::vertical().id_salt("pad-menu-scroll").min_scrolled_height(max_height).max_height(max_height)
+            .show(ui, |ui| {
+                self.pad_menu_contents(ui, index, remove, focus_volume);
+                let layout_id = ui.make_persistent_id("pad-menu-layout");
+                let layout = (ui.min_size().round(), max_height.round());
+                let reflowed = ui.data_mut(|data| {
+                    let previous = data.get_temp::<(egui::Vec2, f32)>(layout_id);
+                    data.insert_temp(layout_id, layout);
+                    previous != Some(layout)
+                });
+                if let Some(focused) = ui.memory(|memory| memory.focused()).and_then(|id| ui.ctx().read_response(id))
+                    && focused.layer_id == ui.layer_id()
+                    && (focused.gained_focus() || (focused.has_focus() && reflowed))
+                    && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+                {
+                    focused.scroll_to_me(Some(egui::Align::Center));
+                }
+            });
+    }
+
+    fn pad_menu_contents(&mut self, ui: &mut egui::Ui, index: usize, remove: &mut Option<(usize, bool)>, focus_volume: bool) {
+        let Some(pad) = self.settings.sounds.get(index).cloned() else { return };
         ui.add(egui::Label::new(RichText::new(pad.display_name()).strong()).truncate());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -662,17 +811,28 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label("Hotkey");
             ui.monospace(pad.hotkey.as_deref().unwrap_or("none"));
-            if ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Set…"))
+            let set = ui.add_enabled(self.hotkeys.is_some(), egui::Button::new("Set…"))
                 .on_hover_text("Plays this pad from any app")
-                .on_disabled_hover_text("Global shortcuts are unavailable; restart OpenMic to retry")
-                .clicked()
-            {
+                .on_disabled_hover_text("Global shortcuts are unavailable; restart OpenMic to retry");
+            if set.clicked() {
+                widgets::finish_keyboard_activation(ui.ctx());
                 self.start_capture(Binding::Pad(pad.path.clone()));
                 ui.close();
-            }
+            } else { super::shortcut_capture_opener(&set); }
         });
-        if pad.hotkey.is_some() && menu_control(ui, "clear-shortcut", egui::Button::new("Clear")).clicked() {
-            self.assign_hotkey(&Binding::Pad(pad.path.clone()), None);
+        if pad.hotkey.is_some() {
+            let clear = menu_control(ui, "clear-shortcut", egui::Button::new("Clear"));
+            if clear.clicked() {
+                self.assign_hotkey(&Binding::Pad(pad.path.clone()), None);
+                if clear.has_focus() {
+                    let keyboard = ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released());
+                    clear.surrender_focus();
+                    if keyboard {
+                        widgets::finish_keyboard_activation(ui.ctx());
+                        ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::Next));
+                    }
+                }
+            }
         }
         if let Some(hotkeys) = &self.hotkeys {
             if let Some(shortcut) = &pad.hotkey
@@ -690,8 +850,11 @@ impl App {
         ui.separator();
         ui.scope_builder(egui::UiBuilder::new().id(ui.make_persistent_id("pad-trim")), |ui| self.trim_editor(ui, index));
         ui.separator();
-        if menu_control(ui, "remove", egui::Button::new("Remove from soundboard")).clicked() {
-            *remove = Some(index);
+        let remove_button = menu_control(ui, "remove", egui::Button::new("Remove from soundboard"));
+        if remove_button.clicked() {
+            let keyboard = remove_button.has_focus() && ui.input(|input|
+                input.focused && !input.pointer.any_down() && !input.pointer.any_released());
+            *remove = Some((index, keyboard));
             ui.close();
         }
     }
@@ -836,23 +999,33 @@ impl App {
     }
 
     pub(super) fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
+        let focus_to_reveal = ui.data_mut(|data| {
+            let id = egui::Id::new("soundboard-focus-reveal");
+            let target = data.get_temp::<egui::Id>(id);
+            data.remove::<egui::Id>(id);
+            target
+        }).filter(|target| ui.memory(|memory| memory.has_focus(*target))
+            && ui.input(|input| input.focused && !input.pointer.any_down() && !input.pointer.any_released()
+                && !input.key_pressed(egui::Key::Tab)));
         let reveal = self.pad_to_reveal.take();
         ui.weak("Drop audio files to add clips. Click a pad to play, pause or resume.");
         if let Some(import) = &self.clip_import {
             let mut cancel = false;
             let cancelling = import.cancel.load(Ordering::Relaxed);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label(if cancelling {
                     "Finishing cancellation…".into()
                 } else {
                     format!("Adding clips · {} of {}", import.total - import.files.len(), import.total)
                 });
-                cancel = ui.add_enabled(import.has_pending_files(), egui::Button::new("Cancel import")).clicked();
+                let response = ui.add_enabled(import.has_pending_files(), egui::Button::new("Cancel import"));
+                widgets::scroll_on_focus(&response);
+                cancel = response.clicked();
             });
             if let Some(path) = import.files.front() {
                 let name = if cancelling { format!("Next: {}", file_name(path)) } else { file_name(path) };
-                ui.add(egui::Label::new(RichText::new(name).weak()).truncate());
+                ui.add(egui::Label::new(RichText::new(&name).weak()).truncate()).on_hover_text(name);
             }
             if cancel {
                 self.cancel_clip_import();
@@ -881,9 +1054,10 @@ impl App {
         ui.add_space(12.0);
 
         let sounds = self.settings.sounds.clone();
-        let mut add_header = false;
-        let mut add_empty = false;
+        let mut add_header = None;
+        let mut add_empty = None;
         let mut remove_index = None;
+        let mut pad_scope = None;
         let mut trim_open = false;
         widgets::card(
             ui,
@@ -891,12 +1065,10 @@ impl App {
             CYAN,
             |ui| {
                 if !sounds.is_empty() {
-                    add_header = ui
-                        .add(
-                            egui::Button::new(RichText::new("Add clips").color(Color32::BLACK))
-                                .fill(CYAN),
-                        )
-                        .clicked();
+                    let response = add_clips_button(ui, "Add clips");
+                    widgets::scroll_on_focus(&response);
+                    if focus_to_reveal == Some(response.id) { response.scroll_to_me(Some(egui::Align::Center)); }
+                    add_header = Some(response);
                     widgets::badge(ui, &format!("{} clips", sounds.len()), CYAN);
                 }
             },
@@ -913,32 +1085,28 @@ impl App {
                                 ui.label(RichText::new("No clips yet").size(17.0).strong());
                                 ui.weak("Drop audio files here, or choose a few below.");
                                 ui.add_space(10.0);
-                                add_empty = ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Add your first clips").color(Color32::BLACK),
-                                        )
-                                        .fill(CYAN),
-                                    )
-                                    .clicked();
+                                let response = add_clips_button(ui, "Add your first clips");
+                                widgets::scroll_on_focus(&response);
+                                if focus_to_reveal == Some(response.id) { response.scroll_to_me(Some(egui::Align::Center)); }
+                                add_empty = Some(response);
                                 ui.add_space(6.0);
                                 ui.weak("WAV, FLAC, OGG, MP3, and AIFF");
                             });
                             ui.add_space(22.0);
                         });
                 } else {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.weak("Click a name to rename; drag to reorder.");
                         // A search box once the board gets long.
                         if sounds.len() > SEARCH_FROM {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.pad_filter)
-                                        .id(egui::Id::new("soundboard-search"))
-                                        .hint_text("Search clips")
-                                        .desired_width(140.0),
-                                );
-                            });
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.pad_filter)
+                                    .id(egui::Id::new("soundboard-search"))
+                                    .hint_text("Search clips")
+                                    .desired_width(ui.available_width().min(140.0)),
+                            );
+                            widgets::scroll_on_focus(&response);
+                            if focus_to_reveal == Some(response.id) { response.scroll_to_me(Some(egui::Align::Center)); }
                         }
                     });
                     ui.add_space(8.0);
@@ -950,15 +1118,21 @@ impl App {
                         ui.weak(format!("No clips match \"{}\"", self.pad_filter.trim()));
                     }
                     let mut moved = None;
-                    ScrollArea::vertical()
+                    let mut reveal_grid = false;
+                    // Leave room for one full pad and its keyboard focus outline.
+                    let pads = ScrollArea::vertical()
                         .id_salt("sound_pads")
-                        .max_height(258.0)
+                        .min_scrolled_height(124.0)
+                        .max_height((ui.clip_rect().height() - 16.0).clamp(124.0, 258.0))
                         .show(ui, |ui| {
                             let gap = 8.0;
                             ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-                            let width = ((ui.available_width() - 2.0 * gap) / 3.0).max(120.0);
-                            for (row_number, row) in shown.chunks(3).enumerate() {
+                            // Keep a readable name beside the play and remove controls.
+                            let columns = ((ui.available_width() + gap) / (150.0 + gap)).floor().clamp(1.0, 3.0) as usize;
+                            let width = (ui.available_width() - (columns - 1) as f32 * gap) / columns as f32;
+                            for (row_number, row) in shown.chunks(columns).enumerate() {
                                 ui.horizontal(|ui| {
+                                    pad_scope = Some(ui.id());
                                     for (column, &i) in row.iter().enumerate() {
                                         let pad = &sounds[i];
                                         let key = clip_key(&pad.path);
@@ -979,10 +1153,11 @@ impl App {
                                             renaming: self.renaming_pad.as_ref().is_some_and(|edit| edit.path == pad.path),
                                         };
                                         let (play, remove, star, name, reveal_page) = clip_pad(ui, i, pad, width, state, (row_number, column));
-                                        if reveal_page {
-                                            self.soundboard_scroll_to_top = true;
-                                            ui.ctx().request_repaint();
-                                        }
+                                        reveal_grid |= reveal_page;
+                                        // A removed pad shifts the rows. Reveal the new grid
+                                        // position rather than the destination's previous rect.
+                                        reveal_grid |= focus_to_reveal.is_some_and(|target|
+                                            [&play, &remove, &star, &name].into_iter().any(|response| response.id == target));
                                         if reveal.as_deref() == Some(pad.path.as_path()) {
                                             play.scroll_to_me(Some(egui::Align::Center));
                                             play.request_focus();
@@ -995,7 +1170,9 @@ impl App {
                                             self.toggle_clip(i, ui.ctx());
                                         }
                                         if remove.clicked() {
-                                            remove_index = Some(i);
+                                            let keyboard = remove.has_focus() && ui.input(|input|
+                                                input.focused && !input.pointer.any_down() && !input.pointer.any_released());
+                                            remove_index = Some((i, keyboard));
                                         }
                                         self.draw_pad_rename(ui, &pad.path, name.rect);
                                         // Drag a pad onto another to move it there.
@@ -1033,26 +1210,45 @@ impl App {
                                             });
                                             if let Some(owner) = owner
                                                 && menu.is_some()
-                                                && ui.input(|input| input.key_pressed(egui::Key::Escape))
                                             {
-                                                ui.memory_mut(|memory| memory.request_focus(owner));
+                                                if self.capturing.as_ref() == Some(&Binding::Pad(pad.path.clone())) {
+                                                    focus_soundboard_control(ui.ctx(), owner);
+                                                } else if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                                    ui.memory_mut(|memory| memory.request_focus(owner));
+                                                }
                                             }
                                         }
                                     }
                                 });
                             }
                         });
+                    if reveal_grid {
+                        // The inner scroll area consumes the pad's scroll target.
+                        // Reveal its viewport in the page as well, so the whole pad fits.
+                        ui.scroll_to_rect(pads.inner_rect, None);
+                    }
                     if let Some((from, to)) = moved {
                         self.move_pad(from, to);
                     }
                 }
             },
         );
-        if add_header || add_empty {
+        let add = add_header.as_ref().or(add_empty.as_ref());
+        if add.is_some_and(|response| response.clicked()) {
             self.add_sounds(ui.ctx());
         }
-        if let Some(index) = remove_index {
+        if let Some((index, keyboard)) = remove_index {
             self.remove_clip(index);
+            if keyboard && let Some(scope) = pad_scope {
+                let filter = if self.settings.sounds.len() > SEARCH_FROM { self.pad_filter.trim().to_lowercase() } else { String::new() };
+                let mut remaining = self.settings.sounds.iter().enumerate()
+                    .filter(|(_, pad)| filter.is_empty() || pad.display_name().to_lowercase().contains(&filter));
+                let next = remaining.clone().find(|(i, _)| *i >= index).or_else(|| remaining.next_back());
+                let target = next.map(|(_, pad)| scope.with(("sound_play", &pad.path))).or_else(|| {
+                    if self.settings.sounds.is_empty() { add.map(|response| response.id) } else { Some(egui::Id::new("soundboard-search")) }
+                });
+                if let Some(target) = target { focus_soundboard_control(ui.ctx(), target); }
+            }
         }
         if !trim_open { self.close_trim_editor(); }
 
@@ -1079,6 +1275,13 @@ impl App {
         };
         // Header status changes must not replace focused playback controls.
         ui.scope_builder(egui::UiBuilder::new().id(egui::Id::new("soundboard-playback")), |ui| {
+            let width_id = ui.id().with("width");
+            let width = ui.available_width();
+            let reflowed = ui.data_mut(|data| {
+                let previous = data.get_temp::<f32>(width_id);
+                data.insert_temp(width_id, width);
+                previous.is_some_and(|previous| previous != width)
+            });
             widgets::card(
                 ui,
                 "PLAYBACK",
@@ -1099,7 +1302,7 @@ impl App {
                     }
                 },
                 |ui| {
-                    let stop = ui.horizontal(|ui| {
+                    let stop = ui.horizontal_wrapped(|ui| {
                         let title_width = (ui.available_width() - 115.0).max(140.0);
                         ui.vertical(|ui| {
                             ui.set_max_width(title_width);
@@ -1123,7 +1326,7 @@ impl App {
                         }).inner
                     }).inner;
                     ui.add_space(8.0);
-                    let volume = ui.horizontal(|ui| {
+                    let volume = ui.horizontal_wrapped(|ui| {
                         let label = ui.label("Clip volume");
                         let original = self.settings.sound_volume;
                         let response = volume_slider(ui, &mut self.settings.sound_volume).labelled_by(label.id);
@@ -1140,7 +1343,13 @@ impl App {
                         self.touch();
                     }
                     for response in [&stop, &volume, &overlap] {
-                        widgets::scroll_on_focus(response);
+                        if reflowed && response.has_focus()
+                            && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+                        {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                        } else {
+                            widgets::scroll_on_focus(response);
+                        }
                     }
                     if self.sound_status.0 != "Ready" && !self.sound_status.0.starts_with("Playing ·") {
                         ui.add_space(5.0);
@@ -1293,16 +1502,16 @@ fn clip_pad(
     if let Some(response) = [&play_response, &remove_response, &star_response, &name_response]
         .into_iter().chain(rename_response.iter()).find(|response| response.has_focus())
     {
-        // Track the grid position rather than screen coordinates, so wheel
-        // scrolling can move away from a focused pad without snapping back.
+        // Track the grid position and viewport height, so wheel scrolling
+        // can move away from a focused pad without snapping back.
         let position_id = ui.make_persistent_id("focused-sound-pad-position");
-        let position = (response.id, position.0, position.1, width.to_bits());
+        let position = (response.id, position.0, position.1, egui::vec2(width, ui.ctx().content_rect().height()));
         let moved = ui.data_mut(|data| {
-            let previous = data.get_temp::<(egui::Id, usize, usize, u32)>(position_id);
+            let previous = data.get_temp::<(egui::Id, usize, usize, egui::Vec2)>(position_id);
             data.insert_temp(position_id, position);
             previous != Some(position)
         });
-        if (response.gained_focus() || moved) && !ui.input(|input| input.pointer.any_pressed()) {
+        if (response.gained_focus() || moved) && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released()) {
             reveal_page = !ui.clip_rect().contains_rect(rect);
             ui.scroll_to_rect(rect, None);
         }
@@ -1362,31 +1571,23 @@ fn clip_pad(
         ));
     }
 
-    let max_chars = ((width - 106.0) / 7.0).max(7.0) as usize;
-    let title = if name.chars().count() > max_chars {
-        format!(
-            "{}…",
-            name.chars()
-                .take(max_chars.saturating_sub(1))
-                .collect::<String>()
-        )
-    } else {
-        name.clone()
-    };
     let text_area = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 52.0, rect.top() + 9.0),
         egui::pos2(rect.right() - 43.0, body.bottom() - 8.0),
     );
     let text_painter = painter.with_clip_rect(text_area);
+    let paint_text = |text: String, y: f32, size: f32, color| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text, egui::FontId::proportional(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(text_area.width());
+        let galley = text_painter.layout_job(job);
+        text_painter.galley(egui::pos2(text_area.left(), rect.top() + y - galley.size().y / 2.0), galley, color);
+    };
     if !state.renaming {
         if name_response.hovered() || name_response.has_focus() {
             painter.rect_filled(name_rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
         }
-        text_painter.text(
-            egui::pos2(rect.left() + 52.0, rect.top() + 30.0),
-            egui::Align2::LEFT_CENTER,
-            title,
-            egui::FontId::proportional(14.0),
+        paint_text(
+            name.clone(), 30.0, 14.0,
             if name_response.hovered() || name_response.has_focus() { widgets::text_color(ui, CYAN) } else { visuals.text_color() },
         );
     }
@@ -1421,13 +1622,7 @@ fn clip_pad(
         let done = egui::Rect::from_min_max(track.min, egui::pos2(track.left() + track.width() * progress.clamp(0.0, 1.0), track.bottom()));
         painter.rect_filled(done, 1.5, accent);
     }
-    text_painter.text(
-        egui::pos2(rect.left() + 52.0, rect.top() + 55.0),
-        egui::Align2::LEFT_CENTER,
-        detail,
-        egui::FontId::proportional(11.0),
-        widgets::text_color(ui, detail_color),
-    );
+    paint_text(detail, 55.0, 11.0, widgets::text_color(ui, detail_color));
     painter.line_segment(
         [
             egui::pos2(remove_rect.left(), rect.top() + 8.0),
@@ -1919,10 +2114,13 @@ mod tests {
     }
 
     fn finish_recording_save(app: &mut App) {
-        let ctx = egui::Context::default();
+        finish_recording_save_with_context(app, &egui::Context::default());
+    }
+
+    fn finish_recording_save_with_context(app: &mut App, ctx: &egui::Context) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.recording_save.is_some() {
-            app.poll_recording_save(&ctx);
+            app.poll_recording_save(ctx);
             assert!(std::time::Instant::now() < deadline, "recording save did not finish");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1958,12 +2156,302 @@ mod tests {
     }
 
     fn short_record_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        record_frame_at_size(app, ctx, egui::vec2(700.0, 420.0), events)
+    }
+
+    fn record_frame_at_size(app: &mut App, ctx: &egui::Context, size: egui::Vec2, events: Vec<egui::Event>) -> egui::FullOutput {
         use eframe::App as _;
         let mut frame = eframe::Frame::_new_kittest();
         ctx.run_ui(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 420.0))),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
         }, |ui| app.ui(ui, &mut frame))
+    }
+
+    #[test]
+    fn recording_output_selector_fits_a_zoomed_window() {
+        use egui::accesskit::Role;
+        let zoom = 1.5;
+        let size = egui::vec2(700.0, 420.0) / zoom;
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for long_name in [false, true] {
+                    let mut app = App::stopped(Default::default());
+                    app.page = super::super::Page::Record;
+                    app.record_source = Source::Computer;
+                    if long_name { app.record_output = "USB speakers with a long manufacturer and device description".repeat(3); }
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                    let node = &tree.nodes.iter()
+                        .find(|(_, node)| node.role() == Role::ComboBox).unwrap().1;
+                    let bounds = node.bounds().unwrap();
+                    let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                        egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                    assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                        && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))),
+                        "the output selector fits the zoomed window; long_name={long_name}, passes={passes}: {rect:?}");
+                    let label = *tree.nodes.iter().find(|(_, node)| node.role() == Role::Label && node.value() == Some("Device"))
+                        .map(|(id, _)| id).unwrap();
+                    assert!(node.labelled_by().contains(&label), "the recording output has an accessible device label");
+                    assert!(app.recorder.is_none() && app.take.is_none() && app.dirty_since.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_output_menu_fits_and_keyboard_selection_only_changes_the_next_device() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for zoom in [1.0, 1.5] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for dark in [true, false] {
+                for passes in [1, 2] {
+                    for default in [false, true] {
+                        let mut app = App::stopped(Default::default());
+                        app.page = super::super::Page::Record;
+                        app.record_source = Source::Computer;
+                        app.outputs = ["USB speakers", "Headphones"].map(|name|
+                            format!("{name}{}", " with a long manufacturer and device description".repeat(3))).into();
+                        app.record_output = app.outputs[0].clone();
+                        let before = app.record_output.clone();
+                        let original = serde_json::to_value(&app.settings).unwrap();
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        widgets::configure_text_styles(&ctx);
+                        ctx.enable_accesskit();
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let target = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                            .find(|(_, node)| node.role() == Role::ComboBox).map(|(id, _)| id).unwrap();
+                        let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                            action, target_tree: TreeId::ROOT, target_node, data: None,
+                        });
+                        let key = |key| egui::Event::Key {
+                            key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                        };
+                        record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, target)]);
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let popup_id = ctx.memory(|memory| memory.focused()).unwrap().with("popup");
+                        record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Enter)]);
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        assert!(egui::Popup::is_any_open(&ctx));
+                        let menu = egui::AreaState::load(&ctx, popup_id).unwrap().rect();
+                        assert!(menu.left() >= 0.0 && menu.right() <= size.x,
+                            "the output menu fits with long device names; zoom={zoom}, passes={passes}: {menu:?}");
+                        record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Escape)]);
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        assert!(!egui::Popup::is_any_open(&ctx));
+                        assert_eq!(app.record_output, before);
+                        record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, target), key(egui::Key::Enter)]);
+                        for _ in 0..6 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let name = if default { "Windows default output" } else { &app.outputs[1] };
+                        let choice = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some(name)).map(|(id, _)| id).unwrap();
+                        if passes == 1 {
+                            let mut reached = false;
+                            for _ in 0..8 {
+                                let output = record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Tab)]);
+                                if output.platform_output.accesskit_update.unwrap().focus == choice { reached = true; break; }
+                            }
+                            assert!(reached, "Tab reaches the requested output inside the menu");
+                            record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Enter)]);
+                        } else { record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Click, choice)]); }
+                        for _ in 0..6 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        assert_eq!(app.record_output, if default { "" } else { &app.outputs[1] });
+                        assert!(app.record_source == Source::Computer);
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                        assert!(app.recorder.is_none() && app.take.is_none() && app.recording_save.is_none() && app.dirty_since.is_none());
+                        assert!(!egui::Popup::is_any_open(&ctx));
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+                        record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Enter)]);
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Click, choice)]);
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        assert!(!egui::Popup::is_any_open(&ctx));
+                        assert_eq!(app.record_output, if default { "" } else { &app.outputs[1] });
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                        assert!(app.recorder.is_none() && app.take.is_none() && app.dirty_since.is_none());
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_reveals_recording_take_controls_in_a_zoomed_window() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let zoom = 1.5;
+        let size = egui::vec2(700.0, 420.0) / zoom;
+        let bounds = |output: &egui::FullOutput, target| {
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+            egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32))
+        };
+        let visible = |output: &egui::FullOutput, target| {
+            let rect = bounds(output, target);
+            output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect)))
+        };
+        let source_position = |output: &egui::FullOutput| output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Source" => Some(text.visual_bounding_rect().center()), _ => None,
+        }).unwrap();
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for assistive in [false, true] {
+                    for label in ["Mic recording", "Add to soundboard", "Save WAV…", "Discard take"] {
+                        let mut app = App::stopped(Default::default());
+                        app.page = super::super::Page::Record;
+                        let take = Arc::new(Recorder::from_samples_for_test(&[0.0; 480]).finish().unwrap().unwrap());
+                        app.take = Some(Arc::clone(&take));
+                        let original = serde_json::to_value(&app.settings).unwrap();
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        widgets::configure_text_styles(&ctx);
+                        ctx.enable_accesskit();
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let source_top = source_position(&output);
+                        let target = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter().find(|(_, node)|
+                            (node.role() == Role::Button && node.label() == Some(label))
+                                || (node.role() == Role::TextInput && node.value() == Some(label))).map(|(id, _)| id).unwrap();
+                        if label == "Discard take" { assert!(!visible(&output, target), "this case starts below the viewport"); }
+                        if assistive {
+                            record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                                action: Action::Focus, target_tree: TreeId::ROOT, target_node: target, data: None,
+                            })]);
+                        } else {
+                            let mut reached = false;
+                            for _ in 0..64 {
+                                let output = record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::Key {
+                                    key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                                }]);
+                                if output.platform_output.accesskit_update.unwrap().focus == target { reached = true; break; }
+                            }
+                            assert!(reached, "Tab reaches {label}");
+                        }
+                        for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, target);
+                        assert!(visible(&output, target), "{label} is visible when focused; dark={dark}, passes={passes}, assistive={assistive}");
+                        for modifiers in [egui::Modifiers::SHIFT, egui::Modifiers::NONE] {
+                            record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::Key {
+                                key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers,
+                            }]);
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, target);
+                        assert!(visible(&output, target));
+                        for delta in [1000.0, -1000.0] {
+                            record_frame_at_size(&mut app, &ctx, size, vec![
+                                egui::Event::PointerMoved(egui::pos2(size.x - 14.0, size.y - 60.0)),
+                                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, delta),
+                                    modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move },
+                            ]);
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, target);
+                            if delta > 0.0 { assert_eq!(source_position(&output), source_top, "focus allows manually scrolling back to the page top"); }
+                            else { assert!(visible(&output, target)); }
+                        }
+                        assert!(Arc::ptr_eq(app.take.as_ref().unwrap(), &take));
+                        assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                        assert!(app.recorder.is_none() && app.recording_save.is_none() && app.dirty_since.is_none());
+                        if label == "Discard take" {
+                            record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::Key {
+                                key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                            }]);
+                            for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            assert!(app.take.is_none() && app.recorder.is_none() && app.recording_save.is_none());
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes Record keyboard focus screenshots; needs Python with Pillow"]
+    fn snapshot_recording_keyboard_focus() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for (zoom, size_label) in [(1.0, "standard"), (1.5, "zoomed")] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for (dark, theme) in [(true, "dark"), (false, "light")] {
+                let mut app = App::stopped(Default::default());
+                app.page = super::super::Page::Record;
+                app.record_source = Source::Computer;
+                app.record_output = "USB speakers with a long manufacturer and device description".repeat(3);
+                app.outputs = vec![app.record_output.clone(), "Headphones with a long manufacturer and device description".repeat(3)];
+                let image = super::super::snapshot::snapshot(&mut app, &format!("record-output-{size_label}-{theme}"), size, zoom, dark);
+                println!("SNAPSHOT {}", image.display());
+                let ctx = egui::Context::default();
+                ctx.options_mut(|options| options.zoom_factor = zoom);
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                widgets::configure_text_styles(&ctx);
+                ctx.enable_accesskit();
+                for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                let target = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                    .find(|(_, node)| node.role() == Role::ComboBox).map(|(id, _)| id).unwrap();
+                let mut events = vec![Vec::new(); 3];
+                events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: target, data: None,
+                })]);
+                events.extend(vec![Vec::new(); 8]);
+                events.push(vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None,
+                    pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+                let image = super::super::snapshot::snapshot_with_events(&mut app,
+                    &format!("record-output-menu-{size_label}-{theme}"), size, zoom, dark, events);
+                println!("SNAPSHOT {}", image.display());
+                assert!(app.recorder.is_none() && app.take.is_none() && app.dirty_since.is_none());
+                for (control, label) in [("name", "Mic recording"), ("discard", "Discard take")] {
+                    let mut app = App::stopped(Default::default());
+                    app.page = super::super::Page::Record;
+                    app.take = Some(Arc::new(Recorder::from_samples_for_test(&[0.0; 480]).finish().unwrap().unwrap()));
+                    app.record_status = ("Take ready".into(), VIOLET);
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                    let target = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                        (node.role() == Role::Button && node.label() == Some(label))
+                            || (node.role() == Role::TextInput && node.value() == Some(label))).map(|(id, _)| id).unwrap();
+                    let mut events = vec![Vec::new(); 3];
+                    let mut reached = false;
+                    for _ in 0..64 {
+                        let tab = vec![egui::Event::Key {
+                            key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
+                        }];
+                        let output = record_frame_at_size(&mut app, &ctx, size, tab.clone());
+                        events.push(tab);
+                        if output.platform_output.accesskit_update.unwrap().focus == target { reached = true; break; }
+                    }
+                    assert!(reached);
+                    events.extend(vec![Vec::new(); 8]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("record-keyboard-{control}-{size_label}-{theme}"), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert!(app.take.is_some() && app.recording_save.is_none() && app.dirty_since.is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -2011,6 +2499,652 @@ mod tests {
                     assert!(Arc::ptr_eq(app.take.as_ref().unwrap(), &take));
                     assert!(app.recorder.is_none() && app.settings.sounds.is_empty() && app.dirty_since.is_none());
                     assert_eq!(app.recording_save.is_some(), saving);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_a_recording_keeps_focus_through_finishing_and_the_result() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for zoom in [1.0, 1.25, 1.5] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for dark in [true, false] {
+                for passes in [1, 2] {
+                    for source in [Source::Microphone, Source::Computer] {
+                        for outcome in ["normal", "empty", "capture error", "empty error", "size limit", "empty size limit", "audio gap"] {
+                            for delayed in [false, true] {
+                                for activation in ["enter", "space", "accessible", "programmatic"] {
+                                    let samples: &[f32] = if outcome.starts_with("empty") { &[] } else { &[0.25; 480] };
+                                    let (recorder, release) = if delayed {
+                                        let (recorder, release) = Recorder::delayed_writer_for_test(samples);
+                                        (recorder, Some(release))
+                                    } else { (Recorder::from_samples_for_test(samples), None) };
+                                    if outcome.contains("error") { recorder.report_error_for_test("Focus fixture microphone disconnected"); }
+                                    if outcome.contains("size limit") { recorder.report_full_for_test(); }
+                                    if outcome == "audio gap" { recorder.report_skipped_for_test(); }
+                                    let mut app = App::stopped(Default::default());
+                                    app.page = super::super::Page::Record;
+                                    app.record_source = source;
+                                    app.record_name = "Studio take café".into();
+                                    app.settings.microphone = "Missing stop-focus test microphone".into();
+                                    app.record_output = "Missing stop-focus test output".into();
+                                    app.recorder = Some(recorder);
+                                    let original = serde_json::to_value(&app.settings).unwrap();
+                                    let ctx = egui::Context::default();
+                                    ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                                    widgets::configure_text_styles(&ctx);
+                                    ctx.enable_accesskit();
+                                    let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                                        action, target_tree: TreeId::ROOT, target_node, data: None,
+                                    });
+                                    let key = |key, pressed, modifiers| egui::Event::Key {
+                                        key, physical_key: Some(key), pressed, repeat: false, modifiers,
+                                    };
+                                    let visible = |output: &egui::FullOutput, target| {
+                                        let node = &output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                                            .find(|(id, _)| *id == target).unwrap().1;
+                                        let bounds = node.bounds().unwrap();
+                                        let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                                            egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                                        let caption = node.label().or(node.value()).unwrap();
+                                        assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)),
+                                            "focused recording control is visible: {caption}, {rect:?}");
+                                        assert!(output.shapes.iter().any(|shape|
+                                            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == caption
+                                                && shape.clip_rect.contains_rect(text.visual_bounding_rect()))),
+                                            "focused recording text is visible: {caption}, zoom={zoom}, passes={passes}, {outcome}, {activation}");
+                                    };
+                                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                    let stop = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                                        node.role() == Role::Button && node.label() == Some("Stop recording")).map(|(id, _)| id).unwrap();
+                                    record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, stop)]);
+                                    for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                    let held = if activation == "space" { egui::Key::Space } else { egui::Key::Enter };
+                                    let held_events = || {
+                                        let mut events = vec![key(held, true, egui::Modifiers::NONE)];
+                                        if held == egui::Key::Space { events.push(egui::Event::Text(" ".into())); }
+                                        events
+                                    };
+                                    if activation == "programmatic" {
+                                        if outcome.contains("error") || outcome.contains("size limit") { app.poll_recording(); }
+                                        else { app.stop_recording(); }
+                                    } else {
+                                        let events = if activation == "accessible" { vec![action(Action::Click, stop)] } else { held_events() };
+                                        record_frame_at_size(&mut app, &ctx, size, events);
+                                    }
+                                    for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                    if delayed {
+                                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                                        let (status, node) = tree.nodes.iter().find(|(_, node)|
+                                            node.role() == Role::Label && node.value() == Some(app.record_status.0.as_str())).unwrap();
+                                        assert_eq!(tree.focus, *status, "finishing keeps focus: {activation}, {outcome}, zoom={zoom}, passes={passes}");
+                                        assert!(!node.is_disabled() && node.supports_action(Action::Focus));
+                                        visible(&output, *status);
+                                        assert!(app.recorder.as_ref().unwrap().is_stopping() && app.take.is_none());
+                                        if matches!(activation, "enter" | "space") {
+                                            for _ in 0..2 { record_frame_at_size(&mut app, &ctx, size, held_events()); }
+                                        }
+                                        release.unwrap().send(()).unwrap();
+                                        finish_recording(&mut app);
+                                    }
+                                    for _ in 0..5 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                                    let empty = samples.is_empty();
+                                    let target = *tree.nodes.iter().find(|(_, node)| if empty {
+                                        node.role() == Role::Button && node.label() == Some("⏺  Record")
+                                    } else { node.role() == Role::TextInput && node.value() == Some("Studio take café") }).map(|(id, _)| id).unwrap();
+                                    assert_eq!(tree.focus, target, "finished result keeps focus: {activation}, {outcome}, delayed={delayed}, zoom={zoom}, passes={passes}");
+                                    visible(&output, target);
+                                    let status = app.record_status.clone();
+                                    if matches!(activation, "enter" | "space") {
+                                        let flags = ctx.data(|data| data.get_temp::<(bool, bool)>(egui::Id::new(("held-activation", ctx.viewport_id()))));
+                                        assert_eq!(flags, Some((held == egui::Key::Enter, held == egui::Key::Space)), "guard the held key before replaying it");
+                                        for _ in 0..3 {
+                                            record_frame_at_size(&mut app, &ctx, size, held_events());
+                                            assert_eq!(app.record_status, status);
+                                            assert_eq!(app.record_name, "Studio take café", "the stopping key must not edit the ready name");
+                                            assert!(app.recorder.is_none() && app.recording_save.is_none());
+                                        }
+                                        record_frame_at_size(&mut app, &ctx, size, vec![key(held, false, egui::Modifiers::NONE)]);
+                                    }
+                                    if empty {
+                                        assert!(app.take.is_none());
+                                        assert_eq!(app.record_status.1, if outcome.contains("error") { RED } else { AMBER });
+                                    } else {
+                                        let take = Arc::clone(app.take.as_ref().unwrap());
+                                        let samples = take.samples().unwrap();
+                                        assert_eq!(samples.len(), 240);
+                                        assert!(samples.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+                                        assert_eq!(app.record_status.1, if outcome == "normal" { GREEN } else { AMBER });
+                                        let modifiers = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+                                        record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::A, true, modifiers),
+                                            key(egui::Key::A, false, modifiers), egui::Event::Text("Kept studio take".into())]);
+                                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                        assert_eq!(app.record_name, "Kept studio take", "the finished take can be named immediately");
+                                        assert!(Arc::ptr_eq(app.take.as_ref().unwrap(), &take));
+                                    }
+                                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                                    assert!(app.recorder.is_none() && app.recording_save.is_none() && app.dirty_since.is_none());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_finalization_preserves_navigation_and_pointer_focus() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for zoom in [1.0, 1.5] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for dark in [true, false] {
+                for passes in [1, 2] {
+                    for source in [Source::Microphone, Source::Computer] {
+                        for empty in [false, true] {
+                            for mode in ["capture focus moved", "capture page switched", "finishing focus moved", "finishing page switched",
+                                "result focus queued", "result page queued", "result focus cleared", "pointer stop"] {
+                                let samples: &[f32] = if empty { &[] } else { &[0.25; 480] };
+                                let (recorder, release) = Recorder::delayed_writer_for_test(samples);
+                                let mut app = App::stopped(Default::default());
+                                app.page = super::super::Page::Record;
+                                app.record_source = source;
+                                app.recorder = Some(recorder);
+                                let original = serde_json::to_value(&app.settings).unwrap();
+                                let ctx = egui::Context::default();
+                                ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                                ctx.enable_accesskit();
+                                let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                                    action, target_tree: TreeId::ROOT, target_node, data: None,
+                                });
+                                let key = |key, pressed| egui::Event::Key {
+                                    key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                                };
+                                let button = |output: &egui::FullOutput, label: &str| *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                                    .find(|(_, node)| node.role() == Role::Button && node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                                for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                let stop = button(&output, "Stop recording");
+                                let switched = mode.contains("page");
+                                let other = button(&output, if switched { "Soundboard" } else { "Mute" });
+                                let move_focus = |app: &mut App| {
+                                    let mut events = vec![action(Action::Focus, other)];
+                                    if switched { events.push(action(Action::Click, other)); }
+                                    record_frame_at_size(app, &ctx, size, events);
+                                    for _ in 0..3 { record_frame_at_size(app, &ctx, size, Vec::new()); }
+                                };
+                                if mode != "pointer stop" {
+                                    record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, stop)]);
+                                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                }
+                                if mode.starts_with("capture") {
+                                    move_focus(&mut app);
+                                    app.stop_recording();
+                                } else if mode == "pointer stop" {
+                                    let bounds = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                                        .find(|(id, _)| *id == stop).unwrap().1.bounds().unwrap();
+                                    let pos = egui::pos2((bounds.x0 + bounds.x1) as f32 / 2.0, (bounds.y0 + bounds.y1) as f32 / 2.0);
+                                    for pressed in [true, false] {
+                                        record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos),
+                                            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }]);
+                                    }
+                                } else {
+                                    record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+                                }
+                                for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                assert!(app.recorder.as_ref().unwrap().is_stopping());
+                                if mode.starts_with("finishing") { move_focus(&mut app); }
+                                release.send(()).unwrap();
+                                finish_recording(&mut app);
+                                if mode.starts_with("result") {
+                                    if mode == "result focus cleared" {
+                                        record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Escape, true), key(egui::Key::Escape, false)]);
+                                    } else { move_focus(&mut app); }
+                                }
+                                for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                if matches!(mode, "pointer stop" | "result focus cleared") {
+                                    assert!(ctx.memory(|memory| memory.focused()).is_none(), "completion must not force focus: {mode}");
+                                } else {
+                                    assert_eq!(output.platform_output.accesskit_update.as_ref().unwrap().focus, other,
+                                        "completion preserves navigation: {mode}, empty={empty}, zoom={zoom}, passes={passes}");
+                                }
+                                if switched {
+                                    assert_eq!(app.page, super::super::Page::Soundboard);
+                                    let record = button(&output, "Record");
+                                    record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, record), action(Action::Click, record)]);
+                                    for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                    assert_eq!(app.page, super::super::Page::Record);
+                                    assert_eq!(output.platform_output.accesskit_update.unwrap().focus, record,
+                                        "returning to the page preserves its navigation button rather than the stale capture control");
+                                }
+                                assert_eq!(app.take.is_none(), empty);
+                                if let Some(take) = &app.take { assert_eq!(take.samples().unwrap().len(), 240); }
+                                assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                                assert!(app.recorder.is_none() && app.recording_save.is_none() && app.dirty_since.is_none());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes recording stop/finalization focus screenshots; needs Python with Pillow"]
+    fn snapshot_recording_stop_focus() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        struct StoppedTake {
+            app: App,
+            release: Option<crossbeam_channel::Sender<()>>,
+            complete: bool,
+        }
+        impl eframe::App for StoppedTake {
+            fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+                if self.complete && ui.ctx().cumulative_frame_nr() >= 16 && let Some(release) = self.release.take() {
+                    release.send(()).unwrap();
+                    finish_recording(&mut self.app);
+                }
+                eframe::App::ui(&mut self.app, ui, frame);
+            }
+        }
+        for (zoom, scale) in [(1.0, "100"), (1.25, "125"), (1.5, "150")] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for (dark, theme) in [(true, "dark"), (false, "light")] {
+                for scene in ["finishing", "ready", "partial", "empty", "failed"] {
+                    let samples = if matches!(scene, "empty" | "failed") { Vec::new() } else { vec![0.25; 96_000] };
+                    let (recorder, release) = Recorder::delayed_writer_for_test(&samples);
+                    if matches!(scene, "partial" | "failed") { recorder.report_error_for_test("The recording device disconnected"); }
+                    let mut app = App::stopped(Default::default());
+                    app.page = super::super::Page::Record;
+                    app.record_source = Source::Computer;
+                    app.record_output = "Headphones with a long manufacturer and device description".repeat(3);
+                    app.outputs = vec![app.record_output.clone()];
+                    app.record_name = "Studio take café".into();
+                    app.recorder = Some(recorder);
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                    let stop = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                        node.role() == Role::Button && node.label() == Some("Stop recording")).map(|(id, _)| id).unwrap();
+                    let mut stopped = StoppedTake { app, release: Some(release), complete: scene != "finishing" };
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: stop, data: None,
+                    })]);
+                    events.extend(vec![Vec::new(); 6]);
+                    let press = vec![egui::Event::Key { key: egui::Key::Space, physical_key: Some(egui::Key::Space),
+                        pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }, egui::Event::Text(" ".into())];
+                    events.push(press.clone());
+                    events.extend(vec![Vec::new(); 5]);
+                    events.extend(vec![press; 3]);
+                    events.extend(vec![Vec::new(); 3]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut stopped,
+                        &format!("record-stop-{scene}-{scale}-{theme}"), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(stopped.app.record_name, "Studio take café");
+                    assert!(stopped.app.recording_save.is_none() && stopped.app.dirty_since.is_none());
+                    if scene == "finishing" {
+                        assert!(stopped.app.recorder.as_ref().unwrap().is_stopping());
+                        stopped.release.take().unwrap().send(()).unwrap();
+                        finish_recording(&mut stopped.app);
+                    } else {
+                        assert!(stopped.app.recorder.is_none());
+                        assert_eq!(stopped.app.take.is_none(), samples.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discarding_a_take_restores_record_focus_without_repeating_the_action() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for zoom in [1.0, 1.25, 1.5] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for dark in [true, false] {
+                for passes in [1, 2] {
+                    for source in [Source::Microphone, Source::Computer] {
+                        for activation in ["enter", "space", "accessible", "pointer"] {
+                            let mut app = App::stopped(Default::default());
+                            app.page = super::super::Page::Record;
+                            app.record_source = source;
+                            app.settings.microphone = "Missing recording-focus test microphone".into();
+                            app.record_output = "Missing recording-focus test output".into();
+                            app.take = Recorder::from_samples_for_test(&[0.25; 480]).finish().unwrap().map(Arc::new);
+                            let original = serde_json::to_value(&app.settings).unwrap();
+                            let ctx = egui::Context::default();
+                            ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                            ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                            widgets::configure_text_styles(&ctx);
+                            ctx.enable_accesskit();
+                            let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                                action, target_tree: TreeId::ROOT, target_node, data: None,
+                            });
+                            let key = |key, pressed| egui::Event::Key {
+                                key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                            };
+                            for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            let discard = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.role() == Role::Button && node.label() == Some("Discard take"))
+                                .map(|(id, _)| id).unwrap();
+                            record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, discard)]);
+                            for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            let held = if activation == "space" { egui::Key::Space } else { egui::Key::Enter };
+                            if activation == "pointer" {
+                                let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                let bounds = output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                    .find(|(id, _)| *id == discard).unwrap().1.bounds().unwrap();
+                                let pos = egui::pos2((bounds.x0 + bounds.x1) as f32 / 2.0, (bounds.y0 + bounds.y1) as f32 / 2.0);
+                                for pressed in [true, false] {
+                                    record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pos),
+                                        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }]);
+                                }
+                            } else {
+                                let events = if activation == "accessible" { vec![action(Action::Click, discard)] }
+                                    else { vec![key(held, true)] };
+                                record_frame_at_size(&mut app, &ctx, size, events);
+                            }
+                            for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                            let (record, node) = tree.nodes.iter().find(|(_, node)|
+                                node.role() == Role::Button && node.label() == Some("⏺  Record")).unwrap();
+                            let record = *record;
+                            if activation == "pointer" { assert_ne!(tree.focus, record, "pointer discards do not request keyboard focus"); }
+                            else { assert_eq!(tree.focus, record, "discard returns to Record: {activation}, zoom={zoom}, passes={passes}"); }
+                            let bounds = node.bounds().unwrap();
+                            let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                                egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                            if activation != "pointer" {
+                                assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                                    && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))));
+                            }
+                            if matches!(activation, "enter" | "space") {
+                                for _ in 0..3 {
+                                    record_frame_at_size(&mut app, &ctx, size, vec![key(held, true)]);
+                                    assert_eq!(app.record_status.0, "Take discarded", "held activation must not start a new recording");
+                                }
+                                record_frame_at_size(&mut app, &ctx, size, vec![key(held, false)]);
+                            }
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            let next = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                                .find(|(_, node)| node.role() == Role::Button && node.label() == Some(
+                                    if source == Source::Microphone { "Computer audio" } else { "Microphone" }))
+                                .map(|(id, _)| id).unwrap();
+                            record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, next)]);
+                            record_frame_at_size(&mut app, &ctx, size, vec![key(egui::Key::Enter, true), key(egui::Key::Enter, false)]);
+                            assert!(app.record_source != source, "a fresh activation remains usable");
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                            assert!(app.take.is_none() && app.recorder.is_none() && app.recording_save.is_none() && app.dirty_since.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recording_saves_keep_focus_through_progress_success_and_failure() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for zoom in [1.0, 1.25, 1.5] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for dark in [true, false] {
+                for passes in [1, 2] {
+                    for source in [Source::Microphone, Source::Computer] {
+                        for scene in ["wav", "failed", "add-enter", "add-space", "add-accessible"] {
+                            for timing in ["before progress", "after progress", "focus moved", "page switched", "focus queued", "page queued"] {
+                                let dir = tempfile::tempdir().unwrap();
+                                let saved = dir.path().join("saved.wav");
+                                if scene == "failed" { std::fs::create_dir(&saved).unwrap(); }
+                                let mut app = App::stopped(Default::default());
+                                app.page = super::super::Page::Record;
+                                app.record_source = source;
+                                app.settings.microphone = "Missing recording-focus test microphone".into();
+                                app.record_output = "Missing recording-focus test output".into();
+                                app.record_name = "Recording keyboard focus fixture".into();
+                                let take = Arc::new(Recorder::from_samples_for_test(&[0.25; 480]).finish().unwrap().unwrap());
+                                app.take = Some(Arc::clone(&take));
+                                let original = app.settings.clone();
+                                let ctx = egui::Context::default();
+                                ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                                widgets::configure_text_styles(&ctx);
+                                ctx.enable_accesskit();
+                                let action = |action, target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+                                    action, target_tree: TreeId::ROOT, target_node, data: None,
+                                });
+                                let key = |key, pressed| egui::Event::Key {
+                                    key, physical_key: Some(key), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                                };
+                                let button = |output: &egui::FullOutput, label: &str| *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                                    .find(|(_, node)| node.role() == Role::Button && node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                                for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                let origin = button(&output, if scene.starts_with("add") { "Add to soundboard" } else { "Save WAV…" });
+                                record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, origin)]);
+                                for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                let held = if scene == "add-space" { egui::Key::Space } else { egui::Key::Enter };
+                                if scene.starts_with("add") {
+                                    let events = if scene == "add-accessible" { vec![action(Action::Click, origin)] } else { vec![key(held, true)] };
+                                    record_frame_at_size(&mut app, &ctx, size, events);
+                                } else { app.start_recording_save(RecordingDestination::Wav(saved.clone()), &ctx); }
+                                assert!(app.recording_save.is_some());
+                                let mut held_active = matches!(scene, "add-enter" | "add-space");
+                                let mut other_focus = None;
+                                if timing != "before progress" {
+                                    for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                    let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                                    let (progress, node) = tree.nodes.iter().find(|(_, node)|
+                                        node.role() == Role::Label && node.value() == Some("Saving recording…")).unwrap();
+                                    assert_eq!(tree.focus, *progress, "saving status owns focus: {scene}, {timing}, zoom={zoom}, passes={passes}");
+                                    assert!(!node.is_disabled() && node.supports_action(Action::Focus));
+                                    for label in ["Add to soundboard", "Save WAV…", "Discard take"] {
+                                        let id = button(&output, label);
+                                        assert!(tree.nodes.iter().find(|(node, _)| *node == id).unwrap().1.is_disabled());
+                                    }
+                                    if timing == "after progress" && !held_active {
+                                        record_frame_at_size(&mut app, &ctx, size, vec![key(held, true)]);
+                                        held_active = true;
+                                    }
+                                    if matches!(timing, "focus moved" | "page switched") {
+                                        let target = button(&output, if timing == "focus moved" { "Mute" } else { "Soundboard" });
+                                        let mut events = vec![action(Action::Focus, target)];
+                                        if timing == "page switched" { events.push(action(Action::Click, target)); }
+                                        record_frame_at_size(&mut app, &ctx, size, events);
+                                        for _ in 0..4 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                        other_focus = Some(target);
+                                    }
+                                }
+                                finish_recording_save_with_context(&mut app, &ctx);
+                                if matches!(timing, "focus queued" | "page queued") {
+                                    let target = button(&output, if timing == "focus queued" { "Mute" } else { "Soundboard" });
+                                    let mut events = vec![action(Action::Focus, target)];
+                                    if timing == "page queued" { events.push(action(Action::Click, target)); }
+                                    record_frame_at_size(&mut app, &ctx, size, events);
+                                    other_focus = Some(target);
+                                }
+                                for _ in 0..5 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                                let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                                let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                                let target = other_focus.unwrap_or_else(|| if scene == "failed" { origin } else { button(&output, "⏺  Record") });
+                                assert_eq!(tree.focus, target, "completion keeps the intended focus: {scene}, {timing}, zoom={zoom}, passes={passes}");
+                                if other_focus.is_none() {
+                                    let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                                    let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                                        egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+                                    assert!(output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                                        && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))));
+                                }
+                                assert_eq!(app.page, if matches!(timing, "page switched" | "page queued") { super::super::Page::Soundboard } else { super::super::Page::Record });
+                                let status = app.record_status.clone();
+                                if held_active {
+                                    let flags = ctx.data(|data| data.get_temp::<(bool, bool)>(egui::Id::new(("held-activation", ctx.viewport_id()))));
+                                    assert_eq!(flags, Some((held == egui::Key::Enter, held == egui::Key::Space)), "guard the held key before replaying it");
+                                    for _ in 0..3 {
+                                        let output = record_frame_at_size(&mut app, &ctx, size, vec![key(held, true)]);
+                                        assert_eq!(output.platform_output.accesskit_update.unwrap().focus, target);
+                                        assert_eq!(app.record_status, status);
+                                        assert!(app.recorder.is_none() && app.recording_save.is_none());
+                                    }
+                                    record_frame_at_size(&mut app, &ctx, size, vec![key(held, false)]);
+                                }
+                                let mut expected = original;
+                                if scene == "failed" {
+                                    assert!(Arc::ptr_eq(app.take.as_ref().unwrap(), &take));
+                                    assert!(take.samples().unwrap().iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+                                    assert!(saved.is_dir() && app.record_status.1 == RED);
+                                } else {
+                                    assert!(app.take.is_none() && take.samples().is_err());
+                                    let path = if scene.starts_with("add") {
+                                        assert_eq!(app.settings.sounds.len(), 1);
+                                        let path = app.settings.sounds[0].path.clone();
+                                        expected.sounds.push(Pad::new(path.clone()));
+                                        path
+                                    } else { saved.clone() };
+                                    let samples = crate::decode::load_clip(&path).unwrap();
+                                    assert_eq!(samples.len(), 240);
+                                    assert!(samples.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+                                    if scene.starts_with("add") { std::fs::remove_file(path).unwrap(); }
+                                    assert_eq!(app.record_status.1, GREEN);
+                                }
+                                assert_eq!(serde_json::to_value(&app.settings).unwrap(), serde_json::to_value(&expected).unwrap());
+                                assert_eq!(app.dirty_since.is_some(), scene.starts_with("add"));
+                                assert_eq!(app.record_name, "Recording keyboard focus fixture");
+                                assert!(app.recorder.is_none() && app.clip_loads.is_none() && app.clip_import.is_none());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disconnected_recording_saves_return_focus_to_the_name_for_retry() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                let mut app = App::stopped(Default::default());
+                app.page = super::super::Page::Record;
+                let take = Arc::new(Recorder::from_samples_for_test(&[0.25; 480]).finish().unwrap().unwrap());
+                app.take = Some(Arc::clone(&take));
+                let (done, job) = crossbeam_channel::bounded(1);
+                app.recording_save = Some(RecordingSave { job, add_to_board: false });
+                app.record_status = ("Saving recording…".into(), CYAN);
+                let ctx = egui::Context::default();
+                ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                ctx.enable_accesskit();
+                for _ in 0..3 { short_record_frame(&mut app, &ctx, Vec::new()); }
+                let output = short_record_frame(&mut app, &ctx, Vec::new());
+                let status = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                    node.role() == Role::Label && node.value() == Some("Saving recording…")).map(|(id, _)| id).unwrap();
+                short_record_frame(&mut app, &ctx, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus, target_tree: TreeId::ROOT, target_node: status, data: None,
+                })]);
+                drop(done);
+                app.poll_recording_save(&ctx);
+                for _ in 0..4 { short_record_frame(&mut app, &ctx, Vec::new()); }
+                let output = short_record_frame(&mut app, &ctx, Vec::new());
+                let tree = output.platform_output.accesskit_update.unwrap();
+                let name = *tree.nodes.iter().find(|(_, node)| node.role() == Role::TextInput && node.value() == Some("Mic recording"))
+                    .map(|(id, _)| id).unwrap();
+                assert_eq!(tree.focus, name);
+                assert!(Arc::ptr_eq(app.take.as_ref().unwrap(), &take));
+                assert!(app.record_status.0.contains("stopped unexpectedly"));
+                assert!(app.recording_save.is_none() && app.recorder.is_none() && app.dirty_since.is_none());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes recording focus-transition screenshots; needs Python with Pillow"]
+    fn snapshot_recording_focus_transitions() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        struct Transition {
+            app: App,
+            start: Option<RecordingDestination>,
+            complete: bool,
+        }
+        impl eframe::App for Transition {
+            fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+                if ui.ctx().cumulative_frame_nr() >= 10 && let Some(destination) = self.start.take() {
+                    self.app.start_recording_save(destination, ui.ctx());
+                }
+                if self.complete && ui.ctx().cumulative_frame_nr() >= 16 && self.app.recording_save.is_some() {
+                    finish_recording_save_with_context(&mut self.app, ui.ctx());
+                }
+                eframe::App::ui(&mut self.app, ui, frame);
+            }
+        }
+        for (zoom, scale) in [(1.0, "100"), (1.25, "125"), (1.5, "150")] {
+            let size = egui::vec2(700.0, 420.0) / zoom;
+            for (dark, theme) in [(true, "dark"), (false, "light")] {
+                for scene in ["discarded", "saving", "saved", "failed"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let blocked = dir.path().join("blocked.wav");
+                    if scene == "failed" { std::fs::create_dir(&blocked).unwrap(); }
+                    let mut app = App::stopped(Default::default());
+                    app.page = super::super::Page::Record;
+                    app.record_source = Source::Computer;
+                    app.record_output = "Headphones with a long manufacturer and device description".repeat(3);
+                    app.outputs = vec![app.record_output.clone()];
+                    app.record_name = "Keyboard focused take".into();
+                    app.take = Recorder::from_samples_for_test(&vec![0.25; 96_000]).finish().unwrap().map(Arc::new);
+                    app.record_status = ("Take ready".into(), GREEN);
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                    let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                    let label = match scene { "discarded" => "Discard take", "failed" => "Save WAV…", _ => "Add to soundboard" };
+                    let target = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                        node.role() == Role::Button && node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                    let mut transition = Transition { app,
+                        start: (scene == "failed").then_some(RecordingDestination::Wav(blocked)),
+                        complete: matches!(scene, "saved" | "failed"),
+                    };
+                    let mut events = vec![Vec::new(); 3];
+                    events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: target, data: None,
+                    })]);
+                    events.extend(vec![Vec::new(); 6]);
+                    let press = egui::Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter),
+                        pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+                    events.push(vec![press.clone()]);
+                    events.extend(vec![Vec::new(); 5]);
+                    events.extend(vec![vec![press]; 3]);
+                    events.extend(vec![Vec::new(); 3]);
+                    let image = super::super::snapshot::snapshot_with_events(&mut transition,
+                        &format!("record-transition-{scene}-{scale}-{theme}"), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert!(transition.app.recorder.is_none());
+                    match scene {
+                        "discarded" => assert!(transition.app.take.is_none() && transition.app.record_status.0 == "Take discarded"),
+                        "saving" => {
+                            assert!(transition.app.take.is_some() && transition.app.recording_save.is_some());
+                            finish_recording_save(&mut transition.app);
+                        }
+                        "saved" => assert!(transition.app.take.is_none() && transition.app.record_status.1 == GREEN),
+                        _ => assert!(transition.app.take.is_some() && transition.app.recording_save.is_none() && transition.app.record_status.1 == RED),
+                    }
+                    for pad in &transition.app.settings.sounds { std::fs::remove_file(&pad.path).unwrap(); }
                 }
             }
         }
@@ -2360,6 +3494,243 @@ mod tests {
     }
 
     #[test]
+    fn soundboard_controls_fit_and_keep_focus_when_text_size_changes() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("responsive-{index}.wav"), 0.1)).collect();
+        let controls = [
+            (Role::Button, "Cancel import"), (Role::TextInput, "Search clips"),
+            (Role::Button, "Play target"), (Role::Button, "Rename target"),
+            (Role::CheckBox, "Add target to the strip"), (Role::Button, "Remove target"),
+            (Role::Button, "Stop clips"), (Role::Slider, "volume"),
+            (Role::SpinButton, "volume"), (Role::CheckBox, "Let clips overlap"),
+        ];
+        let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        });
+        let tab = || egui::Event::Key { key: egui::Key::Tab, physical_key: None,
+            pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let visible = |output: &egui::FullOutput, target, label: &str, zoom, size: egui::Vec2| {
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            assert_eq!(tree.focus, target, "{label} keeps focus at {zoom}");
+            let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+            let rect = egui::Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
+            assert!(rect.right() <= size.x && output.shapes.iter().any(|shape| shape.clip_rect.contains_rect(rect)
+                && match &shape.shape {
+                    egui::Shape::Rect(shape) => shape.rect.intersects(rect),
+                    egui::Shape::Text(shape) => shape.visual_bounding_rect().intersects(rect),
+                    _ => false,
+                }), "{label} is fully visible at {zoom}: {rect:?}");
+            if label.ends_with("target") || label == "Add target to the strip" {
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Rect(pad) if (pad.rect.height() - 108.0).abs() < 0.01
+                        && pad.rect.contains(rect.center()) && shape.clip_rect.expand(0.5 / zoom).contains_rect(pad.rect))),
+                    "the whole focused {label} pad fits at {zoom}: {rect:?}; pad/clip={:?}",
+                    output.shapes.iter().filter_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(pad) if (pad.rect.height() - 108.0).abs() < 0.01
+                            && pad.rect.contains(rect.center()) => Some((pad.rect, shape.clip_rect)), _ => None,
+                    }).collect::<Vec<_>>());
+                let title = output.shapes.iter().find(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.text() == "target")).expect("the focused pad's title is drawn");
+                for shape in &output.shapes {
+                    if shape.clip_rect == title.clip_rect && let egui::Shape::Text(text) = &shape.shape {
+                        assert!(shape.clip_rect.expand(0.5 / zoom).contains_rect(text.visual_bounding_rect()),
+                            "pad names and details fit instead of cutting off glyphs at {zoom}: {}", text.galley.text());
+                    }
+                }
+            }
+        };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for assistive in [false, true] {
+                    let mut app = App::stopped(crate::config::Settings {
+                        sounds: paths.iter().cloned().map(Pad::new).collect(), sound_volume: 0.61347,
+                        overlap_clips: false, ..Default::default()
+                    });
+                    app.page = super::super::Page::Soundboard;
+                    app.pad_filter = "r".into();
+                    app.engine = Some(crate::engine::Engine::for_test());
+                    app.settings.sounds[11].name = Some("target".into());
+                    for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    app.play_clip(0, &ctx);
+                    let original = serde_json::to_value(&app.settings).unwrap();
+                    let playing = app.playing.clone();
+                    let progress = app.pad_progress.clone();
+                    let status = app.sound_status.clone();
+                    let (_done, job) = crossbeam_channel::bounded(1);
+                    app.clip_import = Some(ClipImport {
+                        files: [dir.path().join("Field recording - extended audience applause.wav")].into(),
+                        job: Some(job), total: 2, added: 1, invalid: Vec::new(), cancel: Arc::default(),
+                    });
+                    let mut ids = Vec::new();
+                    let mut size = egui::vec2(700.0, 420.0);
+                    for (transition, zoom) in [1.0, 1.25, 1.0, 1.5, 1.0].into_iter().enumerate() {
+                        let keep = (transition > 0).then(|| [3, 7, 1, 8][transition - 1]);
+                        if let Some(index) = keep {
+                            record_frame_at_size(&mut app, &ctx, size, vec![focus(ids[index])]);
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        }
+                        ctx.options_mut(|options| options.zoom_factor = zoom);
+                        size = egui::vec2(700.0, 420.0) / zoom;
+                        for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        if let Some(index) = keep { visible(&output, ids[index], controls[index].1, zoom, size); }
+                        let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+                        let top = tree.nodes.iter().find(|(_, node)| node.label() == Some("Pause responsive-0"))
+                            .unwrap().1.bounds().unwrap().y0;
+                        let columns = tree.nodes.iter().filter(|(_, node)| node.role() == Role::Button
+                            && node.label().is_some_and(|label| label == "Pause responsive-0" || label.starts_with("Play responsive-"))
+                            && node.bounds().is_some_and(|bounds| bounds.y0 == top)).count();
+                        assert_eq!(columns, if zoom == 1.0 { 3 } else if zoom == 1.25 { 2 } else { 1 }, "the grid reflows at {zoom}");
+                        for (index, (role, label)) in controls.into_iter().enumerate() {
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            let target = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)| {
+                                node.role() == role && if label == "volume" { node.numeric_value() == Some(f64::from(0.61347f32)) }
+                                    else if role == Role::TextInput { node.placeholder() == Some(label) } else { node.label() == Some(label) }
+                            }).map(|(id, _)| id).unwrap_or_else(|| panic!("missing {role:?} {label} at {zoom}"));
+                            if ids.len() == index { ids.push(target); } else { assert_eq!(ids[index], target, "{role:?} {label} keeps its identity at {zoom}"); }
+                            if assistive {
+                                record_frame_at_size(&mut app, &ctx, size, vec![focus(target)]);
+                            } else {
+                                let mut reached = false;
+                                for _ in 0..100 {
+                                    let output = record_frame_at_size(&mut app, &ctx, size, vec![tab()]);
+                                    if output.platform_output.accesskit_update.unwrap().focus == target { reached = true; break; }
+                                }
+                                assert!(reached, "Tab reaches {role:?} {label} at {zoom}; passes={passes}");
+                            }
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            visible(&record_frame_at_size(&mut app, &ctx, size, Vec::new()), target, label, zoom, size);
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), original, "navigation preserves settings precision");
+                            assert_eq!(app.playing, playing);
+                            assert_eq!(app.pad_progress, progress);
+                            assert_eq!(app.sound_status, status);
+                            assert_eq!(app.pad_filter, "r", "resizing preserves the search query");
+                            assert!(app.dirty_since.is_none() && app.clip_loads.is_none() && app.renaming_pad.is_none());
+                            assert!(!app.clip_import.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn focused_soundboard_pads_fit_after_height_only_resizing() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("responsive-{index}.wav"), 0.1)).collect();
+        let controls = [(Role::Button, "Play target"), (Role::Button, "Rename target"),
+            (Role::CheckBox, "Add target to the strip"), (Role::Button, "Remove target"), (Role::TextInput, "target")];
+        let focus = |target_node| egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+        });
+        let pad_visible = |output: &egui::FullOutput, target, zoom| {
+            let tree = output.platform_output.accesskit_update.as_ref().unwrap();
+            assert_eq!(tree.focus, target);
+            let bounds = tree.nodes.iter().find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+            let center = egui::pos2(((bounds.x0 + bounds.x1) * 0.5) as f32, ((bounds.y0 + bounds.y1) * 0.5) as f32);
+            output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(pad)
+                if (pad.rect.height() - 108.0).abs() < 0.01 && pad.rect.contains(center)
+                    && shape.clip_rect.expand(0.5 / zoom).contains_rect(pad.rect)))
+        };
+        for dark in [true, false] {
+            for passes in [1, 2] {
+                for zoom in [1.0, 1.25, 1.5] {
+                    for (role, label) in controls {
+                        let mut app = App::stopped(crate::config::Settings {
+                            sounds: paths.iter().cloned().map(Pad::new).collect(), sound_volume: 0.61347,
+                            overlap_clips: false, ..Default::default()
+                        });
+                        app.page = super::super::Page::Soundboard;
+                        app.settings.sounds[11].name = Some("target".into());
+                        app.pad_filter = "r".into();
+                        app.engine = Some(crate::engine::Engine::for_test());
+                        for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                        let ctx = egui::Context::default();
+                        ctx.options_mut(|options| { options.max_passes = passes.try_into().unwrap(); options.zoom_factor = zoom; });
+                        ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                        widgets::configure_text_styles(&ctx);
+                        ctx.enable_accesskit();
+                        app.play_clip(0, &ctx);
+                        let (_done, job) = crossbeam_channel::bounded(1);
+                        app.clip_import = Some(ClipImport {
+                            files: [dir.path().join("Field recording - extended audience applause.wav")].into(),
+                            job: Some(job), total: 2, added: 1, invalid: Vec::new(), cancel: Arc::default(),
+                        });
+                        let original = serde_json::to_value(&app.settings).unwrap();
+                        let playing = app.playing.clone();
+                        let progress = app.pad_progress.clone();
+                        let status = app.sound_status.clone();
+                        let mut size = egui::vec2(700.0, 880.0) / zoom;
+                        for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let opening = if role == Role::TextInput { "Rename target" } else { label };
+                        let target = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(_, node)| node.label() == Some(opening)).map(|(id, _)| id).unwrap();
+                        record_frame_at_size(&mut app, &ctx, size, vec![focus(target)]);
+                        for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        if role == Role::TextInput {
+                            record_frame_at_size(&mut app, &ctx, size, [true, false].into_iter().map(|pressed| egui::Event::Key {
+                                key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                            }).collect());
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                        }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let target = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                            node.role() == role && if role == Role::TextInput { node.value() == Some(label) } else { node.label() == Some(label) }
+                        ).map(|(id, _)| id).unwrap();
+                        for height in [420.0, 880.0, 420.0] {
+                            size.y = height / zoom;
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            assert!(pad_visible(&output, target, zoom), "the whole focused {label} pad fits after resizing: height={height}, zoom={zoom}, passes={passes}");
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                            assert_eq!(app.playing, playing);
+                            assert_eq!(app.pad_progress, progress);
+                            assert_eq!(app.sound_status, status);
+                            assert_eq!(app.pad_filter, "r");
+                            assert_eq!(app.renaming_pad.as_ref().map(|edit| (&edit.path, edit.text.as_str())),
+                                (role == Role::TextInput).then_some((&paths[11], "target")));
+                            assert!(app.dirty_since.is_none() && app.clip_loads.is_none());
+                            assert!(!app.clip_import.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+                        }
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let bounds = output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(id, _)| *id == target).unwrap().1.bounds().unwrap();
+                        let pointer = egui::pos2(((bounds.x0 + bounds.x1) * 0.5) as f32, ((bounds.y0 + bounds.y1) * 0.5) as f32);
+                        for (delta, visible) in [(1000.0, false), (-1000.0, true)] {
+                            record_frame_at_size(&mut app, &ctx, size, vec![egui::Event::PointerMoved(pointer), egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, delta),
+                                modifiers: egui::Modifiers::NONE, phase: egui::TouchPhase::Move,
+                            }]);
+                            for _ in 0..8 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                            let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                            assert_eq!(pad_visible(&output, target, zoom), visible,
+                                "manual scrolling can leave and return to the focused {label} pad without snapping back; zoom={zoom}, delta={delta}");
+                            assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                            assert_eq!(app.playing, playing);
+                            assert_eq!(app.pad_progress, progress);
+                            assert_eq!(app.sound_status, status);
+                            assert_eq!(app.pad_filter, "r");
+                            assert_eq!(app.renaming_pad.as_ref().map(|edit| (&edit.path, edit.text.as_str())),
+                                (role == Role::TextInput).then_some((&paths[11], "target")));
+                            assert!(app.dirty_since.is_none() && app.clip_loads.is_none());
+                            assert!(!app.clip_import.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn search_keeps_focus_and_query_when_background_clips_and_engine_status_change() {
         use egui::accesskit::{Action, ActionRequest, Role, TreeId};
         let dir = tempfile::tempdir().unwrap();
@@ -2643,6 +4014,137 @@ mod tests {
         assert_eq!(app.settings.sounds, [Pad::new(good)]);
         assert_eq!(app.sound_status, ("Added 1 clip · Could not read: failed.wav".into(), AMBER));
         assert!(app.update_blocker().is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn snapshot_responsive_soundboard_controls() {
+        use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("responsive-{index}.wav"), 0.1)).collect();
+        for (zoom, scale) in [(1.0, "standard"), (1.25, "medium"), (1.5, "zoomed")] {
+            for (dark, theme) in [(true, "dark"), (false, "light")] {
+                for scene in ["import", "search", "pad", "playback", "overview", "empty"] {
+                    if scene == "empty" && zoom != 1.5 { continue; }
+                    let mut app = App::stopped(crate::config::Settings {
+                        sounds: if scene == "empty" { Vec::new() } else { paths.iter().cloned().map(Pad::new).collect() },
+                        sound_volume: 0.61347, overlap_clips: false, ..Default::default()
+                    });
+                    app.page = super::super::Page::Soundboard;
+                    if scene != "empty" {
+                        app.settings.sounds[0].name = Some("Audience applause - extended field recording".into());
+                        app.settings.sounds[11].name = Some("target".into());
+                        app.engine = Some(crate::engine::Engine::for_test());
+                        for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                        app.play_clip(0, &egui::Context::default());
+                        app.clip_import = Some(ClipImport {
+                            files: [dir.path().join("Field recording - extended audience applause.wav")].into(),
+                            job: None, total: 2, added: 1, invalid: Vec::new(), cancel: Arc::default(),
+                        });
+                    }
+                    if scene == "search" { app.pad_filter = "r".into(); }
+                    let original = serde_json::to_value(&app.settings).unwrap();
+                    let size = egui::vec2(700.0, if scene == "overview" { 1000.0 } else { 420.0 }) / zoom;
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                    widgets::configure_text_styles(&ctx);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
+                    let mut events = vec![Vec::new(); 3];
+                    if !matches!(scene, "overview" | "empty") {
+                        let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
+                        let (role, label) = match scene {
+                            "import" => (Role::Button, "Cancel import"), "search" => (Role::TextInput, "Search clips"),
+                            "pad" => (Role::Button, "Play target"), _ => (Role::SpinButton, "volume"),
+                        };
+                        let target_node = *output.platform_output.accesskit_update.unwrap().nodes.iter().find(|(_, node)|
+                            node.role() == role && if role == Role::SpinButton { node.numeric_value() == Some(f64::from(0.61347f32)) }
+                                else if role == Role::TextInput { node.placeholder() == Some(label) } else { node.label() == Some(label) }
+                        ).map(|(id, _)| id).unwrap();
+                        events.push(vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                            action: Action::Focus, target_tree: TreeId::ROOT, target_node, data: None,
+                        })]);
+                        events.extend(vec![Vec::new(); 8]);
+                    }
+                    let image = super::super::snapshot::snapshot_with_events(&mut app,
+                        &format!("board-responsive-{scene}-{scale}-{theme}"), size, zoom, dark, events);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                    assert!(app.dirty_since.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes focused Soundboard pads after height-only resizing; needs Python with Pillow"]
+    fn snapshot_soundboard_pads_after_resizing() {
+        use egui::accesskit::{Action, ActionRequest, TreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..12).map(|index| wav(dir.path(), &format!("responsive-{index}.wav"), 0.1)).collect();
+        for (dark, theme) in [(true, "dark"), (false, "light")] {
+            for zoom in [1.0, 1.25, 1.5] {
+                for (label, scene) in [("Play target", "play"), ("Rename target", "rename"),
+                    ("Add target to the strip", "star"), ("Remove target", "remove"), ("Rename target", "edit")]
+                {
+                    let mut app = App::stopped(crate::config::Settings {
+                        sounds: paths.iter().cloned().map(Pad::new).collect(), sound_volume: 0.61347,
+                        overlap_clips: false, ..Default::default()
+                    });
+                    app.page = super::super::Page::Soundboard;
+                    app.settings.sounds[11].name = Some("target".into());
+                    app.pad_filter = "r".into();
+                    app.engine = Some(crate::engine::Engine::for_test());
+                    for path in &paths { app.cache_clip(path.clone(), CachedClip::read(path, &AtomicBool::new(false)).unwrap()); }
+                    app.play_clip(0, &egui::Context::default());
+                    app.clip_import = Some(ClipImport {
+                        files: [dir.path().join("Field recording - extended audience applause.wav")].into(),
+                        job: None, total: 2, added: 1, invalid: Vec::new(), cancel: Arc::default(),
+                    });
+                    let original = serde_json::to_value(&app.settings).unwrap();
+                    let playing = app.playing.clone();
+                    let progress = app.pad_progress.clone();
+                    let status = app.sound_status.clone();
+                    let initial = egui::vec2(700.0, 880.0) / zoom;
+                    let size = egui::vec2(700.0, 420.0) / zoom;
+                    let ctx = egui::Context::default();
+                    ctx.options_mut(|options| options.zoom_factor = zoom);
+                    ctx.enable_accesskit();
+                    for _ in 0..3 { record_frame_at_size(&mut app, &ctx, initial, Vec::new()); }
+                    let output = record_frame_at_size(&mut app, &ctx, initial, Vec::new());
+                    let target = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .find(|(_, node)| node.label() == Some(label)).map(|(id, _)| id).unwrap();
+                    let input = |size, events| egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default()
+                    };
+                    let mut inputs: Vec<_> = (0..3).map(|_| input(initial, Vec::new())).collect();
+                    inputs.push(input(initial, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                        action: Action::Focus, target_tree: TreeId::ROOT, target_node: target, data: None,
+                    })]));
+                    inputs.extend((0..8).map(|_| input(initial, Vec::new())));
+                    if scene == "edit" {
+                        inputs.push(input(initial, [true, false].into_iter().map(|pressed| egui::Event::Key {
+                            key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed, repeat: false, modifiers: egui::Modifiers::NONE,
+                        }).collect()));
+                        inputs.extend((0..8).map(|_| input(initial, Vec::new())));
+                    }
+                    inputs.extend((0..8).map(|_| input(size, Vec::new())));
+                    let image = super::super::snapshot::snapshot_with_inputs(&mut app,
+                        &format!("board-resize-{scene}-{}-{theme}", (zoom * 100.0) as u32), size, zoom, dark, inputs);
+                    println!("SNAPSHOT {}", image.display());
+                    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                    assert_eq!(app.playing, playing);
+                    assert_eq!(app.pad_progress, progress);
+                    assert_eq!(app.sound_status, status);
+                    assert_eq!(app.pad_filter, "r");
+                    assert_eq!(app.renaming_pad.as_ref().map(|edit| (&edit.path, edit.text.as_str())),
+                        (scene == "edit").then_some((&paths[11], "target")));
+                    assert!(app.dirty_since.is_none() && app.clip_loads.is_none());
+                    assert!(!app.clip_import.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+                }
+            }
+        }
     }
 
     #[test]

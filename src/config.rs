@@ -434,7 +434,23 @@ impl Settings {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SETTINGS_PATH_FOR_TEST: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn use_settings_path_for_test(path: &Path) -> impl Drop {
+    struct Restore(Option<PathBuf>, std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) { SETTINGS_PATH_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take()); }
+    }
+    Restore(SETTINGS_PATH_FOR_TEST.with(|slot| slot.replace(Some(path.to_owned()))), std::marker::PhantomData)
+}
+
 pub fn settings_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = SETTINGS_PATH_FOR_TEST.with(|slot| slot.borrow().clone()) { return path; }
     // Tests exercise code that saves settings; keep them off the real file.
     if cfg!(test) {
         return std::env::temp_dir()
@@ -457,6 +473,27 @@ fn legacy_settings_paths() -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+#[test]
+fn isolated_settings_paths_restore_nested_scopes_and_do_not_cross_threads() {
+    let original = settings_path();
+    let folder = tempfile::tempdir().unwrap();
+    let outer = folder.path().join("outer.json");
+    let inner = folder.path().join("inner.json");
+    {
+        let _outer = use_settings_path_for_test(&outer);
+        assert_eq!(settings_path(), outer);
+        {
+            let _inner = use_settings_path_for_test(&inner);
+            assert_eq!(settings_path(), inner);
+        }
+        assert_eq!(settings_path(), outer);
+        let expected = original.clone();
+        std::thread::spawn(move || assert_eq!(settings_path(), expected)).join().unwrap();
+        assert_eq!(settings_path(), outer);
+    }
+    assert_eq!(settings_path(), original);
 }
 
 /// Passed by the Windows startup entry: start hidden in the tray.

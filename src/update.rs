@@ -355,6 +355,14 @@ pub struct Updater {
     wake: Arc<dyn Fn() + Send + Sync>,
     done: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
+    #[cfg(test)]
+    next_download: Option<(crossbeam_channel::Receiver<Result<()>>, u64)>,
+    #[cfg(test)]
+    next_check: Option<crossbeam_channel::Receiver<Result<Option<Release>>>>,
+    #[cfg(test)]
+    install_error: Option<String>,
+    #[cfg(test)]
+    install_attempts: usize,
 }
 
 impl Updater {
@@ -368,6 +376,14 @@ impl Updater {
             wake: Arc::new(wake),
             done: Arc::default(),
             cancel: Arc::default(),
+            #[cfg(test)]
+            next_download: None,
+            #[cfg(test)]
+            next_check: None,
+            #[cfg(test)]
+            install_error: None,
+            #[cfg(test)]
+            install_attempts: 0,
         }
     }
 
@@ -425,6 +441,12 @@ impl Updater {
         }
         self.last_check = Some(Instant::now());
         self.status = Status::Checking;
+        #[cfg(test)]
+        if let Some(completion) = self.next_check.take() {
+            self.spawn("test-update-check", move |_, _| Event::Checked(
+                completion.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("Update check fixture closed")))));
+            return;
+        }
         self.spawn("openmic-update-check", |_, _| Event::Checked(check(&agent(), &feed())));
     }
 
@@ -442,7 +464,17 @@ impl Updater {
         self.done.store(0, Ordering::Relaxed);
         self.cancel.store(false, Ordering::Relaxed);
         self.status = Status::Downloading(release.clone());
+        #[cfg(test)]
+        let completion = self.next_download.take();
+        #[cfg(test)]
+        if let Some((_, done)) = &completion { self.done.store(*done, Ordering::Relaxed); }
         self.spawn("openmic-update-download", move |done, cancel| {
+            #[cfg(test)]
+            let result = if let Some((completion, _)) = completion {
+                completion.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("Update download fixture closed")))
+                    .and_then(|()| check_download_cancelled(cancel))
+            } else { download(&agent(), &release, &RELEASE_KEY, &paths.staged, done, cancel) };
+            #[cfg(not(test))]
             let result = download(&agent(), &release, &RELEASE_KEY, &paths.staged, done, cancel);
             Event::Downloaded(release, result)
         });
@@ -460,6 +492,11 @@ impl Updater {
     /// quits; the new copy waits for that before it opens any devices.
     pub fn install(&mut self) -> Result<()> {
         let Status::Ready(_) = &self.status else { bail!("no update is ready") };
+        #[cfg(test)]
+        {
+            self.install_attempts += 1;
+            if let Some(error) = &self.install_error { bail!("{error}"); }
+        }
         let paths = Paths::current()?;
         replace(&paths)?;
         let started = std::process::Command::new(&paths.exe)
@@ -510,6 +547,24 @@ impl Updater {
     pub fn set_status_for_test(&mut self, status: Status) {
         self.status = status;
     }
+
+    /// Exercise GUI actions through the real worker lifecycle without networking.
+    pub(crate) fn hold_next_download_for_test(&mut self, done: u64) -> crossbeam_channel::Sender<Result<()>> {
+        let (completion, wait) = crossbeam_channel::bounded(1);
+        self.next_download = Some((wait, done));
+        completion
+    }
+
+    pub(crate) fn hold_next_check_for_test(&mut self) -> crossbeam_channel::Sender<Result<Option<Release>>> {
+        let (completion, wait) = crossbeam_channel::bounded(1);
+        self.next_check = Some(wait);
+        completion
+    }
+
+    /// Keep keyboard fixtures from replacing or starting the test executable.
+    pub(crate) fn reject_installs_for_test(&mut self, error: &str) { self.install_error = Some(error.into()); }
+
+    pub(crate) fn install_attempts_for_test(&self) -> usize { self.install_attempts }
 }
 
 #[cfg(test)]

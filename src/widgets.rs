@@ -44,9 +44,55 @@ pub fn text_color(ui: &egui::Ui, accent: Color32) -> Color32 {
     }
 }
 
-/// Reveal newly focused controls during keyboard or assistive navigation.
+/// Consume an action before focus moves to a replacement control.
+pub fn finish_keyboard_activation(ctx: &egui::Context) {
+    let id = egui::Id::new(("held-activation", ctx.viewport_id()));
+    let (enter, space, space_pressed) = ctx.input(|input| (input.key_down(egui::Key::Enter),
+        input.key_down(egui::Key::Space), input.key_pressed(egui::Key::Space)));
+    ctx.input_mut(|input| input.events.retain(|event| !matches!(event,
+        egui::Event::Key { key: egui::Key::Enter | egui::Key::Space, pressed: true, .. })
+        && !((space || space_pressed) && matches!(event, egui::Event::Text(text) if text == " "))));
+    ctx.data_mut(|data| {
+        if enter || space { data.insert_temp(id, (enter, space)); }
+        else { data.remove::<(bool, bool)>(id); }
+    });
+}
+
+/// Ignore repeats of a completed action until its activation keys are released.
+pub fn consume_held_activation(ctx: &egui::Context) {
+    let id = egui::Id::new(("held-activation", ctx.viewport_id()));
+    let Some((mut enter, mut space)) = ctx.data(|data| data.get_temp::<(bool, bool)>(id)) else { return };
+    if ctx.input(|input| input.focused) {
+        ctx.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::Key { key: egui::Key::Enter, pressed: false, .. } => { enter = false; true },
+                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => { space = false; true },
+                egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => !enter,
+                egui::Event::Key { key: egui::Key::Space, pressed: true, .. } => !space,
+                egui::Event::Text(text) if space && text == " " => false,
+                _ => true,
+            });
+            // A release followed by a new press in this batch is a fresh action.
+            enter &= input.key_down(egui::Key::Enter);
+            space &= input.key_down(egui::Key::Space);
+        });
+    } else { enter = false; space = false; }
+    ctx.data_mut(|data| {
+        if enter || space { data.insert_temp(id, (enter, space)); }
+        else { data.remove::<(bool, bool)>(id); }
+    });
+}
+
+/// Reveal focused controls when navigating or resizing the viewport.
 pub fn scroll_on_focus(response: &Response) {
-    if response.gained_focus()
+    let layout = (response.ctx.content_rect().size(), response.ctx.zoom_factor());
+    let id = response.id.with(("focus-viewport", response.ctx.viewport_id()));
+    let reflowed = response.ctx.data_mut(|data| {
+        let previous = data.get_temp::<(Vec2, f32)>(id);
+        data.insert_temp(id, layout);
+        previous.is_some_and(|previous| previous != layout)
+    });
+    if response.has_focus() && (response.gained_focus() || reflowed)
         && response.ctx.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
     {
         response.scroll_to_me(Some(Align::Center));

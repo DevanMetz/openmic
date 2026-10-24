@@ -311,44 +311,61 @@ pub(super) fn snapshot(app: &mut impl eframe::App, name: &str, size: egui::Vec2,
 
 /// Replay input first, then let menus and animations settle before rendering.
 pub(super) fn snapshot_with_events(app: &mut impl eframe::App, name: &str, size: egui::Vec2, ppp: f32, dark: bool, events: Vec<Vec<egui::Event>>) -> PathBuf {
+    let inputs = events.into_iter().map(|events| egui::RawInput { events, ..Default::default() }).collect();
+    snapshot_frame(app, name, size, ppp, dark, inputs, None)
+}
+
+/// Replay complete input frames, including window resizes, before rendering.
+pub(super) fn snapshot_with_inputs(app: &mut impl eframe::App, name: &str, size: egui::Vec2, ppp: f32, dark: bool, inputs: Vec<egui::RawInput>) -> PathBuf {
+    snapshot_frame(app, name, size, ppp, dark, inputs, None)
+}
+
+/// Render a deferred native window using the callback its parent registered.
+pub(super) fn snapshot_viewport_with_events(app: &mut impl eframe::App, name: &str, size: egui::Vec2, ppp: f32, dark: bool, events: Vec<Vec<egui::Event>>, viewport: egui::ViewportId) -> PathBuf {
+    let inputs = events.into_iter().map(|events| egui::RawInput { events, ..Default::default() }).collect();
+    snapshot_frame(app, name, size, ppp, dark, inputs, Some(viewport))
+}
+
+fn snapshot_frame(app: &mut impl eframe::App, name: &str, size: egui::Vec2, ppp: f32, dark: bool, inputs: Vec<egui::RawInput>, viewport: Option<egui::ViewportId>) -> PathBuf {
     let ctx = egui::Context::default();
     ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+    if viewport.is_some() { ctx.set_embed_viewports(false); }
     crate::widgets::configure_text_styles(&ctx);
     let mut frame = eframe::Frame::_new_kittest();
     let mut textures: HashMap<TextureId, ColorImage> = HashMap::new();
     let mut output = None;
-    let frames = events.len() + 4;
-    let mut events = events.into_iter();
+    let frames = inputs.len() + 4;
+    let mut inputs = inputs.into_iter();
     for step in 0..frames {
-        let mut input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, size)),
-            time: Some(step as f64 * 0.2),
-            events: events.next().unwrap_or_default(),
-            ..Default::default()
-        };
-        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
-        let full = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
-        for (id, deltas) in &full.textures_delta.set {
-            for delta in deltas {
-                let egui::ImageData::Color(image) = &delta.image;
-                match delta.pos {
-                    None => {
-                        textures.insert(*id, (**image).clone());
-                    }
-                    Some([x0, y0]) => {
-                        let tex = textures.get_mut(id).expect("patch to a known texture");
-                        for y in 0..image.size[1] {
-                            for x in 0..image.size[0] {
-                                tex.pixels[(y0 + y) * tex.size[0] + x0 + x] = image.pixels[y * image.size[0] + x];
-                            }
-                        }
-                    }
-                }
-            }
+        let mut input = inputs.next().unwrap_or_default();
+        input.screen_rect.get_or_insert(egui::Rect::from_min_size(Pos2::ZERO, size));
+        input.time.get_or_insert(step as f64 * 0.2);
+        let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+        info.native_pixels_per_point = Some(ppp);
+        if viewport.is_some() {
+            info.inner_rect = Some(egui::Rect::from_min_size(egui::pos2(300.0, 200.0), size));
+            info.outer_rect = info.inner_rect;
         }
-        output = Some(full);
+        let mut full = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+        update_textures(&mut textures, &full);
+        let mut render_size = size;
+        if let Some(viewport) = viewport {
+            let Some(child) = full.viewport_output.get(&viewport) else { output = None; continue };
+            render_size = child.builder.inner_size.expect("native snapshot specifies its size");
+            let callback = child.viewport_ui_cb.as_ref().expect("native snapshot has a deferred callback").clone();
+            let mut input = egui::RawInput {
+                viewport_id: viewport, screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, render_size)),
+                time: Some(step as f64 * 0.2), focused: false, ..Default::default()
+            };
+            input.viewports.insert(viewport, egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT), native_pixels_per_point: Some(ppp), ..Default::default()
+            });
+            full = ctx.run_ui(input, |ui| callback(ui));
+            update_textures(&mut textures, &full);
+        }
+        output = Some((full, render_size));
     }
-    let output = output.expect("ran a frame");
+    let (output, size) = output.expect("requested snapshot window was rendered");
     let primitives = ctx.tessellate(output.shapes, ppp);
     let background = ctx.global_style().visuals.panel_fill;
     let mut canvas = Canvas::new((size.x * ppp) as usize, (size.y * ppp) as usize, background);
@@ -361,6 +378,25 @@ pub(super) fn snapshot_with_events(app: &mut impl eframe::App, name: &str, size:
         }
     }
     canvas.save_png(name)
+}
+
+fn update_textures(textures: &mut HashMap<TextureId, ColorImage>, full: &egui::FullOutput) {
+    for (id, deltas) in &full.textures_delta.set {
+        for delta in deltas {
+            let egui::ImageData::Color(image) = &delta.image;
+            match delta.pos {
+                None => { textures.insert(*id, (**image).clone()); }
+                Some([x0, y0]) => {
+                    let tex = textures.get_mut(id).expect("patch to a known texture");
+                    for y in 0..image.size[1] {
+                        for x in 0..image.size[0] {
+                            tex.pixels[(y0 + y) * tex.size[0] + x0 + x] = image.pixels[y * image.size[0] + x];
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Speech-like history for the live pictures: syllables with gaps, a

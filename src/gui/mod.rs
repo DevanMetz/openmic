@@ -3,12 +3,16 @@
 
 mod clips;
 mod durations;
+#[cfg(test)]
+mod external_actions;
 mod mic_tab;
 mod mic_test;
 mod overlay;
 mod routes;
 mod settings_tab;
 mod startup;
+#[cfg(test)]
+mod status_controls;
 #[cfg(test)]
 mod snapshot;
 mod sound_tab;
@@ -128,7 +132,7 @@ impl Command {
 }
 
 /// A setting a global hotkey can be bound to.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Binding {
     Mute,
     Bypass,
@@ -170,8 +174,6 @@ pub struct App {
     pad_filter: String,
     /// A strip pad to reveal and focus when the board next draws.
     pad_to_reveal: Option<PathBuf>,
-    /// Reveal the board while preserving the focused pad control.
-    soundboard_scroll_to_top: bool,
     /// A clip name being edited, separate from its saved display name.
     renaming_pad: Option<sound_tab::PadRename>,
     /// The trim menu's current clip.
@@ -208,6 +210,8 @@ pub struct App {
     /// Stand-in audio history for pictures drawn without an engine (tests).
     #[cfg(test)]
     demo_frames: Vec<crate::engine::ScopeFrame>,
+    #[cfg(test)]
+    devices_for_test: Option<(Vec<String>, Vec<String>)>,
     /// Peak-hold positions of the input/output meters, dBFS.
     hold: [f32; 2],
     /// Start was blocked by a device that isn't connected (e.g. a USB mic
@@ -342,7 +346,6 @@ impl App {
             pad_durations: durations::Durations::default(),
             pad_filter: String::new(),
             pad_to_reveal: None,
-            soundboard_scroll_to_top: false,
             renaming_pad: None,
             trim_clip: None,
             clip_errors: HashMap::new(),
@@ -365,6 +368,8 @@ impl App {
             strength_before_off: 1.0,
             #[cfg(test)]
             demo_frames: Vec::new(),
+            #[cfg(test)]
+            devices_for_test: None,
             hold: [-60.0; 2],
             waiting_for_device: false,
             reconnecting: false,
@@ -555,6 +560,11 @@ impl App {
     /// Re-list devices. `replace_missing` (the Refresh button) swaps out
     /// choices whose device is gone; background polls only fill empty ones.
     fn refresh_devices(&mut self, replace_missing: bool) {
+        #[cfg(test)]
+        if let Some((inputs, outputs)) = &self.devices_for_test {
+            self.update_devices(inputs.clone(), outputs.clone(), replace_missing);
+            return;
+        }
         let host = cpal_host();
         self.update_devices(list_devices(&host, false), list_devices(&host, true), replace_missing);
     }
@@ -1025,24 +1035,90 @@ impl App {
     /// Record the next key press as a shortcut for the binding being set.
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
         let Some(binding) = self.capturing.clone() else { return };
+        let held_id = egui::Id::new(("captured-shortcut-keys", ctx.viewport_id()));
+        let held = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(held_id)).unwrap_or_default();
         let pressed = ctx.input(|i| {
-            i.events.iter().find_map(|event| match event {
-                egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers } => {
-                    let key = physical_key.unwrap_or(*key);
-                    (!is_modifier(key)).then_some((key, *modifiers))
+            i.events.iter().enumerate().find_map(|(index, event)| match event {
+                egui::Event::Key { key, physical_key, pressed: true, repeat, modifiers } => {
+                    let physical = physical_key.unwrap_or(*key);
+                    // egui counts repeats by logical key, even for different physical keys.
+                    let fresh = !repeat || physical_key.is_some_and(|scan| held.iter().any(|(saved, saved_scan)|
+                        saved == key && saved_scan.is_some_and(|saved_scan| saved_scan != scan)));
+                    (!is_modifier(physical) && fresh).then_some((index, *key, *physical_key, physical, *modifiers))
                 }
                 _ => None,
             })
         });
-        let Some((key, modifiers)) = pressed else { return };
+        let cancel_button = !matches!(binding, Binding::Pad(_)) && pressed.is_some_and(|(_, logical, _, key, modifiers)|
+            matches!(logical, egui::Key::Enter | egui::Key::Space) && logical == key && !modifiers.ctrl && !modifiers.alt)
+            && ctx.data(|data| data.get_temp::<egui::Id>(egui::Id::new(("shortcut-row", &binding)).with("edit")))
+                .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)));
+        let combination = pressed.map(|(_, _, _, key, modifiers)| hotkeys::combo(key, modifiers));
+        if let Some((index, logical, physical, _, _)) = pressed {
+            let tail = ctx.input_mut(|input| {
+                let next = input.events.iter().enumerate().skip(index + 1).find_map(|(next, event)| match event {
+                    egui::Event::Key { key, physical_key, pressed: true, repeat, .. }
+                        if !is_modifier(physical_key.unwrap_or(*key)) && (!repeat
+                            || !shortcut_key_matches((logical, physical), (*key, *physical_key))) => Some(next),
+                    _ => None,
+                });
+                next.map(|next| {
+                    // Releases also clear activation guards on the replacement control.
+                    let mut tail: Vec<_> = input.events[..next].iter().filter(|event|
+                        matches!(event, egui::Event::Key { pressed: false, .. })).cloned().collect();
+                    tail.extend(input.events.split_off(next));
+                    tail
+                })
+            });
+            if let Some(tail) = tail {
+                ctx.plugin_or_default::<DeferredFocusInput>().lock().events.push_front(tail);
+                ctx.request_repaint();
+            }
+        }
+        let down = ctx.input(|input| {
+            let mut down = Vec::new();
+            for event in &input.events {
+                if let egui::Event::Key { key, physical_key, pressed, .. } = event
+                    && !is_modifier(physical_key.unwrap_or(*key))
+                {
+                    let key = (*key, *physical_key);
+                    if *pressed { if !down.contains(&key) { down.push(key); } }
+                    else { down.retain(|saved| !shortcut_key_matches(*saved, key)); }
+                }
+            }
+            down
+        });
+        if !down.is_empty() {
+            ctx.data_mut(|data| {
+                let mut held = data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(held_id).unwrap_or_default();
+                for key in down { if !held.contains(&key) { held.push(key); } }
+                data.insert_temp(held_id, held);
+            });
+        }
+        // Capture owns navigation and text as well as the combination's first key.
+        ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        ctx.input_mut(|input| input.events.retain(|event| !shortcut_keyboard_event(event) || matches!(event,
+            egui::Event::Key { key: egui::Key::Escape, .. }) || (cancel_button && matches!(event,
+                egui::Event::Key { key: egui::Key::Enter | egui::Key::Space, .. }))));
+        let Some((_, _, _, key, _)) = pressed else { return };
         if key == egui::Key::Escape {
+            // egui clears button focus before delivering Escape. Keep the pad reachable.
+            if matches!(binding, Binding::Pad(_)) && self.page == Page::Soundboard
+                && let Some(owner) = ctx.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus"))).flatten()
+            {
+                sound_tab::focus_soundboard_control(ctx, owner);
+            }
             self.cancel_capture();
             return;
         }
-        match hotkeys::combo(key, modifiers) {
-            Ok(combo) => self.assign_hotkey(&binding, Some(combo)),
+        match combination.expect("a key was pressed") {
+            Ok(combo) => {
+                self.assign_hotkey(&binding, Some(combo));
+            }
             // Keep listening for a usable combination.
-            Err(why) => self.hotkey_status = (why.into(), AMBER),
+            Err(why) => {
+                self.hotkey_status = (why.into(), AMBER);
+            }
         }
     }
 
@@ -1251,6 +1327,8 @@ impl eframe::App for App {
             return;
         }
         ui.ctx().plugin_or_default::<DeferredFocusInput>();
+        let openers = egui::Id::new(("shortcut-capture-openers", ui.ctx().viewport_id()));
+        ui.data_mut(|data| data.remove::<Vec<egui::Id>>(openers));
         let routed_keyboard = if self.capturing.is_some() {
             // Shortcut capture reads the next physical key from the original batch.
             ui.data_mut(|data| data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input")));
@@ -1258,10 +1336,11 @@ impl eframe::App for App {
         } else {
             apply_keyboard_input(ui)
         };
+        consume_captured_shortcut(ui.ctx());
+        widgets::consume_held_activation(ui.ctx());
         let ctx = ui.ctx().clone();
         self.import_dropped_sounds(&ctx);
         self.capture_hotkey(&ctx);
-        self.draw_release_notes(&ctx);
         self.update_running_status();
 
         egui::Panel::left("sidebar")
@@ -1283,8 +1362,7 @@ impl eframe::App for App {
             let mut scroll = ScrollArea::vertical()
                 .id_salt(self.page.title())
                 .auto_shrink([false; 2]);
-            let reveal_board = std::mem::take(&mut self.soundboard_scroll_to_top);
-            if self.page == Page::Soundboard && (self.pad_to_reveal.is_some() || reveal_board) {
+            if self.page == Page::Soundboard && self.pad_to_reveal.is_some() {
                 scroll = scroll.vertical_scroll_offset(0.0);
             }
             scroll.show(ui, |ui| match self.page {
@@ -1296,13 +1374,20 @@ impl eframe::App for App {
             });
         });
         if self.page != Page::Soundboard { self.close_trim_editor(); }
+        if self.draw_release_notes(&ctx) {
+            self.restore_release_notes_focus(&ctx);
+        }
         self.draw_quit_confirmation(&ctx);
         if routed_keyboard && ctx.output(|output| output.ime.is_some()) {
             // Replayed arrows belong to the active text editor's caret.
             ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
         }
         let focused = ctx.memory(|memory| memory.focused());
-        ui.data_mut(|data| data.insert_temp(egui::Id::new("keyboard-focus"), focused));
+        let capture = egui::Id::new(("shortcut-capture-active", ctx.viewport_id()));
+        ui.data_mut(|data| {
+            data.insert_temp(egui::Id::new("keyboard-focus"), focused);
+            data.insert_temp(capture, self.capturing.is_some());
+        });
     }
 }
 
@@ -1323,29 +1408,61 @@ impl App {
                 .on_hover_text("Built without --release: slower, and never updates itself");
         }
         ui.add_space(10.0);
-        for page in Page::ALL {
-            let label = match page {
-                Page::Record if self.recorder.as_ref().is_some_and(Recorder::is_stopping) => "Record  • finishing".to_owned(),
-                Page::Record if self.recorder.is_some() => "Record  ⏺ REC".to_owned(),
-                Page::Dictation if self.dictating.as_ref().is_some_and(|recording| recording.recorder.is_stopping()) => "Dictation  • finishing".to_owned(),
-                Page::Dictation if self.dictating.is_some() => "Dictation  • listening".to_owned(),
-                _ => page.title().to_owned(),
-            };
-            let selected = self.page == page;
-            let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
-            let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, text));
-            if response.clicked() {
-                self.finish_pad_rename(true);
-                if !selected {
-                    self.cancel_capture();
+        let navigation_height = (ui.available_height() - self.status_panel_height(ui) - ui.spacing().item_spacing.y).max(0.0);
+        let navigation_layout = egui::vec2(ui.available_width(), navigation_height);
+        let navigation_layout_id = egui::Id::new(("sidebar-navigation-layout", ui.ctx().viewport_id()));
+        let navigation_reflowed = ui.data_mut(|data| {
+            let previous = data.get_temp::<egui::Vec2>(navigation_layout_id);
+            data.insert_temp(navigation_layout_id, navigation_layout);
+            previous.is_some_and(|previous| previous != navigation_layout)
+        });
+        ScrollArea::vertical().id_salt("sidebar-navigation").max_height(navigation_height)
+            .min_scrolled_height(0.0).auto_shrink([false, true]).show(ui, |ui| {
+                for page in Page::ALL {
+                    let label = match page {
+                        Page::Record if self.recorder.as_ref().is_some_and(Recorder::is_stopping) => "Record  • finishing".to_owned(),
+                        Page::Record if self.recorder.is_some() => "Record  ⏺ REC".to_owned(),
+                        Page::Dictation if self.dictating.as_ref().is_some_and(|recording| recording.recorder.is_stopping()) => "Dictation  • finishing".to_owned(),
+                        Page::Dictation if self.dictating.is_some() => "Dictation  • listening".to_owned(),
+                        _ => page.title().to_owned(),
+                    };
+                    let selected = self.page == page;
+                    let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
+                    let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, text));
+                    widgets::scroll_on_focus(&response);
+                    if navigation_reflowed && response.has_focus()
+                        && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+                    {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    if response.clicked() {
+                        self.finish_pad_rename(true);
+                        if !selected {
+                            self.cancel_capture();
+                        }
+                        self.page = page;
+                    }
                 }
-                self.page = page;
-            }
-        }
+                // Keep the final button's focus outline inside fractional-height viewports.
+                ui.add_space(1.0);
+            });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(8.0);
             self.draw_status_panel(ui);
         });
+    }
+
+    fn status_panel_height(&self, ui: &mut egui::Ui) -> f32 {
+        // Measure only readonly content; the processing buttons run once in the real panel.
+        let mut measure = ui.new_child(egui::UiBuilder::new().id_salt("status-size")
+            .layout(egui::Layout::bottom_up(egui::Align::Min)).invisible().sizing_pass());
+        measure.add_space(8.0);
+        measure.allocate_exact_size(egui::vec2(measure.available_width(), 26.0), egui::Sense::hover());
+        measure.add_space(4.0);
+        measure.allocate_exact_size(egui::vec2(measure.available_width(), 6.0), egui::Sense::hover());
+        measure.add_space(4.0);
+        self.draw_status_details(&mut measure);
+        measure.min_rect().height()
     }
 
     fn draw_status_panel(&mut self, ui: &mut egui::Ui) {
@@ -1355,15 +1472,21 @@ impl App {
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             let start = egui::Button::new(RichText::new(if running { "Stop" } else { "Start" }).color(Color32::BLACK))
                 .fill(if running { RED } else { GREEN });
-            if ui.add_sized([width, 26.0], start).clicked() {
+            let start = ui.add_sized([width, 26.0], start);
+            self.restore_settings_retry_focus(&start, true);
+            if start.clicked() {
+                widgets::finish_keyboard_activation(ui.ctx());
                 self.toggle_running();
+                ui.ctx().request_repaint();
             }
             let muted = self.settings.mute;
             let mute = egui::Button::new(RichText::new(if muted { "Unmute" } else { "Mute" }).color(if muted { Color32::BLACK } else { ui.visuals().text_color() }))
                 .fill(if muted { RED } else { ui.visuals().widgets.inactive.weak_bg_fill });
             if ui.add_sized([width, 26.0], mute).on_hover_text("Silence your voice; the soundboard still plays").clicked() {
+                widgets::finish_keyboard_activation(ui.ctx());
                 self.settings.mute = !muted;
                 self.apply_live();
+                ui.ctx().request_repaint();
             }
         });
         ui.add_space(4.0);
@@ -1378,6 +1501,10 @@ impl App {
             ui.painter().rect_filled(fill, 3.0, color);
         }
         ui.add_space(4.0);
+        self.draw_status_details(ui);
+    }
+
+    fn draw_status_details(&self, ui: &mut egui::Ui) {
         if let Some(error) = &self.save_error {
             ui.label(RichText::new("Settings not saved · retrying…").small().color(widgets::text_color(ui, RED))).on_hover_text(error);
         }
@@ -1432,6 +1559,72 @@ fn is_modifier(key: egui::Key) -> bool {
     )
 }
 
+fn shortcut_keyboard_event(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+        | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut
+        | egui::Event::Ime(_))
+}
+
+fn shortcut_key_matches((logical, physical): (egui::Key, Option<egui::Key>), (key, scan): (egui::Key, Option<egui::Key>)) -> bool {
+    physical.zip(scan).map_or(logical == key, |(physical, scan)| physical == scan)
+}
+
+fn shortcut_capture_opener(response: &egui::Response) {
+    if response.enabled() {
+        let id = egui::Id::new(("shortcut-capture-openers", response.ctx.viewport_id()));
+        response.ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<egui::Id>>(id).push(response.id));
+    }
+}
+
+/// A captured or rejected shortcut key stays out of the UI until it is released.
+fn consume_captured_shortcut(ctx: &egui::Context) {
+    let id = egui::Id::new(("captured-shortcut-keys", ctx.viewport_id()));
+    let Some(mut held) = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(id)) else { return };
+    let mut text_from_capture = true;
+    let mut navigation = false;
+    let mut escape = false;
+    if ctx.input(|input| input.focused) {
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                if let egui::Event::Key { key, physical_key, pressed, .. } = event {
+                    if let Some(index) = held.iter().position(|saved| shortcut_key_matches(*saved, (*key, *physical_key)))
+                    {
+                        if !pressed {
+                            held.remove(index);
+                            text_from_capture = !held.is_empty();
+                            return true;
+                        }
+                        text_from_capture = true;
+                        navigation |= matches!(key, egui::Key::Tab | egui::Key::ArrowUp | egui::Key::ArrowDown
+                            | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::Escape);
+                        escape |= *key == egui::Key::Escape;
+                        return false;
+                    }
+                    if *pressed && !is_modifier(*key) { text_from_capture = false; }
+                }
+                !(text_from_capture && !matches!(event, egui::Event::Key { .. }) && shortcut_keyboard_event(event))
+            });
+            // A different physical key can release the same logical key in egui.
+            held.retain(|(logical, physical)| physical.is_some() || input.key_down(*logical));
+        });
+    } else { held.clear(); }
+    if navigation {
+        // egui sees navigation before App::ui. Recompute it from the remaining input.
+        let direction = ctx.input(|input| input.events.iter().rev().find_map(keyboard_focus_direction)
+            .unwrap_or(egui::FocusDirection::None));
+        ctx.memory_mut(|memory| memory.move_focus(direction));
+    }
+    if escape && ctx.memory(|memory| memory.focused()).is_none()
+        && let Some(owner) = ctx.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus"))).flatten()
+    {
+        ctx.memory_mut(|memory| memory.request_focus(owner));
+    }
+    ctx.data_mut(|data| {
+        if held.is_empty() { data.remove::<Vec<(egui::Key, Option<egui::Key>)>>(id); }
+        else { data.insert_temp(id, held); }
+    });
+}
+
 /// Whether a window placed at `px` (its top-left corner, screen pixels)
 /// would show on a connected monitor; a monitor unplugged since then would
 /// leave it off screen.
@@ -1449,8 +1642,12 @@ fn on_a_monitor(_: [i32; 2]) -> bool {
     true
 }
 
-fn open_url(url: &str) {
+fn open_url(ctx: &egui::Context, url: &str) {
+    widgets::finish_keyboard_activation(ctx);
+    #[cfg(test)]
+    ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<String>>(egui::Id::new("opened-urls")).push(url.to_owned()));
     // Explorer hands URLs to the default browser.
+    #[cfg(not(test))]
     let _ = std::process::Command::new("explorer").arg(url).spawn();
 }
 
@@ -1501,8 +1698,18 @@ impl egui::plugin::Plugin for DeferredFocusInput {
     fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         if input.viewport_id != egui::ViewportId::ROOT { return; }
         let key = egui::Id::new("keyboard-input");
-        if input.events.iter().any(|event| matches!(event,
-            egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }))
+        let capturing = ctx.data(|data| data.get_temp::<bool>(
+            egui::Id::new(("shortcut-capture-active", input.viewport_id)))).unwrap_or(false);
+        let mut held = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(
+            egui::Id::new(("captured-shortcut-keys", input.viewport_id)))).unwrap_or_default();
+        if !capturing && input.events.iter().any(|event| {
+            if let egui::Event::Key { key, physical_key, pressed, .. } = event {
+                let scan = (*key, *physical_key);
+                if !pressed { held.retain(|saved| !shortcut_key_matches(*saved, scan)); }
+                else if *key == egui::Key::Escape { return !held.iter().any(|saved| shortcut_key_matches(*saved, scan)); }
+            }
+            false
+        })
         {
             // Escape cancels an edit that has not been shown yet.
             ctx.data_mut(|data| data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(key));
@@ -1532,6 +1739,53 @@ impl egui::plugin::Plugin for DeferredFocusInput {
             // egui claims assistive focus as its target is drawn. Commands must
             // wait until then, and earlier input must use the previous focus.
             let tail = input.events.split_off(if focus == 0 { 1 } else { focus });
+            if !tail.is_empty() { self.events.push_front(tail); }
+        }
+        if capturing {
+            let mut candidate = false;
+            let next = input.events.iter().enumerate().find_map(|(index, event)| {
+                if let egui::Event::Key { key, physical_key, pressed, repeat, .. } = event
+                    && !is_modifier(physical_key.unwrap_or(*key))
+                {
+                    let scan = (*key, *physical_key);
+                    if !pressed { held.retain(|saved| !shortcut_key_matches(*saved, scan)); }
+                    else if !repeat && !held.iter().any(|saved| shortcut_key_matches(*saved, scan)) {
+                        if candidate { return Some(index); }
+                        candidate = true;
+                        held.push(scan);
+                    }
+                }
+                None
+            });
+            if let Some(next) = next {
+                // Reject or accept this key before later navigation or Escape runs.
+                let tail = input.events.split_off(next);
+                self.events.push_front(tail);
+            }
+        }
+        let openers = ctx.data(|data| data.get_temp::<Vec<egui::Id>>(
+            egui::Id::new(("shortcut-capture-openers", input.viewport_id)))).unwrap_or_default();
+        let openers: Vec<_> = openers.into_iter().filter_map(|id| ctx.read_response(id)).filter(egui::Response::enabled).collect();
+        let focused = ctx.memory(|memory| memory.focused());
+        let (mut enter, mut space) = ctx.input(|input| (input.key_down(egui::Key::Enter), input.key_down(egui::Key::Space)));
+        let activation = input.events.iter().position(|event| match event {
+            egui::Event::Key { key: key @ (egui::Key::Enter | egui::Key::Space), pressed, .. } => {
+                let down = if *key == egui::Key::Enter { &mut enter } else { &mut space };
+                let fresh = *pressed && !*down;
+                *down = *pressed;
+                fresh && openers.iter().any(|response| focused == Some(response.id))
+            }
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click, target_tree: egui::accesskit::TreeId::ROOT, target_node, ..
+            }) => openers.iter().any(|response| target_node.0 == response.id.value()),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } =>
+                openers.iter().any(|response| response.is_pointer_button_down_on() && response.interact_rect.contains(*pos)
+                    && ctx.layer_id_at(*pos) == Some(response.layer_id)),
+            _ => false,
+        });
+        if let Some(activation) = activation {
+            // Draw Set before later keys can change focus or activate its replacement.
+            let tail = input.events.split_off(activation + 1);
             if !tail.is_empty() { self.events.push_front(tail); }
         }
     }
@@ -2240,33 +2494,57 @@ mod tests {
     #[test]
     fn shortcut_capture_does_not_replay_keys_as_text_navigation() {
         use eframe::App as _;
+        use egui::accesskit::{Action, ActionRequest, TreeId};
         for passes in [1, 2] {
             let mut app = App::stopped(Settings::default());
             app.page = Page::Settings;
             app.settings.hotkeys.mute = Some("Ctrl+Alt+M".into());
+            let mut expected = serde_json::to_value(&app.settings).unwrap();
             app.start_capture(Binding::Mute);
             let ctx = egui::Context::default();
             ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
+            ctx.enable_accesskit();
             let mut frame = eframe::Frame::_new_kittest();
             let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
-                events, ..Default::default()
+                time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
             }, |ui| app.ui(ui, &mut frame));
             for _ in 0..3 { draw(&mut app, Vec::new()); }
-            let key = |key, modifiers| egui::Event::Key {
-                key, physical_key: Some(key), pressed: true, repeat: false, modifiers,
+            let output = draw(&mut app, Vec::new());
+            let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
+                .find(|(_, node)| node.label() == Some("Start processing automatically")).map(|(id, _)| id).unwrap();
+            draw(&mut app, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
+            })]);
+            for _ in 0..8 { draw(&mut app, Vec::new()); }
+            let key = |key, pressed, modifiers| egui::Event::Key {
+                key, physical_key: Some(key), pressed, repeat: false, modifiers,
             };
-            draw(&mut app, vec![
-                key(egui::Key::Tab, egui::Modifiers::NONE),
-                key(egui::Key::M, egui::Modifiers::CTRL),
-                egui::Event::Text("m".into()),
-            ]);
+            let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+            // Edits deferred before capture started must never become shortcuts.
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("keyboard-input"),
+                (None::<egui::Id>, vec![key(egui::Key::M, true, ctrl), egui::Event::Text("m".into())])));
+            draw(&mut app, vec![key(egui::Key::Tab, true, egui::Modifiers::NONE)]);
             for _ in 0..3 { draw(&mut app, Vec::new()); }
-            assert_eq!(app.settings.hotkeys.mute.as_deref(), Some("Ctrl+Alt+M"));
-            assert!(app.capturing.is_some(), "the refused first key leaves capture waiting for a new press");
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+            assert!(app.capturing.is_some(), "a rejected key keeps capture open");
             assert!(app.dirty_since.is_none());
-            draw(&mut app, vec![key(egui::Key::F13, egui::Modifiers::NONE)]);
-            assert_eq!(app.settings.hotkeys.mute.as_deref(), Some("F13"));
+            // A fresh correction is captured; neither the rejected Tab nor its repeats navigate.
+            draw(&mut app, vec![key(egui::Key::Tab, true, egui::Modifiers::NONE),
+                key(egui::Key::M, true, ctrl), egui::Event::Text("m".into())]);
+            for _ in 0..3 { draw(&mut app, Vec::new()); }
+            let output = draw(&mut app, Vec::new());
+            expected["hotkeys"]["mute"] = serde_json::json!("Ctrl+M");
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
+            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner);
+            assert!(app.capturing.is_none() && app.dirty_since.is_some());
+            assert_eq!(app.page, Page::Settings);
+            assert!(app.pad_filter.is_empty() && app.engine.is_none() && app.dictating.is_none());
+            draw(&mut app, vec![key(egui::Key::Tab, false, egui::Modifiers::NONE), key(egui::Key::M, false, ctrl)]);
+            app.start_capture(Binding::Mute);
+            draw(&mut app, vec![key(egui::Key::F13, true, egui::Modifiers::NONE)]);
+            expected["hotkeys"]["mute"] = serde_json::json!("F13");
+            assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
             assert!(app.capturing.is_none() && app.dirty_since.is_some());
         }
     }

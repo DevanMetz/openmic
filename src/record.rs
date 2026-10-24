@@ -680,15 +680,19 @@ pub fn safe_stem(name: &str) -> String {
         .collect();
     let stem = cleaned.trim_matches([' ', '.']);
     let stem = if stem.is_empty() { "Recording" } else { stem };
+    // Windows also reserves superscript 1, 2 and 3 as COM/LPT device-number digits.
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+        "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM\u{00b9}", "COM\u{00b2}", "COM\u{00b3}", "LPT\u{00b9}", "LPT\u{00b2}", "LPT\u{00b3}",
     ];
+    // Ignore spaces before an extension to keep names usable on Windows 10 too.
     if reserved.contains(
         &stem
             .split('.')
             .next()
             .unwrap_or(stem)
+            .trim_end_matches(' ')
             .to_ascii_uppercase()
             .as_str(),
     ) {
@@ -1072,6 +1076,100 @@ mod tests {
         assert_eq!(safe_stem("CON"), "Recording CON");
         assert_eq!(safe_stem("AUX.mix"), "Recording AUX.mix");
         assert_eq!(safe_stem(".. "), "Recording");
+    }
+
+    #[test]
+    fn recording_names_cover_windows_superscript_device_aliases() {
+        for family in ["COM", "LPT"] {
+            for digit in ['\u{00b9}', '\u{00b2}', '\u{00b3}'] {
+                for prefix in [family.to_owned(), family.to_ascii_lowercase()] {
+                    for extension in ["", ".mix", ".archive.wav"] {
+                        let name = format!("{prefix}{digit}{extension}");
+                        for input in [name.clone(), format!("  .{name}.  ")] {
+                            assert_eq!(safe_stem(&input), format!("Recording {name}"), "reserved filename: {input}");
+                        }
+                    }
+                }
+            }
+        }
+        for name in ["COM0", "LPT0", "COM10", "LPT10", "COM\u{2074}", "LPT\u{2074}",
+            "COM\u{00b9} tone", "LPT\u{00b2}0", "Com\u{00b3}beat.mix"] {
+            assert_eq!(safe_stem(name), name, "ordinary names keep their text");
+        }
+    }
+
+    #[test]
+    fn recording_names_cover_spaced_and_console_device_aliases() {
+        let mut aliases: Vec<String> = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+            .into_iter().map(str::to_owned).collect();
+        for family in ["COM", "LPT"] {
+            for digit in "123456789\u{00b9}\u{00b2}\u{00b3}".chars() {
+                aliases.push(format!("{family}{digit}"));
+            }
+        }
+        for alias in aliases {
+            for prefix in [alias.clone(), alias.to_ascii_lowercase()] {
+                for spaces in ["", " ", "   "] {
+                    for extension in ["", ".mix", ".archive.wav"] {
+                        let name = format!("{prefix}{spaces}{extension}");
+                        let expected = if extension.is_empty() {
+                            format!("Recording {prefix}")
+                        } else {
+                            format!("Recording {name}")
+                        };
+                        for input in [name.clone(), format!("  .{name}.  ")] {
+                            assert_eq!(safe_stem(&input), expected, "reserved filename: {input}");
+                        }
+                    }
+                }
+            }
+        }
+        for name in ["CONCERT .mix", "CON IN$.mix", "CONIN$ tone.mix", "COM10 .mix",
+            "LPT10 .mix", "COM\u{00b9} tone.mix", "LPT\u{00b2}0 .mix", "COM\u{2074} .mix",
+            "NUL\u{00a0}.mix", "NUL- .mix", "COM1 - .mix", "LPT9track.archive.wav"] {
+            assert_eq!(safe_stem(name), name, "ordinary names keep their text");
+        }
+    }
+
+    #[test]
+    fn device_aliases_export_and_add_as_regular_wav_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut names = Vec::new();
+        for family in ["COM", "LPT"] {
+            for digit in ['\u{00b9}', '\u{00b2}', '\u{00b3}'] {
+                for extension in [".mix", " .mix"] {
+                    names.push(format!("{family}{digit}{extension}"));
+                }
+            }
+        }
+        names.extend(["CON .mix", "PRN   .archive", "AUX .mix", "NUL .mix", "COM1 .mix",
+            "COM9 .mix", "LPT1 .mix", "LPT9 .mix", "CONIN$", "CONIN$.mix", "CONIN$ .mix",
+            "CONOUT$", "CONOUT$.mix", "CONOUT$ .mix"].into_iter().map(str::to_owned));
+        for name in names {
+            let stem = safe_stem(&name);
+            assert_eq!(stem, format!("Recording {name}"));
+            let exported = dir.path().join(format!("{stem}.wav"));
+            let take = written_take(&[0.25; 480]);
+            let temporary = take.path.clone();
+            take.save_wav(&exported).unwrap();
+            drop(take);
+            assert!(!temporary.exists());
+            assert!(exported.is_file());
+            let samples = crate::decode::load_clip(&exported).unwrap();
+            assert_eq!(samples.len(), 240);
+            assert!(samples.iter().all(|sample| (*sample - 0.25).abs() < 0.001));
+            let take = written_take(&[0.5; 480]);
+            let temporary = take.path.clone();
+            let library = take.add_to_library(&name).unwrap();
+            drop(take);
+            assert!(!temporary.exists());
+            assert_eq!(library.file_name().unwrap(), format!("{stem}.wav").as_str());
+            assert!(library.is_file());
+            let samples = crate::decode::load_clip(&library).unwrap();
+            assert_eq!(samples.len(), 240);
+            assert!(samples.iter().all(|sample| (*sample - 0.5).abs() < 0.001));
+            fs::remove_file(library).unwrap();
+        }
     }
 
     #[test]
