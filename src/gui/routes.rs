@@ -2,11 +2,61 @@
 
 use crate::config::Settings;
 
+#[cfg(windows)]
 pub const VB_CABLE_URL: &str = "https://vb-audio.com/Cable/";
 
 /// VB-Audio Virtual Cable's playback side (Discord records "CABLE Output").
+#[cfg(windows)]
 pub fn cable_input(outputs: &[String]) -> Option<&String> {
     outputs.iter().find(|n| n.contains("CABLE Input"))
+}
+
+/// The OpenMic virtual cable, with VB-Cable still recognized so setup from
+/// an older Linux install keeps working.
+#[cfg(not(windows))]
+pub fn cable_input(outputs: &[String]) -> Option<&String> {
+    outputs
+        .iter()
+        .find(|n| n.contains("OpenMic Virtual Cable"))
+        .or_else(|| outputs.iter().find(|n| n.contains("CABLE Input")))
+}
+
+/// Whether an input is the processed side of a virtual cable (or, on Linux,
+/// any monitor source). Choosing one as the mic would feed audio back.
+#[cfg(windows)]
+fn is_processed_input(name: &str) -> bool {
+    name.contains("CABLE Output")
+}
+
+#[cfg(not(windows))]
+fn is_processed_input(name: &str) -> bool {
+    name.contains("CABLE Output") || name.contains("OpenMic Microphone") || is_monitor_source(name)
+}
+
+#[cfg(not(windows))]
+fn is_monitor_source(name: &str) -> bool {
+    name.contains("Monitor of ") || name.to_ascii_lowercase().contains(".monitor")
+}
+
+/// Platform words for the fallback device labels in the UI.
+#[cfg(windows)]
+pub fn default_output_label() -> &'static str {
+    "Windows default output"
+}
+
+#[cfg(not(windows))]
+pub fn default_output_label() -> &'static str {
+    "System default output"
+}
+
+#[cfg(windows)]
+pub fn default_microphone_label() -> &'static str {
+    "Windows default microphone"
+}
+
+#[cfg(not(windows))]
+pub fn default_microphone_label() -> &'static str {
+    "System default microphone"
 }
 
 /// Keep valid device choices and fill missing ones: the processed output
@@ -30,7 +80,7 @@ pub fn choose_routes(
         // The cable's recording side carries our own processed output;
         // choosing it as the mic would feed that output back into itself.
         s.microphone = inputs.iter()
-            .find(|name| !name.contains("CABLE Output"))
+            .find(|name| !is_processed_input(name))
             .cloned()
             .unwrap_or_default();
     }
@@ -195,5 +245,26 @@ mod tests {
         assert_eq!(s.microphone, "Mic (USB)", "startup/poll keeps the saved mic");
         choose_routes(&mut s, &without_usb, &outputs, false, true);
         assert_eq!(s.microphone, "Webcam Mic", "Refresh replaces a device that is gone");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_prefers_the_openmic_cable_and_skips_its_microphone_and_monitors() {
+        let mut s = Settings::default();
+        let outputs = names(&["Speakers", "CABLE Input (VB-Audio Virtual Cable)", "OpenMic Virtual Cable"]);
+        choose_routes(&mut s, &names(&["USB mic"]), &outputs, false, false);
+        assert_eq!(s.output, "OpenMic Virtual Cable");
+        assert_eq!(s.monitor_output, "Speakers");
+
+        choose_routes(&mut s, &names(&[
+            "Monitor of OpenMic Virtual Cable",
+            "OpenMic Microphone",
+            "Monitor of Speakers",
+            "USB mic",
+        ]), &outputs, false, true);
+        assert_eq!(s.microphone, "USB mic", "processed and monitor sources never loop back");
+
+        choose_routes(&mut s, &names(&["openmic_cable.monitor", "USB mic"]), &outputs, false, true);
+        assert_eq!(s.microphone, "USB mic", "a raw .monitor name is skipped too");
     }
 }

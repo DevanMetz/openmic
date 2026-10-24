@@ -3,6 +3,11 @@
 use super::*;
 use egui::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
 
+#[cfg(windows)]
+const SCENES: &[&str] = &["releases", "notes", "setup", "routing", "logs", "recovery"];
+#[cfg(not(windows))]
+const SCENES: &[&str] = &["releases", "notes", "logs", "recovery"];
+
 fn fixture(scene: &str) -> (App, &'static str, Role, String) {
     let mut app = App::stopped(Settings::default());
     let (label, role, destination) = match scene {
@@ -19,6 +24,7 @@ fn fixture(scene: &str) -> (App, &'static str, Role, String) {
             app.show_release_notes = true;
             ("Open the release page", Role::Link, page)
         }
+        #[cfg(windows)]
         "setup" | "routing" => {
             app.settings.setup.dismissed = scene == "routing";
             ("Get VB-Cable", Role::Button, routes::VB_CABLE_URL.to_owned())
@@ -82,7 +88,7 @@ fn external_actions_open_once_until_the_activation_key_is_released() {
         let size = egui::vec2(700.0, 420.0) / zoom;
         for dark in [true, false] {
             for passes in [1, 2] {
-                for scene in ["releases", "notes", "setup", "routing", "logs", "recovery"] {
+                for &scene in SCENES {
                     for activation in ["enter", "space", "accessible", "accessible unfocused", "pointer", "focused pointer"] {
                         let (mut app, label, role, destination) = fixture(scene);
                         let original = serde_json::to_value(&app.settings).unwrap();
@@ -148,7 +154,7 @@ fn external_actions_do_not_replay_after_focus_or_navigation_changes() {
         let size = egui::vec2(700.0, 420.0) / zoom;
         for dark in [true, false] {
             for passes in [1, 2] {
-                for scene in ["releases", "notes", "setup", "routing", "logs", "recovery"] {
+                for &scene in SCENES {
                     for mode in ["focus", "page", "escape"] {
                         if scene == "recovery" && mode == "page" { continue; }
                         for held in [egui::Key::Enter, egui::Key::Space] {
@@ -227,7 +233,7 @@ fn snapshot_external_actions_keyboard() {
     let zoom = 1.5;
     let size = egui::vec2(700.0, 420.0) / zoom;
     for (dark, theme) in [(true, "dark"), (false, "light")] {
-        for scene in ["releases", "notes", "setup", "routing", "logs", "recovery"] {
+        for &scene in SCENES {
             let (mut app, label, role, destination) = fixture(scene);
             let original = serde_json::to_value(&app.settings).unwrap();
             let ctx = egui::Context::default();

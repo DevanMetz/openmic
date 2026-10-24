@@ -1,8 +1,8 @@
 [package]
 name = "openmic"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2024"
-description = "Native real-time microphone cleaner and soundboard for Windows"
+description = "Native real-time microphone cleaner and soundboard for Windows and Linux"
 license = "MIT"
 repository = "https://github.com/DevanMetz/openmic"
 
@@ -44,6 +44,11 @@ tract-core = "=0.21.4"
 tract-hir = "=0.21.4"
 tract-onnx = "=0.21.4"
 tract-pulse = "=0.21.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
+# default_host() prefers it and falls back to ALSA when no server is running.
+cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

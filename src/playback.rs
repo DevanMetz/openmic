@@ -11,6 +11,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::dsp::SR;
+use crate::engine::{open_stream_with_fallback, stream_buffer};
 use crate::resample::Resampler;
 
 /// A clip playing on an output device; stops when dropped.
@@ -35,9 +36,15 @@ impl PlaybackProgress {
 }
 
 /// Whether a device name is VB-Cable (Discord's input), which the mic test
-/// must never play into.
+/// must never play into. On Linux the OpenMic virtual cable plays that role.
+#[cfg(windows)]
 pub fn is_cable(name: &str) -> bool {
     name.to_ascii_uppercase().contains("CABLE")
+}
+
+#[cfg(not(windows))]
+pub fn is_cable(name: &str) -> bool {
+    name.to_ascii_uppercase().contains("CABLE") || name.contains("OpenMic Virtual Cable")
 }
 
 /// Check the resolved device too: the Windows default can be the same
@@ -66,30 +73,30 @@ impl Player {
         let name = device.to_string();
         validate_output(&name, processed_output)?;
         let supported = device.default_output_config().context("query the output's format")?;
-        let config = StreamConfig {
+        let mut config = StreamConfig {
             channels: supported.channels(),
             sample_rate: supported.sample_rate(),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: stream_buffer(supported.sample_rate(), supported.buffer_size()),
         };
         let audio = Arc::new(resample(samples, config.sample_rate));
         let progress = Arc::new(PlaybackProgress::default());
         let len = audio.len();
         let (report, errors) = crossbeam_channel::bounded(1);
-        let stream = match supported.sample_format() {
-            SampleFormat::I8 => build::<i8>(&device, &config, &audio, &progress, &report),
-            SampleFormat::U8 => build::<u8>(&device, &config, &audio, &progress, &report),
-            SampleFormat::F32 => build::<f32>(&device, &config, &audio, &progress, &report),
-            SampleFormat::I16 => build::<i16>(&device, &config, &audio, &progress, &report),
-            SampleFormat::U16 => build::<u16>(&device, &config, &audio, &progress, &report),
-            SampleFormat::I24 => build::<cpal::I24>(&device, &config, &audio, &progress, &report),
-            SampleFormat::U24 => build::<cpal::U24>(&device, &config, &audio, &progress, &report),
-            SampleFormat::I32 => build::<i32>(&device, &config, &audio, &progress, &report),
-            SampleFormat::U32 => build::<u32>(&device, &config, &audio, &progress, &report),
-            SampleFormat::I64 => build::<i64>(&device, &config, &audio, &progress, &report),
-            SampleFormat::U64 => build::<u64>(&device, &config, &audio, &progress, &report),
-            SampleFormat::F64 => build::<f64>(&device, &config, &audio, &progress, &report),
+        let stream = open_stream_with_fallback(&mut config, |config| match supported.sample_format() {
+            SampleFormat::I8 => build::<i8>(&device, config, &audio, &progress, &report),
+            SampleFormat::U8 => build::<u8>(&device, config, &audio, &progress, &report),
+            SampleFormat::F32 => build::<f32>(&device, config, &audio, &progress, &report),
+            SampleFormat::I16 => build::<i16>(&device, config, &audio, &progress, &report),
+            SampleFormat::U16 => build::<u16>(&device, config, &audio, &progress, &report),
+            SampleFormat::I24 => build::<cpal::I24>(&device, config, &audio, &progress, &report),
+            SampleFormat::U24 => build::<cpal::U24>(&device, config, &audio, &progress, &report),
+            SampleFormat::I32 => build::<i32>(&device, config, &audio, &progress, &report),
+            SampleFormat::U32 => build::<u32>(&device, config, &audio, &progress, &report),
+            SampleFormat::I64 => build::<i64>(&device, config, &audio, &progress, &report),
+            SampleFormat::U64 => build::<u64>(&device, config, &audio, &progress, &report),
+            SampleFormat::F64 => build::<f64>(&device, config, &audio, &progress, &report),
             other => Err(anyhow!("unsupported output format {other}")),
-        }?;
+        })?;
         stream.play().context("start playback")?;
         Ok(Self { stream, progress, len, errors })
     }
@@ -189,6 +196,13 @@ mod tests {
         assert!(is_cable("CABLE Input (VB-Audio Virtual Cable)"));
         assert!(is_cable("Cable Output"));
         assert!(!is_cable("Speakers (JDS Labs Atom DAC)"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_openmic_virtual_cable_is_never_a_test_output() {
+        assert!(is_cable("OpenMic Virtual Cable"));
+        assert!(!is_cable("OpenMic Microphone"));
     }
 
     #[test]

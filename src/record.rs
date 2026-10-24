@@ -16,6 +16,7 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 
 use crate::config;
+use crate::engine::{open_stream_with_fallback, stream_buffer};
 
 /// Peak blocks per second of audio (10 ms each), for drawing waveforms.
 pub const PEAKS_PER_SECOND: usize = 100;
@@ -31,6 +32,61 @@ const QUEUE_SECONDS: usize = 4;
 pub enum Source {
     Microphone,
     Computer,
+}
+
+/// The monitor source that carries an output's audio.
+#[cfg(not(windows))]
+fn monitor_name(output: &str) -> String {
+    format!("Monitor of {output}")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_monitor_source(name: &str) -> bool {
+    name.starts_with("Monitor of ")
+}
+
+#[cfg(not(windows))]
+fn is_openmic_monitor(name: &str) -> bool {
+    name == "Monitor of OpenMic Virtual Cable"
+}
+
+/// Prefer the selected output's monitor, then any other output's monitor.
+#[cfg(not(windows))]
+fn choose_monitor_source<'a>(output: &str, sources: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let preferred = monitor_name(output);
+    let mut fallback = None;
+    for source in sources {
+        if source == preferred {
+            return Some(source);
+        }
+        if fallback.is_none() && is_monitor_source(source) && !is_openmic_monitor(source) {
+            fallback = Some(source);
+        }
+    }
+    fallback
+}
+
+/// Open an output's monitor source as an input stream.
+#[cfg(not(windows))]
+fn monitor_input(host: &cpal::Host, output: &str) -> Result<cpal::Device> {
+    let output = if output.is_empty() {
+        host.default_output_device().context("no default playback device")?.to_string()
+    } else {
+        output.to_owned()
+    };
+    let sources: Vec<String> = host
+        .input_devices()
+        .context("list monitor sources")?
+        .map(|device| device.to_string())
+        .collect();
+    let Some(name) = choose_monitor_source(&output, sources.iter().map(String::as_str)) else {
+        bail!("no monitor source for '{output}'");
+    };
+    let name = name.to_owned();
+    host.input_devices()
+        .context("list monitor sources")?
+        .find(|device| device.to_string() == name)
+        .with_context(|| format!("monitor source '{name}' is not connected"))
 }
 
 /// A recording in progress. Audio goes from the device callback through a
@@ -158,45 +214,47 @@ impl Recorder {
         (recorder, release)
     }
 
-    /// An empty `device_name` means the Windows default device for that source.
+    /// An empty `device_name` means the system default device for that source.
     pub fn start(source: Source, device_name: &str) -> Result<Self> {
-        #[cfg(not(windows))]
-        if source == Source::Computer {
-            bail!("computer audio recording is available on Windows");
-        }
-
         let host = cpal::default_host();
         let device = match (source, device_name.is_empty()) {
             (Source::Microphone, true) => host
                 .default_input_device()
                 .context("no default microphone")?,
-            (Source::Computer, true) => host
-                .default_output_device()
-                .context("no default playback device")?,
             (Source::Microphone, false) => host
                 .input_devices()
                 .context("list microphones")?
                 .find(|device| device.to_string() == device_name)
                 .with_context(|| format!("microphone '{device_name}' is not connected"))?,
+            #[cfg(windows)]
+            (Source::Computer, true) => host
+                .default_output_device()
+                .context("no default playback device")?,
+            #[cfg(windows)]
             (Source::Computer, false) => host
                 .output_devices()
                 .context("list playback devices")?
                 .find(|device| device.to_string() == device_name)
                 .with_context(|| format!("playback device '{device_name}' is not connected"))?,
+            #[cfg(not(windows))]
+            (Source::Computer, _) => monitor_input(&host, device_name)?,
         };
         // CPAL's Windows backend enables WASAPI loopback when an output device
         // is opened as an input stream. Use its output mix format for that case.
         let supported = match source {
             Source::Microphone => device.default_input_config(),
+            #[cfg(windows)]
             Source::Computer => device.default_output_config(),
+            #[cfg(not(windows))]
+            Source::Computer => device.default_input_config(),
         }
         .context("read recording device format")?;
         let sample_rate = supported.sample_rate();
         let channels = supported.channels();
-        let config = cpal::StreamConfig {
+        let mut config = cpal::StreamConfig {
             channels,
             sample_rate,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: stream_buffer(sample_rate, supported.buffer_size()),
         };
 
         let path = take_path();
@@ -239,12 +297,12 @@ impl Recorder {
         });
 
         macro_rules! build_stream {
-            ($sample:ty) => {{
+            ($sample:ty, $config:expr) => {{
                 let queue = Arc::clone(&queue);
                 let skipped = Arc::clone(&recorder.skipped);
                 let error = Arc::clone(&recorder.error);
                 device.build_input_stream(
-                    config,
+                    $config,
                     move |data: &[$sample], _: &cpal::InputCallbackInfo| {
                         // Whole callbacks only, so channels never shift.
                         if queue.capacity() - queue.len() < data.len() {
@@ -266,26 +324,29 @@ impl Recorder {
                 )
             }};
         }
-        let stream = match supported.sample_format() {
-            cpal::SampleFormat::I8 => build_stream!(i8),
-            cpal::SampleFormat::U8 => build_stream!(u8),
-            cpal::SampleFormat::F32 => build_stream!(f32),
-            cpal::SampleFormat::F64 => build_stream!(f64),
-            cpal::SampleFormat::I16 => build_stream!(i16),
-            cpal::SampleFormat::U16 => build_stream!(u16),
-            cpal::SampleFormat::I24 => build_stream!(cpal::I24),
-            cpal::SampleFormat::U24 => build_stream!(cpal::U24),
-            cpal::SampleFormat::I32 => build_stream!(i32),
-            cpal::SampleFormat::U32 => build_stream!(u32),
-            cpal::SampleFormat::I64 => build_stream!(i64),
-            cpal::SampleFormat::U64 => build_stream!(u64),
-            other => Err(cpal::Error::with_message(
-                cpal::ErrorKind::UnsupportedConfig,
-                format!("unsupported recording format {other}"),
-            )),
+        let build = |config: &cpal::StreamConfig| -> std::result::Result<Stream, cpal::Error> {
+            let config = *config;
+            match supported.sample_format() {
+                cpal::SampleFormat::I8 => build_stream!(i8, config),
+                cpal::SampleFormat::U8 => build_stream!(u8, config),
+                cpal::SampleFormat::F32 => build_stream!(f32, config),
+                cpal::SampleFormat::F64 => build_stream!(f64, config),
+                cpal::SampleFormat::I16 => build_stream!(i16, config),
+                cpal::SampleFormat::U16 => build_stream!(u16, config),
+                cpal::SampleFormat::I24 => build_stream!(cpal::I24, config),
+                cpal::SampleFormat::U24 => build_stream!(cpal::U24, config),
+                cpal::SampleFormat::I32 => build_stream!(i32, config),
+                cpal::SampleFormat::U32 => build_stream!(u32, config),
+                cpal::SampleFormat::I64 => build_stream!(i64, config),
+                cpal::SampleFormat::U64 => build_stream!(u64, config),
+                other => Err(cpal::Error::with_message(
+                    cpal::ErrorKind::UnsupportedConfig,
+                    format!("unsupported recording format {other}"),
+                )),
+            }
         };
         // On failure, dropping `recorder` stops the writer and deletes the file.
-        let stream = stream.context("open recording stream")?;
+        let stream = open_stream_with_fallback(&mut config, build).context("open recording stream")?;
         stream.play().context("start recording stream")?;
         recorder.stream = Some(stream);
         recorder.started = Instant::now();
@@ -1170,6 +1231,37 @@ mod tests {
             assert!(samples.iter().all(|sample| (*sample - 0.5).abs() < 0.001));
             fs::remove_file(library).unwrap();
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn monitor_sources_match_their_output_and_skip_the_openmic_cable() {
+        let sources = [
+            "Monitor of OpenMic Virtual Cable",
+            "Monitor of Speakers",
+            "Monitor of Headphones",
+            "USB microphone",
+        ];
+        assert_eq!(monitor_name("Headphones"), "Monitor of Headphones");
+        assert!(is_monitor_source("Monitor of Speakers"));
+        assert!(!is_monitor_source("Speakers"));
+        assert!(is_openmic_monitor("Monitor of OpenMic Virtual Cable"));
+        assert!(!is_openmic_monitor("Monitor of Speakers"));
+        assert_eq!(
+            choose_monitor_source("Headphones", sources.iter().copied()),
+            Some("Monitor of Headphones"),
+            "the selected output's monitor wins"
+        );
+        assert_eq!(
+            choose_monitor_source("Missing output", sources.iter().copied()),
+            Some("Monitor of Speakers"),
+            "fall back to the first monitor that isn't the OpenMic cable"
+        );
+        assert_eq!(
+            choose_monitor_source("Missing output", ["Monitor of OpenMic Virtual Cable", "USB microphone"].into_iter()),
+            None,
+            "the virtual cable monitor and plain microphones are not computer audio"
+        );
     }
 
     #[test]

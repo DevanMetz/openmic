@@ -21,6 +21,13 @@ use crate::logfile;
 const LATEST_RELEASE: &str = "https://api.github.com/repos/DevanMetz/openmic/releases/latest";
 pub const RELEASES_PAGE: &str = "https://github.com/DevanMetz/openmic/releases";
 
+/// Releases only carry a Windows executable for the in-app updater. On Linux
+/// the UI links to the release page instead; tests still exercise the
+/// Windows-only controls.
+pub fn updates_supported() -> bool {
+    cfg!(windows) || cfg!(test)
+}
+
 /// The release workflow signs each executable with the private half of this
 /// Ed25519 key (a GitHub Actions secret); updates without a valid signature
 /// are refused, so a tampered release can't install itself.

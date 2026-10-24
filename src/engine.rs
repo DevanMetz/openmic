@@ -258,6 +258,49 @@ impl Output {
     }
 }
 
+/// Windows keeps the driver's default buffer. PulseAudio's default asks for
+/// around two seconds, so Linux uses 10 ms, clamped to what the device allows.
+#[cfg(windows)]
+pub(crate) fn stream_buffer(_rate: u32, _supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    cpal::BufferSize::Default
+}
+
+#[cfg(not(windows))]
+pub(crate) fn stream_buffer(rate: u32, supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed((rate / 100).max(1).clamp(*min, *max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    }
+}
+
+/// Build a stream, retrying once with the driver's default buffer if Linux
+/// rejects a fixed size (some ALSA devices do).
+#[cfg(windows)]
+pub(crate) fn open_stream_with_fallback<E>(
+    config: &mut StreamConfig,
+    mut build: impl FnMut(&StreamConfig) -> std::result::Result<Stream, E>,
+) -> std::result::Result<Stream, E> {
+    build(config)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_stream_with_fallback<E>(
+    config: &mut StreamConfig,
+    mut build: impl FnMut(&StreamConfig) -> std::result::Result<Stream, E>,
+) -> std::result::Result<Stream, E> {
+    let fixed = matches!(config.buffer_size, cpal::BufferSize::Fixed(_));
+    match build(config) {
+        Ok(stream) => Ok(stream),
+        Err(_) if fixed => {
+            config.buffer_size = cpal::BufferSize::Default;
+            build(config)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Build a stream for whatever sample format the device uses.
 macro_rules! for_format {
     ($format:expr, $build:ident ( $($arg:expr),* )) => {
@@ -354,16 +397,18 @@ fn open_output(host: &Host, name: &str, what: &'static str, reports: &Arc<Report
     let supported = device
         .default_output_config()
         .with_context(|| format!("query default format of {what} '{name}'"))?;
-    let config = StreamConfig {
+    let mut config = StreamConfig {
         channels: supported.channels(),
         sample_rate: supported.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
+        buffer_size: stream_buffer(supported.sample_rate(), supported.buffer_size()),
     };
     let queue = Arc::new(OutQueue::new(config.sample_rate));
-    let stream = for_format!(
-        supported.sample_format(),
-        output_stream(&device, &config, &queue, reports.stream_error(what))
-    )
+    let stream = open_stream_with_fallback(&mut config, |config| {
+        for_format!(
+            supported.sample_format(),
+            output_stream(&device, config, &queue, reports.stream_error(what))
+        )
+    })
     .with_context(|| format!("open {what} '{name}'"))?;
     Ok(OpenOutput { stream, queue, rate: config.sample_rate })
 }
@@ -407,17 +452,19 @@ impl Engine {
         let mic_cfg = mic_dev
             .default_input_config()
             .with_context(|| format!("query default format of microphone '{mic}'"))?;
-        let mic_stream_cfg = StreamConfig {
+        let mut mic_stream_cfg = StreamConfig {
             channels: mic_cfg.channels(),
             sample_rate: mic_cfg.sample_rate(),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: stream_buffer(mic_cfg.sample_rate(), mic_cfg.buffer_size()),
         };
         let mic_q = Arc::new(ArrayQueue::<f32>::new(32_768)); // mono @ mic rate
         let waker = Arc::new(OnceLock::new());
-        let input = for_format!(
-            mic_cfg.sample_format(),
-            input_stream(&mic_dev, &mic_stream_cfg, &mic_q, &waker, reports.stream_error("microphone"))
-        )
+        let input = open_stream_with_fallback(&mut mic_stream_cfg, |config| {
+            for_format!(
+                mic_cfg.sample_format(),
+                input_stream(&mic_dev, config, &mic_q, &waker, reports.stream_error("microphone"))
+            )
+        })
         .with_context(|| format!("open microphone '{mic}'"))?;
 
         let output = open_output(&host, out, "output", &reports)?;
@@ -882,6 +929,29 @@ mod tests {
         queue.primed.store(true, Ordering::Relaxed);
         drift.trim(&queue);
         assert_eq!(queue.samples.len(), queue.target());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_stream_buffers_are_ten_ms_and_stay_inside_the_supported_range() {
+        let range = cpal::SupportedBufferSize::Range { min: 64, max: 1000 };
+        assert_eq!(stream_buffer(48_000, &range), cpal::BufferSize::Fixed(480));
+        assert_eq!(stream_buffer(44_100, &range), cpal::BufferSize::Fixed(441));
+        assert_eq!(
+            stream_buffer(8_000, &cpal::SupportedBufferSize::Range { min: 512, max: 1024 }),
+            cpal::BufferSize::Fixed(512),
+            "a low rate is raised to the minimum"
+        );
+        assert_eq!(
+            stream_buffer(48_000, &cpal::SupportedBufferSize::Range { min: 64, max: 256 }),
+            cpal::BufferSize::Fixed(256),
+            "a small maximum caps the request"
+        );
+        assert_eq!(
+            stream_buffer(48_000, &cpal::SupportedBufferSize::Unknown),
+            cpal::BufferSize::Default,
+            "a device without a range keeps the driver default"
+        );
     }
 
     #[test]

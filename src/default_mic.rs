@@ -1,11 +1,12 @@
-//! Make VB-Cable's recording side ("CABLE Output") the Windows default
-//! microphone while OpenMic runs, so apps left on "Default" (Discord's own
-//! default) hear the cleaned voice with no manual setup.
+//! Make the virtual cable's recording side ("CABLE Output" on Windows,
+//! "OpenMic Microphone" on Linux) the default microphone while OpenMic runs,
+//! so apps left on "Default" (Discord's own default) hear the cleaned voice
+//! with no manual setup.
 //!
 //! Windows has no public API for changing default devices; this uses the
 //! long-stable undocumented IPolicyConfig interface, as EarTrumpet and
 //! SoundSwitch do. COM work runs on a short-lived MTA thread so it never
-//! touches the GUI thread's apartment.
+//! touches the GUI thread's apartment. Linux uses pactl's default source.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ enum Role {
     Communications,
 }
 
-/// Endpoint id of VB-Cable's recording device, if installed.
+/// Endpoint id of the virtual cable's recording device, if present.
 pub fn cable_capture_id() -> Result<Option<String>> {
     on_com_thread(imp::cable_capture_id)
 }
@@ -184,7 +185,92 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{bail, Context, Result};
+
+    use super::{Role, SavedDefaults};
+
+    pub struct ComApartment;
+
+    pub fn com_init() -> Result<ComApartment> {
+        Ok(ComApartment)
+    }
+
+    pub fn cable_capture_id() -> Result<Option<String>> {
+        let sources = pactl(&["list", "short", "sources"])?;
+        Ok(source_names(&sources)
+            .into_iter()
+            .find(|name| *name == crate::virtual_mic::SOURCE_NAME)
+            .map(str::to_owned))
+    }
+
+    pub fn current() -> Result<SavedDefaults> {
+        let source = pactl(&["get-default-source"])?.trim().to_owned();
+        if source.is_empty() {
+            bail!("pactl returned no default source");
+        }
+        Ok(SavedDefaults { console: source.clone(), communications: source })
+    }
+
+    pub fn set_role(id: &str, _role: Role) -> Result<()> {
+        pactl(&["set-default-source", id]).map(|_| ())
+    }
+
+    /// The names in `pactl list short sources`: "<index> <name> ...".
+    fn source_names(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .collect()
+    }
+
+    /// pactl can hang when a server disappears mid-command; fail instead.
+    fn pactl(args: &[&str]) -> Result<String> {
+        let what = args.first().copied().unwrap_or("pactl");
+        let mut child = Command::new("pactl")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run pactl {what} (is pulseaudio-utils installed?)"))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait_with_output();
+                bail!("pactl {what} timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().context("read pactl output")?;
+        if !output.status.success() {
+            bail!(
+                "pactl {what} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn source_names_skip_the_index_and_extra_columns() {
+            let text = "0\talsa_output.pci.monitor\tmodule-alsa-card.c\ts16le 2ch 48000Hz\tSUSPENDED\n\
+                        1\topenmic_mic\tmodule-remap-source.c\tfloat32le 1ch 48000Hz\tIDLE\n";
+            assert_eq!(source_names(text), ["alsa_output.pci.monitor", "openmic_mic"]);
+            assert!(source_names("").is_empty());
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 mod imp {
     use super::{Role, SavedDefaults};
     use anyhow::{anyhow, Result};
@@ -198,10 +284,10 @@ mod imp {
         Ok(None)
     }
     pub fn current() -> Result<SavedDefaults> {
-        Err(anyhow!("default devices are Windows-only"))
+        Err(anyhow!("default devices are not supported on this platform"))
     }
     pub fn set_role(_: &str, _: Role) -> Result<()> {
-        Err(anyhow!("default devices are Windows-only"))
+        Err(anyhow!("default devices are not supported on this platform"))
     }
 }
 

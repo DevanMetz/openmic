@@ -7,6 +7,26 @@ use super::{clock_time, App, Binding, Command, AMBER, CYAN, GREEN, MUTED, RED, V
 use crate::dictation::SpeechModel;
 use crate::widgets;
 
+#[cfg(windows)]
+fn startup_label() -> &'static str {
+    "Start with Windows"
+}
+
+#[cfg(not(windows))]
+fn startup_label() -> &'static str {
+    "Start on login"
+}
+
+#[cfg(windows)]
+fn startup_hint() -> &'static str {
+    "Starts hidden in the notification area"
+}
+
+#[cfg(not(windows))]
+fn startup_hint() -> &'static str {
+    "Starts minimized"
+}
+
 impl App {
     pub(super) fn draw_settings_tab(&mut self, ui: &mut egui::Ui) {
         let hotkeys_ok = self.hotkeys.is_some();
@@ -40,7 +60,6 @@ impl App {
         );
         ui.add_space(8.0);
 
-        let tray_ok = self.tray.is_some();
         widgets::card(
             ui,
             "GENERAL",
@@ -48,8 +67,8 @@ impl App {
             |_| {},
             |ui| {
                 let startup = ui
-                    .checkbox(&mut self.settings.start_with_windows, "Start with Windows")
-                    .on_hover_text("Starts hidden in the notification area");
+                    .checkbox(&mut self.settings.start_with_windows, startup_label())
+                    .on_hover_text(startup_hint());
                 widgets::scroll_on_focus(&startup);
                 if startup.changed() {
                     self.toggle_startup(self.settings.start_with_windows);
@@ -59,24 +78,28 @@ impl App {
                 if auto_start.changed() {
                     self.touch();
                 }
-                let tray = ui.add_enabled(
-                    tray_ok,
-                    egui::Checkbox::new(
-                        &mut self.settings.close_to_tray,
-                        "Keep running in the notification area when the window closes",
-                    ),
-                );
-                widgets::scroll_on_focus(&tray);
-                if tray.changed() {
-                    self.touch();
+                #[cfg(windows)]
+                {
+                    let tray_ok = self.tray.is_some();
+                    let tray = ui.add_enabled(
+                        tray_ok,
+                        egui::Checkbox::new(
+                            &mut self.settings.close_to_tray,
+                            "Keep running in the notification area when the window closes",
+                        ),
+                    );
+                    widgets::scroll_on_focus(&tray);
+                    if tray.changed() {
+                        self.touch();
+                    }
+                    ui.weak(if !tray_ok {
+                        "The notification area isn't available, so closing the window quits OpenMic."
+                    } else if self.settings.close_to_tray {
+                        "Click the tray icon to reopen OpenMic; quit from its right-click menu."
+                    } else {
+                        "Closing the window quits OpenMic."
+                    });
                 }
-                ui.weak(if !tray_ok {
-                    "The notification area isn't available, so closing the window quits OpenMic."
-                } else if self.settings.close_to_tray {
-                    "Click the tray icon to reopen OpenMic; quit from its right-click menu."
-                } else {
-                    "Closing the window quits OpenMic."
-                });
                 let minimize = ui
                     .checkbox(&mut self.settings.minimize_to_strip, "Minimize to the strip")
                     .on_hover_text("The window's minimize button collapses OpenMic to the always-on-top strip");
@@ -99,6 +122,9 @@ impl App {
 
     /// The daily check; checking now and installing happen in the header.
     fn draw_updates(&mut self, ui: &mut egui::Ui) {
+        if !crate::update::updates_supported() {
+            return;
+        }
         let updates = ui
             .checkbox(&mut self.settings.check_for_updates, "Check for updates daily")
             .on_hover_text("Asks GitHub for the latest OpenMic release; nothing else is sent");
@@ -267,7 +293,11 @@ impl App {
                         self.touch();
                     }
                 });
-                ui.weak("Your words are typed into the app you're using. Set your Shortcut above.");
+                ui.weak(if cfg!(windows) {
+                    "Your words are typed into the app you're using. Set your Shortcut above."
+                } else {
+                    "Your words appear below to copy into the app you're using. Set your Shortcut above."
+                });
 
                 if let Some(recording) = &self.dictating {
                     ui.horizontal(|ui| {
@@ -2367,6 +2397,7 @@ mod tests {
     #[test]
     fn removing_a_model_keeps_focus_without_starting_a_download() {
         use egui::accesskit::{Action, ActionRequest, Role, TreeId};
+        #[cfg(windows)]
         use std::os::windows::fs::OpenOptionsExt;
         let directory = tempfile::tempdir().unwrap();
         let _model_directory = crate::dictation::use_model_directory_for_test(directory.path());
@@ -2379,8 +2410,17 @@ mod tests {
                             for activation in ["enter", "space", "accessible", "pointer", "focused pointer"] {
                                 assert!(model.directory_for_test().starts_with(directory.path()));
                                 model_files(model);
+                                #[cfg(windows)]
                                 let held_file = failed.then(|| std::fs::File::options().read(true).share_mode(1)
                                     .open(model.directory_for_test().join("model.safetensors")).unwrap());
+                                #[cfg(not(windows))]
+                                let held_permissions = failed.then(|| {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let folder = model.directory_for_test();
+                                    let permissions = std::fs::metadata(&folder).unwrap().permissions();
+                                    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+                                    permissions
+                                });
                                 let mut app = App::stopped(Default::default());
                                 app.page = Page::Dictation;
                                 app.settings.speech_model = model;
@@ -2458,7 +2498,12 @@ mod tests {
                                 assert_eq!(app.last_dictation, "Previous words café");
                                 assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
                                 assert!(app.dirty_since.is_none());
+                                #[cfg(windows)]
                                 drop(held_file);
+                                #[cfg(not(windows))]
+                                if let Some(permissions) = held_permissions {
+                                    std::fs::set_permissions(model.directory_for_test(), permissions).unwrap();
+                                }
                                 model.remove().unwrap();
                             }
                         }
@@ -2468,6 +2513,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     #[ignore = "writes model download and removal focus screenshots; needs Python with Pillow"]
     fn snapshot_dictation_download_focus() {
@@ -3179,7 +3225,7 @@ mod tests {
         for dark in [true, false] {
             for passes in [1, 2] {
                 for warning in [false, true] {
-                    for label in ["Start with Windows", "Start processing automatically", "Minimize to the strip",
+                    for label in [startup_label(), "Start processing automatically", "Minimize to the strip",
                         "Always show the strip", "Check for updates daily", "Open log folder"] {
                         let mut app = App::stopped(Default::default());
                         app.page = Page::Settings;

@@ -496,7 +496,7 @@ fn isolated_settings_paths_restore_nested_scopes_and_do_not_cross_threads() {
     assert_eq!(settings_path(), original);
 }
 
-/// Passed by the Windows startup entry: start hidden in the tray.
+/// Passed by the startup entry: start hidden in the tray or strip.
 pub const MINIMIZED_ARG: &str = "--minimized";
 
 #[cfg(windows)]
@@ -515,11 +515,6 @@ pub fn startup_enabled() -> bool {
     };
     key.get_value::<String, _>(STARTUP_NAME).is_ok()
         || key.get_value::<String, _>(LEGACY_STARTUP_NAME).is_ok()
-}
-
-#[cfg(not(windows))]
-pub fn startup_enabled() -> bool {
-    false
 }
 
 #[cfg(windows)]
@@ -548,9 +543,72 @@ pub fn set_startup(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn startup_file() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("autostart").join("openmic.desktop"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn startup_enabled() -> bool {
+    startup_file().is_some_and(|path| startup_enabled_at(&path))
+}
+
+#[cfg(target_os = "linux")]
+fn startup_enabled_at(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_startup(enabled: bool) -> Result<()> {
+    let path = startup_file().context("locate the XDG autostart folder")?;
+    let exe = std::env::current_exe().context("locate OpenMic executable")?;
+    set_startup_at(&path, enabled, &exe)
+}
+
+#[cfg(target_os = "linux")]
+fn set_startup_at(path: &Path, enabled: bool, exe: &Path) -> Result<()> {
+    if enabled {
+        let parent = path.parent().context("locate the autostart folder")?;
+        fs::create_dir_all(parent).context("create the autostart folder")?;
+        let exe = exe.display().to_string().replace('%', "%%").replace('\\', "\\\\").replace('"', "\\\"");
+        let entry = format!(
+            "[Desktop Entry]\nType=Application\nName=OpenMic\nExec=\"{exe}\" {MINIMIZED_ARG}\nX-GNOME-Autostart-enabled=true\n"
+        );
+        fs::write(path, entry).with_context(|| format!("write {}", path.display()))
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+pub fn startup_enabled() -> bool {
+    false
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 pub fn set_startup(_enabled: bool) -> Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn xdg_autostart_entry_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("autostart/openmic.desktop");
+    let exe = Path::new("/opt/My App/openmic");
+    assert!(!startup_enabled_at(&path));
+    set_startup_at(&path, true, exe).unwrap();
+    assert!(startup_enabled_at(&path));
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("[Desktop Entry]"));
+    assert!(text.contains("Exec=\"/opt/My App/openmic\" --minimized"));
+    set_startup_at(&path, false, exe).unwrap();
+    assert!(!startup_enabled_at(&path));
+    set_startup_at(&path, false, exe).unwrap();
 }
 
 #[cfg(test)]

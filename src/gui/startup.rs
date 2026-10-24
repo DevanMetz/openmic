@@ -207,6 +207,7 @@ mod tests {
 
     #[test]
     fn settings_retry_results_preserve_files_preferences_and_keyboard_focus() {
+        #[cfg(windows)]
         use std::os::windows::fs::OpenOptionsExt;
         for zoom in [1.0, 1.25, 1.5] {
             let size = egui::vec2(700.0, 420.0) / zoom;
@@ -239,7 +240,15 @@ mod tests {
                             };
                             if outcome == "fresh" { std::fs::remove_file(&path).unwrap(); }
                             else { std::fs::write(&path, &bytes).unwrap(); }
+                            #[cfg(windows)]
                             let lock = (outcome == "read").then(|| std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap());
+                            #[cfg(not(windows))]
+                            let unreadable = (outcome == "read").then(|| {
+                                use std::os::unix::fs::PermissionsExt;
+                                let permissions = std::fs::metadata(&path).unwrap().permissions();
+                                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+                                permissions
+                            });
                             activate(&mut app, &ctx, size, retry, activation);
                             let success = matches!(outcome, "recovered" | "fresh");
                             assert_eq!(app.settings.load_error.is_none(), success, "{outcome}, {activation}, zoom={zoom}, passes={passes}");
@@ -250,7 +259,10 @@ mod tests {
                             if outcome == "fresh" { app.waiting_for_device = true; }
                             let held = if activation == "space" { egui::Key::Space } else { egui::Key::Enter };
                             for _ in 0..3 { draw(&mut app, &ctx, size, if matches!(activation, "enter" | "space") { press(held) } else { Vec::new() }); }
+                            #[cfg(windows)]
                             drop(lock);
+                            #[cfg(not(windows))]
+                            if let Some(permissions) = unreadable { std::fs::set_permissions(&path, permissions).unwrap(); }
                             for _ in 0..3 { draw(&mut app, &ctx, size, if matches!(activation, "enter" | "space") { press(held) } else { Vec::new() }); }
                             assert_eq!(attempts(&ctx, false), 1, "releasing a file lock is not another retry");
                             assert_eq!(attempts(&ctx, true), usize::from(success));

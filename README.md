@@ -1,6 +1,6 @@
 # OpenMic
 
-OpenMic is a local, real-time microphone cleaner and soundboard for Windows. It cleans your voice with DeepFilterNet 3 (or the lighter RNNoise), silences everything that isn't speech, mixes optional sound clips, and sends the result to VB-Audio Virtual Cable for Discord or any other voice application.
+OpenMic is a local, real-time microphone cleaner and soundboard for Windows and Linux. It cleans your voice with DeepFilterNet 3 (or the lighter RNNoise), silences everything that isn't speech, mixes optional sound clips, and sends the result to VB-Audio Virtual Cable (or OpenMic Virtual Cable on Linux) for Discord or any other voice application.
 
 Audio stays on your computer. Nothing is kept unless you use **Record** or speech to text; **Test my mic** records five seconds only long enough to play it back, and nothing is uploaded. The only network requests are the speech model download you ask for, the daily check for new OpenMic releases (which you can turn off) and an update download you start.
 
@@ -43,7 +43,17 @@ Audio stays on your computer. Nothing is kept unless you use **Record** or speec
 
 Prebuilt Windows x64 executables are attached to each [GitHub release](https://github.com/DevanMetz/openmic/releases). OpenMic itself needs no installer. It requires the [Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist); install it if Windows reports a missing `VCRUNTIME140.dll`. To build OpenMic yourself, read on.
 
-## Requirements
+## Linux
+
+Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://github.com/DevanMetz/openmic/releases), extract it, and run `./openmic`. PulseAudio, or PipeWire with `pipewire-pulse`, and the `pactl` command are required (`pulseaudio-utils` on Debian/Ubuntu, `pipewire-pulse` on PipeWire-only systems). Without them OpenMic still runs, but has no virtual microphone.
+
+While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord/OBS/browsers to select as their microphone. Both are removed when OpenMic exits, and leftovers from a crash are replaced on the next launch. **Start on login** writes an XDG autostart entry. OpenMic uses 10 ms PulseAudio buffers, takes a single-instance lock, and records computer audio from the selected output's monitor source.
+
+To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
+
+Not available on Linux: the notification-area tray (closing the window quits), the in-app updater (download new releases from the releases page), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11).
+
+## Windows requirements
 
 - Windows 10 or 11
 - [Rust](https://rustup.rs) (stable) and MSVC build tools
@@ -51,7 +61,7 @@ Prebuilt Windows x64 executables are attached to each [GitHub release](https://g
 - A C compiler for the vendored RNNoise: MSVC `cl.exe` cannot compile the VLA usage in `pitch.c`, so the build uses `clang` (e.g. the one shipped with AMD ROCm, or LLVM/Clang for Windows). It must target the MSVC ABI.
 - [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (recommended output)
 
-## Build & run
+## Windows build & run
 
 ```bat
 git clone https://github.com/DevanMetz/openmic.git

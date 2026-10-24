@@ -15,6 +15,17 @@ use super::{
 use crate::config::Pad;
 use crate::record::{self, Recorder, Source, PEAKS_PER_SECOND};
 use crate::widgets;
+use super::routes::{default_microphone_label, default_output_label};
+
+#[cfg(windows)]
+fn computer_audio_available(_inputs: &[String]) -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn computer_audio_available(inputs: &[String]) -> bool {
+    inputs.iter().any(|name| record::is_monitor_source(name))
+}
 
 pub(super) struct PadRename {
     path: PathBuf,
@@ -527,6 +538,7 @@ impl App {
         let take_ready = self.take.is_some();
         let saving = self.recording_save.is_some();
         let outputs = self.outputs.clone();
+        let computer_audio = computer_audio_available(&self.inputs);
         let mut start = false;
         let mut stop = false;
         let mut save = false;
@@ -580,8 +592,10 @@ impl App {
                     ui.add_enabled_ui(!active && !take_ready, |ui| {
                         let microphone = ui.selectable_value(&mut self.record_source, Source::Microphone, "Microphone");
                         widgets::scroll_on_focus(&microphone);
-                        let computer = ui.selectable_value(&mut self.record_source, Source::Computer, "Computer audio");
-                        widgets::scroll_on_focus(&computer);
+                        if computer_audio {
+                            let computer = ui.selectable_value(&mut self.record_source, Source::Computer, "Computer audio");
+                            widgets::scroll_on_focus(&computer);
+                        }
                     });
                 });
                 ui.horizontal(|ui| {
@@ -597,7 +611,7 @@ impl App {
                         }
                         (Source::Microphone, None) => {
                             let name = if self.settings.microphone.is_empty() {
-                                "Windows default microphone"
+                                default_microphone_label()
                             } else {
                                 &self.settings.microphone
                             };
@@ -608,7 +622,7 @@ impl App {
                         }
                         (Source::Computer, None) => {
                             let label = if self.record_output.is_empty() {
-                                "Windows default output".to_owned()
+                                default_output_label().to_owned()
                             } else {
                                 self.record_output.clone()
                             };
@@ -620,7 +634,7 @@ impl App {
                                     .truncate()
                                     .show_ui(ui, |ui| {
                                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                                        for (value, name) in std::iter::once(("", "Windows default output"))
+                                        for (value, name) in std::iter::once(("", default_output_label()))
                                             .chain(outputs.iter().map(|name| (name.as_str(), name.as_str())))
                                         {
                                             let choice = ui.selectable_value(&mut self.record_output, value.to_owned(), name)
@@ -2252,7 +2266,7 @@ mod tests {
                         record_frame_at_size(&mut app, &ctx, size, vec![action(Action::Focus, target), key(egui::Key::Enter)]);
                         for _ in 0..6 { record_frame_at_size(&mut app, &ctx, size, Vec::new()); }
                         let output = record_frame_at_size(&mut app, &ctx, size, Vec::new());
-                        let name = if default { "Windows default output" } else { &app.outputs[1] };
+                        let name = if default { default_output_label() } else { &app.outputs[1] };
                         let choice = *output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
                             .find(|(_, node)| node.label() == Some(name)).map(|(id, _)| id).unwrap();
                         if passes == 1 {
@@ -2819,6 +2833,7 @@ mod tests {
                         for activation in ["enter", "space", "accessible", "pointer"] {
                             let mut app = App::stopped(Default::default());
                             app.page = super::super::Page::Record;
+                            app.inputs = vec!["Monitor of Test output".into()];
                             app.record_source = source;
                             app.settings.microphone = "Missing recording-focus test microphone".into();
                             app.record_output = "Missing recording-focus test output".into();
