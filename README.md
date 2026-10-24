@@ -2,7 +2,7 @@
 
 OpenMic is a local, real-time microphone cleaner and soundboard for Windows. It cleans your voice with DeepFilterNet 3 (or the lighter RNNoise), silences everything that isn't speech, mixes optional sound clips, and sends the result to VB-Audio Virtual Cable for Discord or any other voice application.
 
-Audio stays on your computer. Nothing is recorded unless you use **Record** or speech to text, and nothing is uploaded. The only network requests are the speech model download you ask for and a daily check for new OpenMic releases, which you can turn off.
+Audio stays on your computer. Nothing is kept unless you use **Record** or speech to text; **Test my mic** records five seconds only long enough to play it back, and nothing is uploaded. The only network requests are the speech model download you ask for, the daily check for new OpenMic releases (which you can turn off) and an update download you start.
 
 ![OpenMic v0.4.0 running with live scope and processing controls](docs/screenshot.png)
 

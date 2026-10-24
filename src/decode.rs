@@ -107,6 +107,9 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
 fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) -> Result<()> {
     let spec = *decoded.spec();
     let channels = spec.channels.count();
+    if channels == 0 {
+        bail!("audio track has no channels");
+    }
     // Packet duration is in container time-base ticks, which need not equal
     // decoded frames. Size the buffer using the decoder's actual output.
     let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
@@ -166,6 +169,15 @@ mod tests {
         let mut mono = Vec::new();
         append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded))).unwrap();
         assert_eq!(mono, vec![0.5, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn an_audio_buffer_without_channels_is_refused_instead_of_dividing_by_zero() {
+        let decoded = AudioBuffer::<f32>::unused();
+        let mut mono = Vec::new();
+        let error = append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded))).unwrap_err();
+        assert_eq!(error.to_string(), "audio track has no channels");
+        assert!(mono.is_empty());
     }
 
     #[test]
