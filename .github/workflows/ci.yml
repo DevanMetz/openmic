@@ -27,6 +27,23 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang pkg-config libasound2-dev libxdo-dev libx11-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
   # Keeps release-profile build artifacts cached on main for the release
   # workflow. GitHub only lets a tag's run read caches from that tag or the
   # default branch, so caches saved by earlier tag builds were never reused
