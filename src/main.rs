@@ -48,8 +48,9 @@ fn main() -> eframe::Result<()> {
         logfile::warn(format_args!("virtual microphone unavailable: {e:#}"));
     }
     let settings = config::Settings::load();
-    // Windows startup launches straight into the notification area.
-    // (A collapsed OpenMic opens as the strip, with the window hidden.)
+    // --minimized (login startup) launches straight into the notification
+    // area when one exists. A collapsed OpenMic opens as the strip, with
+    // the window hidden.
     let start_hidden = settings.load_error.is_none()
         && ((settings.close_to_tray && std::env::args().any(|arg| arg == config::MINIMIZED_ARG)) || settings.collapsed);
     let icon = egui::IconData {
