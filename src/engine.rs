@@ -337,19 +337,24 @@ where
 {
     Ok(device.build_input_stream(
         *config,
-        input_callback::<T>(usize::from(config.channels), Arc::clone(queue), Arc::clone(waker)),
+        input_callback::<T>(usize::from(config.channels), config.sample_rate, Arc::clone(queue), Arc::clone(waker)),
         on_error,
         None,
     )?)
 }
 
-fn input_callback<T>(channels: usize, queue: Arc<ArrayQueue<f32>>, waker: Arc<OnceLock<Thread>>)
-    -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
+fn input_callback<T>(
+    channels: usize,
+    sample_rate: u32,
+    queue: Arc<ArrayQueue<f32>>,
+    waker: Arc<OnceLock<Thread>>,
+) -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     move |data, _| {
+        crate::rt::request_audio_thread(sample_rate, "microphone");
         for frame in data.chunks(channels) {
             // Invalid device samples must not poison the resampler or the
             // persistent filter state. Sum in f64 before clipping the mix.
@@ -371,15 +376,20 @@ fn output_stream<T>(
     config: &StreamConfig,
     queue: &Arc<OutQueue>,
     on_error: impl FnMut(cpal::Error) + Send + 'static,
+    what: &'static str,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = usize::from(config.channels);
+    let rate = config.sample_rate;
     let queue = Arc::clone(queue);
     Ok(device.build_output_stream(
         *config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| queue.fill(data, channels),
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            crate::rt::request_audio_thread(rate, what);
+            queue.fill(data, channels);
+        },
         on_error,
         None,
     )?)
@@ -406,7 +416,7 @@ fn open_output(host: &Host, name: &str, what: &'static str, reports: &Arc<Report
     let stream = open_stream_with_fallback(&mut config, |config| {
         for_format!(
             supported.sample_format(),
-            output_stream(&device, config, &queue, reports.stream_error(what))
+            output_stream(&device, config, &queue, reports.stream_error(what), what)
         )
     })
     .with_context(|| format!("open {what} '{name}'"))?;
@@ -490,13 +500,26 @@ impl Engine {
                 .name("openmic-dsp".into())
                 .spawn(move || {
                     let _ = waker.set(thread::current());
-                    // Pro Audio scheduling class (MMCSS): fewer dropouts
-                    // while a game or browser keeps the CPU busy.
-                    let priority =
-                        audio_thread_priority::promote_current_thread_to_real_time(FRAME as u32, SR);
-                    if priority.is_err() {
-                        reports.warn.lock().get_or_insert_with(|| {
-                            "processing thread: real-time priority refused".into()
+                    // Fewer dropouts while a game or browser keeps the CPU busy.
+                    // Windows joins the Pro Audio class here. Linux asks
+                    // RealtimeKit from a helper so this thread can start at once.
+                    #[cfg(not(target_os = "linux"))]
+                    let _priority = match audio_thread_priority::promote_current_thread_to_real_time(FRAME as u32, SR) {
+                        Ok(handle) => Some(handle),
+                        Err(_) => {
+                            reports.warn.lock().get_or_insert_with(|| {
+                                "processing thread: real-time priority refused".into()
+                            });
+                            None
+                        }
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        let reports = Arc::clone(&reports);
+                        crate::rt::request_current_thread(SR, move |error| {
+                            reports.warn.lock().get_or_insert_with(|| {
+                                format!("processing thread: real-time priority refused: {error}")
+                            });
                         });
                     }
                     if let Err(e) = process_loop(
@@ -753,7 +776,7 @@ mod tests {
     #[test]
     fn invalid_device_samples_do_not_poison_later_microphone_audio() {
         let queue = Arc::new(ArrayQueue::new(1024));
-        let mut callback = input_callback::<f32>(2, Arc::clone(&queue), Arc::default());
+        let mut callback = input_callback::<f32>(2, 48_000, Arc::clone(&queue), Arc::default());
         let info = cpal::InputCallbackInfo::new(cpal::InputStreamTimestamp {
             callback: cpal::StreamInstant::ZERO,
             capture: cpal::StreamInstant::ZERO,

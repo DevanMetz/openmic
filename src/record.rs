@@ -301,9 +301,11 @@ impl Recorder {
                 let queue = Arc::clone(&queue);
                 let skipped = Arc::clone(&recorder.skipped);
                 let error = Arc::clone(&recorder.error);
+                let sample_rate = $config.sample_rate;
                 device.build_input_stream(
                     $config,
                     move |data: &[$sample], _: &cpal::InputCallbackInfo| {
+                        crate::rt::request_audio_thread(sample_rate, "recording");
                         // Whole callbacks only, so channels never shift.
                         if queue.capacity() - queue.len() < data.len() {
                             skipped.store(true, Ordering::Relaxed);

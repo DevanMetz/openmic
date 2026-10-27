@@ -18,6 +18,7 @@ mod logfile;
 mod playback;
 mod record;
 mod resample;
+mod rt;
 mod tray;
 mod update;
 mod virtual_mic;

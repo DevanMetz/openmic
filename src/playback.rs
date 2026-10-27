@@ -157,6 +157,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     move |data, info| {
+        crate::rt::request_audio_thread(rate, "playback");
         let start = progress.queued.load(Ordering::Relaxed);
         let mut at = start;
         for frame in data.chunks_mut(channels) {
