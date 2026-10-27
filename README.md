@@ -49,9 +49,11 @@ Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://gi
 
 While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord/OBS/browsers to select as their microphone. Both are removed when OpenMic exits, and leftovers from a crash are replaced on the next launch. **Start on login** writes an XDG autostart entry. OpenMic uses 10 ms PulseAudio buffers, takes a single-instance lock, and records computer audio from the selected output's monitor source.
 
+Closing the window hides OpenMic in the notification area when the desktop shows StatusNotifier icons, and quits otherwise.
+
 To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
 
-Not available on Linux: the notification-area tray (closing the window quits), the in-app updater (download new releases from the releases page), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11).
+Not available on Linux: the in-app updater (download new releases from the releases page), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11).
 
 ## Windows requirements
 
@@ -184,7 +186,7 @@ Holding **Enter** or **Space** on **Set…** opens capture once. Release that ke
 
 Focused settings stay visible when you resize the window. Clicking **Cancel** or **Clear** in a shortcut row keeps the page where you scrolled.
 
-Closing the window hides OpenMic to the notification area, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
+Closing the window hides OpenMic to the notification area when one is available, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
 
 ## Updates
 
