@@ -49,6 +49,10 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
+# StatusNotifierItem tray. ksni speaks D-Bus itself, so the build does not
+# need GTK or libappindicator. Desktops without a StatusNotifier host fail
+# at runtime and OpenMic keeps the window instead.
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
