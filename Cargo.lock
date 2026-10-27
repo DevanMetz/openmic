@@ -3773,6 +3773,8 @@ dependencies = [
  "windows-core",
  "winreg",
  "winresource",
+ "x11rb",
+ "xkeysym",
 ]
 
 [[package]]

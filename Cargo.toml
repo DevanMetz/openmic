@@ -49,6 +49,10 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
+# Already in the lockfile (global-hotkey and winit). Dictation uses them to
+# type into the focused X11 window. No new crates.
+x11rb = { version = "0.13.2", features = ["xtest"] }
+xkeysym = "0.2.1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

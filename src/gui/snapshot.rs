@@ -20,10 +20,9 @@ const DEFAULT_MIC_HELP: &str = "In Discord: leave Voice & Video > Input Device o
 #[cfg(not(windows))]
 const DEFAULT_MIC_HELP: &str = "Make OpenMic Microphone my default mic while running";
 
-#[cfg(windows)]
-const DICTATION_HELP: &str = "Your words are typed into the app you're using. Set your Shortcut above.";
-#[cfg(not(windows))]
-const DICTATION_HELP: &str = "Your words appear below to copy into the app you're using. Set your Shortcut above.";
+fn dictation_help() -> &'static str {
+    crate::dictation::entry_hint()
+}
 
 struct Canvas {
     width: usize,
@@ -206,7 +205,7 @@ fn native_helper_text_and_links_remain_readable_when_the_system_theme_changes() 
                         "Recording stays on this computer.",
                     ],
                     super::Page::Dictation => &[
-                        "Shortcut", "Model", DICTATION_HELP,
+                        "Shortcut", "Model", dictation_help(),
                     ],
                     super::Page::Settings => &[
                         "Mute mic", "Bypass processing", "Stop all clips", "Speech to text",
