@@ -49,6 +49,9 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
+# Same crate global-hotkey already links. RandR and the EWMH work area say
+# where a saved window still fits; Wayland sessions do not use it.
+x11rb = { version = "0.13.2", features = ["randr", "resource_manager"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

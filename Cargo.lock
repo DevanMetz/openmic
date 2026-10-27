@@ -3773,6 +3773,7 @@ dependencies = [
  "windows-core",
  "winreg",
  "winresource",
+ "x11rb",
 ]
 
 [[package]]
