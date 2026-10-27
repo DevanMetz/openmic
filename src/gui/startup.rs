@@ -13,6 +13,9 @@ impl App {
             && self.settings.load_error.is_none()
             && (self.tray.is_some() || self.strip_visible());
         if requested_hidden && !self.hidden {
+            // The window is on screen. A login-start flag must not keep the
+            // strip hidden beside it when there was nowhere else to go.
+            self.strip_suppressed = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
     }
@@ -489,6 +492,11 @@ mod tests {
             let ctx = egui::Context::default();
             let output = ctx.run_ui(egui::RawInput::default(), |ui| app.set_startup_visibility(ui.ctx(), requested_hidden));
             assert_eq!(app.hidden, hidden, "collapsed={collapsed}, always={always_show_strip}, suppressed={suppressed}");
+            assert_eq!(
+                app.strip_suppressed,
+                suppressed && hidden,
+                "a window that had to be shown keeps its strip: collapsed={collapsed}, always={always_show_strip}"
+            );
             let shown = output.viewport_output.values().flat_map(|v| &v.commands)
                 .any(|command| *command == egui::ViewportCommand::Visible(true));
             assert_eq!(shown, requested_hidden && !hidden, "show a window that was created hidden");
