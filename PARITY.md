@@ -41,9 +41,9 @@ Windows is the reference. Status describes this tree: `working`, `partial`, `mis
 | Start on login | partial | `src/config.rs` |
 | Start processing automatically | working | `src/config.rs`, `src/gui/mod.rs` |
 | One copy at a time; launching again shows the running window | partial | `src/instance.rs` |
-| In-app updates (daily check, download, verify, restart) | missing | `src/update.rs`, `src/gui/updates.rs` |
-| Check for updates daily | missing | `src/gui/settings_tab.rs` |
-| Open the releases page, log folder, and settings folder | missing | `src/gui/mod.rs` |
+| In-app updates (daily check, download, verify, restart) | working | `src/update.rs`, `src/gui/updates.rs`, `.github/workflows/release.yml` |
+| Check for updates daily | working | `src/gui/settings_tab.rs`, `src/update.rs` |
+| Open the releases page, log folder, and settings folder | working | `src/gui/mod.rs` |
 | Light and dark theme following the system | working | `src/gui/mod.rs` |
 | Screen reader and keyboard navigation | working | `src/gui/mod.rs` |
 | Settings saved atomically, with a recovery screen if the file will not load | working | `src/config.rs`, `src/gui/startup.rs` |
@@ -62,4 +62,5 @@ Windows is the reference. Status describes this tree: `working`, `partial`, `mis
 - **Strip and window placement.** The strip asks to stay on top, but nothing re-raises it after another window or the panel covers it, and Wayland has no standard always-on-top flag. Hover hints and the restored window are not fitted to a work area: `monitor_work_area` returns nothing, `on_a_monitor` accepts every position, and `work_area_size` returns nothing. A saved position can reopen off-screen.
 - **Start on login.** OpenMic writes `~/.config/autostart/openmic.desktop` and treats any existing file as enabled, including one a desktop disabled. The command passes `--minimized`, which suppresses the strip, and there is no tray for that launch to hide in.
 - **Second launch.** The lock file stops another process. It does not ask the running copy to show its window.
-- **Updates and links.** The in-app updater only accepts `openmic-<tag>-windows-x64.exe`. On Linux the version number is a label, **Check for updates daily** is hidden, and so is **Open log folder**. Buttons that do open something run `explorer`, which is not installed. The recovery screen's **Open settings folder** uses that same path.
+- **Updates.** The published Linux build is x86_64. Its updater downloads `openmic-<tag>-linux-x86_64.tar.gz`, checks the SHA-256 and Ed25519 signature, and replaces the running binary with the `openmic` file inside the archive. Other architectures are not possible until a release publishes an archive for them. Windows still installs `openmic-<tag>-windows-x64.exe`.
+- **Links and folders.** `xdg-open` opens the releases page, the log folder, and the settings folder. Windows still uses Explorer. A missing `xdg-open` is written to the log.

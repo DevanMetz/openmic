@@ -21,6 +21,9 @@ crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 directories = "6.0"
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+# Inflate the Linux release archive after its signature check. rust_backend
+# is miniz_oxide, already in the lockfile, so this does not need a system zlib.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 global-hotkey = "0.8"
 parking_lot = "0.12"
 rfd = "0.15.4"

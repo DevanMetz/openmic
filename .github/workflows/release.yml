@@ -133,9 +133,18 @@ jobs:
           cp README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      # The updater refuses a Linux archive without this signature (public
+      # half in src/update.rs), so a missing secret fails the release.
+      - name: Sign the archive for the in-app updater
+        env:
+          OPENMIC_SIGNING_KEY: ${{ secrets.OPENMIC_SIGNING_KEY }}
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 scripts/sign_release.py "openmic-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             openmic-${{ github.ref_name }}-linux-x86_64.tar.gz
             openmic-${{ github.ref_name }}-linux-x86_64.tar.gz.sha256
+            openmic-${{ github.ref_name }}-linux-x86_64.tar.gz.sig
           body_path: docs/releases/${{ github.ref_name }}.md
