@@ -18,7 +18,7 @@ Audio stays on your computer. Nothing is kept unless you use **Record** or speec
 - Live routing changes with automatic stream handoff (soundboard playheads preserved)
 - Recovers on its own when a device is unplugged and plugged back in
 - Low, steady latency: output queues hold ~25 ms and track clock drift between devices, so the delay never creeps up over a long session
-- Audio threads run in Windows' Pro Audio scheduling class, for fewer dropouts under load
+- Audio threads run in Windows' Pro Audio scheduling class, and on Linux at real-time priority through RealtimeKit, for fewer dropouts under load
 - Noise-reduction strength, input/output gain and an optional level-based gate
 - Processing presets (Balanced, Mechanical keyboard, Quiet room, Noisy room, Low CPU) plus your own
 - Live bypass and microphone mute
@@ -47,9 +47,9 @@ Prebuilt Windows x64 executables are attached to each [GitHub release](https://g
 
 Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://github.com/DevanMetz/openmic/releases), extract it, and run `./openmic`. PulseAudio, or PipeWire with `pipewire-pulse`, and the `pactl` command are required (`pulseaudio-utils` on Debian/Ubuntu, `pipewire-pulse` on PipeWire-only systems). Without them OpenMic still runs, but has no virtual microphone.
 
-While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord/OBS/browsers to select as their microphone. Both are removed when OpenMic exits, and leftovers from a crash are replaced on the next launch. **Start on login** writes an XDG autostart entry. OpenMic uses 10 ms PulseAudio buffers, takes a single-instance lock, and records computer audio from the selected output's monitor source.
+While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord/OBS/browsers to select as their microphone. Both are removed when OpenMic exits, and leftovers from a crash are replaced on the next launch. **Start on login** writes an XDG autostart entry. OpenMic uses 10 ms PulseAudio buffers, takes a single-instance lock, and records computer audio from the selected output's monitor source. Audio threads ask RealtimeKit (`rtkit`) for real-time priority; without it they keep normal priority and OpenMic logs the refusal.
 
-To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
+To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libdbus-1-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
 
 Not available on Linux: the notification-area tray (closing the window quits), the in-app updater (download new releases from the releases page), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11).
 
