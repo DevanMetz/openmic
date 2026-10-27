@@ -49,6 +49,9 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
+# Same crate winit and global-hotkey already link. Keeps the level strip
+# above other X11 windows. The connection is pure Rust, so this adds no library.
+x11rb = { version = "0.13.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

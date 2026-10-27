@@ -20,6 +20,8 @@ mod record;
 mod resample;
 mod tray;
 mod update;
+#[cfg(target_os = "linux")]
+mod x11_above;
 mod virtual_mic;
 mod viz;
 mod widgets;
