@@ -40,7 +40,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang pkg-config libasound2-dev libxdo-dev libx11-dev \
-            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libssl-dev dbus
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 

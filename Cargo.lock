@@ -3742,6 +3742,7 @@ version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "ashpd",
  "audio_thread_priority",
  "candle-core",
  "candle-nn",
@@ -3754,9 +3755,12 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "eframe",
+ "futures-channel",
+ "futures-util",
  "global-hotkey",
  "ndarray",
  "parking_lot",
+ "pollster",
  "rfd",
  "serde",
  "serde_json",
@@ -3773,6 +3777,7 @@ dependencies = [
  "windows-core",
  "winreg",
  "winresource",
+ "zbus",
 ]
 
 [[package]]

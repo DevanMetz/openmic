@@ -49,6 +49,18 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
+# Wayland global shortcuts. async-std matches rfd's ashpd; tokio cannot be
+# enabled at the same time. pollster and the futures crates drive the portal
+# from a worker thread (they are already in the build through rfd).
+ashpd = { version = "0.11.1", default-features = false, features = ["async-std"] }
+pollster = "0.4.0"
+futures-util = "0.3.34"
+futures-channel = "0.3.34"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The portal test serves GlobalShortcuts. zbus is already linked through ashpd;
+# the interface macro resolves `::zbus` only when this crate depends on it.
+zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

@@ -16,6 +16,8 @@ mod icon;
 mod instance;
 mod logfile;
 mod playback;
+#[cfg(target_os = "linux")]
+mod portal_shortcuts;
 mod record;
 mod resample;
 mod tray;
