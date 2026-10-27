@@ -75,16 +75,37 @@ pub struct StatsSnapshot {
     pub model: ModelState,
 }
 
-/// Deduped friendly names for a direction.
-pub fn list_devices(host: &Host, output: bool) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
+/// One device as the host reports it. `id` is the backend id (`DeviceId::id`),
+/// empty when the host cannot provide one. PulseAudio monitor sources use
+/// `{sink}.monitor` here; their display names are translated.
+pub struct ListedDevice {
+    pub name: String,
+    pub id: String,
+}
+
+/// Every device in a direction, including duplicate display names.
+pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
+    let mut listed = Vec::new();
     let iter = if output { host.output_devices() } else { host.input_devices() };
     if let Ok(devices) = iter {
         for device in devices {
-            let name = device.to_string();
-            if !names.contains(&name) {
-                names.push(name);
-            }
+            let id = device.id().map(|id| id.id().to_owned()).unwrap_or_default();
+            listed.push(ListedDevice { name: device.to_string(), id });
+        }
+    }
+    listed
+}
+
+/// Deduped friendly names for a direction. The first device keeps the name.
+pub fn list_devices(host: &Host, output: bool) -> Vec<String> {
+    device_names(list_device_details(host, output))
+}
+
+fn device_names(devices: impl IntoIterator<Item = ListedDevice>) -> Vec<String> {
+    let mut names = Vec::new();
+    for device in devices {
+        if !names.contains(&device.name) {
+            names.push(device.name);
         }
     }
     names
