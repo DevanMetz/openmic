@@ -23,19 +23,19 @@ pub fn cable_input(outputs: &[String]) -> Option<&String> {
 
 /// Whether an input is the processed side of a virtual cable (or, on Linux,
 /// any monitor source). Choosing one as the mic would feed audio back.
+/// `monitors` carries display names recognized by their backend id, including
+/// descriptions the desktop has translated.
 #[cfg(windows)]
-fn is_processed_input(name: &str) -> bool {
+fn is_processed_input(name: &str, _monitors: &[String]) -> bool {
     name.contains("CABLE Output")
 }
 
 #[cfg(not(windows))]
-fn is_processed_input(name: &str) -> bool {
-    name.contains("CABLE Output") || name.contains("OpenMic Microphone") || is_monitor_source(name)
-}
-
-#[cfg(not(windows))]
-fn is_monitor_source(name: &str) -> bool {
-    name.contains("Monitor of ") || name.to_ascii_lowercase().contains(".monitor")
+fn is_processed_input(name: &str, monitors: &[String]) -> bool {
+    name.contains("CABLE Output")
+        || name.contains("OpenMic Microphone")
+        || crate::record::is_monitor_source(name)
+        || monitors.iter().any(|monitor| monitor == name)
 }
 
 /// Platform words for the fallback device labels in the UI.
@@ -66,12 +66,27 @@ pub fn default_microphone_label() -> &'static str {
 /// Without VB-Cable the processed output stays unset: defaulting to the
 /// first device would play the mic out of the speakers (feedback).
 /// Choices whose device is absent are only replaced if `replace_missing`.
+#[cfg(test)]
 pub fn choose_routes(
     s: &mut Settings,
     inputs: &[String],
     outputs: &[String],
     prefer_cable: bool,
     replace_missing: bool,
+) {
+    choose_routes_with_monitors(s, inputs, outputs, prefer_cable, replace_missing, &[]);
+}
+
+/// Route devices, and do not automatically pick any name in `monitors` as
+/// the microphone. Those names include translated monitor descriptions
+/// ("Monitor von …") that the English label check cannot see.
+pub fn choose_routes_with_monitors(
+    s: &mut Settings,
+    inputs: &[String],
+    outputs: &[String],
+    prefer_cable: bool,
+    replace_missing: bool,
+    monitors: &[String],
 ) {
     let needs = |current: &String, pool: &[String]| {
         current.is_empty() || (replace_missing && !pool.contains(current))
@@ -80,7 +95,7 @@ pub fn choose_routes(
         // The cable's recording side carries our own processed output;
         // choosing it as the mic would feed that output back into itself.
         s.microphone = inputs.iter()
-            .find(|name| !is_processed_input(name))
+            .find(|name| !is_processed_input(name, monitors))
             .cloned()
             .unwrap_or_default();
     }
@@ -266,5 +281,26 @@ mod tests {
 
         choose_routes(&mut s, &names(&["openmic_cable.monitor", "USB mic"]), &outputs, false, true);
         assert_eq!(s.microphone, "USB mic", "a raw .monitor name is skipped too");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_translated_monitor_description_is_not_chosen_as_the_microphone() {
+        let mut s = Settings::default();
+        let speakers = "Monitor von Lautsprecher";
+        let cable = "Monitor von OpenMic Virtual Cable";
+        let inputs = names(&[cable, speakers, "USB-Mikrofon"]);
+        let monitors = names(&[cable, speakers]);
+        let outputs = names(&["Lautsprecher", "OpenMic Virtual Cable"]);
+        choose_routes_with_monitors(&mut s, &inputs, &outputs, false, true, &monitors);
+        assert_eq!(s.microphone, "USB-Mikrofon");
+        assert_eq!(s.output, "OpenMic Virtual Cable");
+
+        choose_routes_with_monitors(&mut s, &names(&[speakers]), &outputs, false, true, &monitors);
+        assert!(s.microphone.is_empty(), "wait for a microphone instead of looping a translated monitor back");
+
+        s.microphone = speakers.into();
+        choose_routes_with_monitors(&mut s, &inputs, &outputs, false, true, &monitors);
+        assert_eq!(s.microphone, speakers, "an explicit route is retained");
     }
 }

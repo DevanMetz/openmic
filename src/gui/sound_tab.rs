@@ -18,13 +18,13 @@ use crate::widgets;
 use super::routes::{default_microphone_label, default_output_label};
 
 #[cfg(windows)]
-fn computer_audio_available(_inputs: &[String]) -> bool {
+fn computer_audio_available(_inputs: &[String], _monitors: &[String]) -> bool {
     true
 }
 
 #[cfg(not(windows))]
-fn computer_audio_available(inputs: &[String]) -> bool {
-    inputs.iter().any(|name| record::is_monitor_source(name))
+fn computer_audio_available(inputs: &[String], monitors: &[String]) -> bool {
+    inputs.iter().any(|name| monitors.iter().any(|monitor| monitor == name) || record::is_monitor_source(name))
 }
 
 pub(super) struct PadRename {
@@ -538,7 +538,7 @@ impl App {
         let take_ready = self.take.is_some();
         let saving = self.recording_save.is_some();
         let outputs = self.outputs.clone();
-        let computer_audio = computer_audio_available(&self.inputs);
+        let computer_audio = computer_audio_available(&self.inputs, &self.monitor_inputs);
         let mut start = false;
         let mut stop = false;
         let mut save = false;
@@ -1711,6 +1711,18 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_translated_monitor_name_still_offers_computer_audio() {
+        let speakers = "Monitor von Lautsprecher".to_owned();
+        let inputs = [speakers.clone(), "USB-Mikrofon".into()];
+        assert!(!computer_audio_available(&inputs, &[]), "the translated description is not an English monitor label");
+        assert!(computer_audio_available(&inputs, std::slice::from_ref(&speakers)));
+        assert!(computer_audio_available(&["Monitor of Speakers".into()], &[]));
+        assert!(computer_audio_available(&["alsa_output.pci.analog-stereo.monitor".into()], &[]));
+        assert!(!computer_audio_available(&["Studio Monitor".into(), "USB-Mikrofon".into()], &[]));
+    }
 
     #[test]
     fn recording_and_take_labels_keep_the_device_that_was_opened() {
