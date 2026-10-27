@@ -45,7 +45,7 @@ Prebuilt Windows x64 executables are attached to each [GitHub release](https://g
 
 ## Linux
 
-Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://github.com/DevanMetz/openmic/releases), extract it, and run `./openmic`. PulseAudio, or PipeWire with `pipewire-pulse`, and the `pactl` command are required (`pulseaudio-utils` on Debian/Ubuntu, `pipewire-pulse` on PipeWire-only systems). Without them OpenMic still runs, but has no virtual microphone.
+Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://github.com/DevanMetz/openmic/releases), extract it, and run `./openmic`. The window opens on Wayland and on X11. PulseAudio, or PipeWire with `pipewire-pulse`, and the `pactl` command are required (`pulseaudio-utils` on Debian/Ubuntu, `pipewire-pulse` on PipeWire-only systems). Without them OpenMic still runs, but has no virtual microphone.
 
 While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord/OBS/browsers to select as their microphone. Both are removed when OpenMic exits, and leftovers from a crash are replaced on the next launch. **Start on login** writes an XDG autostart entry. OpenMic uses 10 ms PulseAudio buffers, takes a single-instance lock, and records computer audio from the selected output's monitor source.
 
