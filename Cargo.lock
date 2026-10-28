@@ -3789,6 +3789,7 @@ dependencies = [
  "winreg",
  "winresource",
  "x11rb",
+ "xkeysym",
 ]
 
 [[package]]

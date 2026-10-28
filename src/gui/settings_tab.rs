@@ -293,11 +293,7 @@ impl App {
                         self.touch();
                     }
                 });
-                ui.weak(if cfg!(windows) {
-                    "Your words are typed into the app you're using. Set your Shortcut above."
-                } else {
-                    "Your words appear below to copy into the app you're using. Set your Shortcut above."
-                });
+                ui.weak(crate::dictation::entry_hint());
 
                 if let Some(recording) = &self.dictating {
                     ui.horizontal(|ui| {

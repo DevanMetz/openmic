@@ -1245,8 +1245,7 @@ impl App {
                 dictation::Event::Transcribed { text, typing_error } => {
                     self.last_dictation = text;
                     match typing_error {
-                        Some(error) if cfg!(windows) => (format!("Copy the transcript below: {error}"), AMBER),
-                        Some(_) => ("Transcript ready below".into(), MUTED),
+                        Some(error) => (format!("Copy the transcript below: {error}"), AMBER),
                         None => ("Typed".into(), GREEN),
                     }
                 }

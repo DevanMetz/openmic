@@ -23,6 +23,8 @@ mod resample;
 mod tray;
 mod update;
 mod virtual_mic;
+#[cfg(target_os = "linux")]
+mod x11_type;
 mod viz;
 mod widgets;
 

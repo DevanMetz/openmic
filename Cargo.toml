@@ -52,13 +52,10 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
-# Same crate global-hotkey already links. RandR and the EWMH work area say
-# where a saved window still fits; Wayland sessions do not use it.
-x11rb = { version = "0.13.2", features = ["randr", "resource_manager"] }
-# Same crates and versions as eframe's glow feature. Cargo unifies the
-# features onto that copy: Wayland can create an EGL window surface, and
-# X11 prefers GLX with EGL as the fallback. Without this, glutin is EGL-only
-# and a Wayland window has no surface.
+# X11 dictation and monitor placement share this connection.
+x11rb = { version = "0.13.2", features = ["xtest", "randr", "resource_manager"] }
+xkeysym = "0.2.1"
+# Enable window surfaces on both Wayland and X11.
 glutin = { version = "=0.32.3", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
 glutin-winit = { version = "=0.5.0", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
 

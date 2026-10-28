@@ -24,6 +24,18 @@ use crate::config;
 use crate::dsp;
 use crate::record::Take;
 
+/// The Dictation page's one-line description of where the words go.
+///
+/// Wayland cannot take the keystrokes; the status line says so when a take
+/// finishes, and the transcript stays on the page to copy.
+pub fn entry_hint() -> &'static str {
+    if cfg!(any(windows, target_os = "linux")) {
+        "Your words are typed into the app you're using. Set your Shortcut above."
+    } else {
+        "Your words appear below to copy into the app you're using. Set your Shortcut above."
+    }
+}
+
 /// A Whisper checkpoint from Hugging Face, pinned to a revision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SpeechModel {
@@ -909,10 +921,15 @@ fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
+    crate::x11_type::type_text(text, cancel)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn type_text(_text: &str, cancel: &AtomicBool) -> Result<()> {
     check_transcription_cancelled(cancel)?;
-    bail!("typing into other apps isn't available on Linux; the transcript is shown to copy")
+    bail!("typing into other apps isn't available on this platform; the transcript is shown to copy")
 }
 
 #[cfg(test)]
