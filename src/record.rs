@@ -1636,8 +1636,11 @@ mod tests {
     }
 
     fn listed(name: &str, id: &str) -> crate::engine::ListedDevice {
+        #[cfg(windows)]
+        let _ = id;
         crate::engine::ListedDevice {
             name: name.into(),
+            #[cfg(not(windows))]
             id: id.into(),
         }
     }

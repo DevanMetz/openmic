@@ -1940,6 +1940,7 @@ fn named_inputs(names: impl IntoIterator<Item = String>) -> Vec<ListedDevice> {
         .into_iter()
         .map(|name| ListedDevice {
             name,
+            #[cfg(not(windows))]
             id: String::new(),
         })
         .collect()
