@@ -2,10 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 
-use crate::dsp::{apply_processing, HighPass, Model, Params, VoiceGate, FRAME, HIGHPASS_HZ};
+use crate::dsp::{FRAME, HIGHPASS_HZ, HighPass, Model, Params, VoiceGate, apply_processing};
 
 /// What the cleaner is actually running, for the GUI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +71,11 @@ impl Cleaner {
 
     /// Current (voice gate, level gate) gains, for the scope.
     pub fn gate_gains(&self, p: &Params) -> (f32, f32) {
-        let voice = if p.voice_gate && !p.bypass { self.voice_gate.gain() } else { 1.0 };
+        let voice = if p.voice_gate && !p.bypass {
+            self.voice_gate.gain()
+        } else {
+            1.0
+        };
         (voice, self.level_gate)
     }
 
@@ -117,7 +121,10 @@ impl Cleaner {
             Some(wet) => apply_processing(
                 &dry,
                 &wet,
-                &Params { strength: 1.0, ..*p },
+                &Params {
+                    strength: 1.0,
+                    ..*p
+                },
                 &mut self.level_gate,
             ),
             None if p.bypass => apply_processing(&dry, &rnn_out, p, &mut self.level_gate),
@@ -127,8 +134,13 @@ impl Cleaner {
             self.frames_seen += 1;
         }
         if p.voice_gate && !p.bypass {
-            let gate_prob = if self.frames_seen < VAD_WARMUP_FRAMES { 0.0 } else { prob };
-            self.voice_gate.process(&mut z, gate_prob, p.voice_threshold);
+            let gate_prob = if self.frames_seen < VAD_WARMUP_FRAMES {
+                0.0
+            } else {
+                prob
+            };
+            self.voice_gate
+                .process(&mut z, gate_prob, p.voice_threshold);
         } else {
             self.voice_gate.reset();
         }
@@ -229,14 +241,16 @@ pub mod rnn {
     impl Denoiser {
         pub fn new() -> Self {
             // NULL model = the library's built-in trained weights.
-            unsafe { Self { st: rnnoise_create(std::ptr::null()) } }
+            unsafe {
+                Self {
+                    st: rnnoise_create(std::ptr::null()),
+                }
+            }
         }
 
         /// Process `frame` in place; returns voice probability.
         pub fn process_frame(&mut self, frame: &mut [f32]) -> f32 {
-            unsafe {
-                rnnoise_process_frame(self.st, frame.as_mut_ptr(), frame.as_ptr())
-            }
+            unsafe { rnnoise_process_frame(self.st, frame.as_mut_ptr(), frame.as_ptr()) }
         }
     }
 
@@ -290,7 +304,7 @@ impl DeepFilter {
             .with_thresholds(-15.0, 1000.0, 1000.0)
             .with_mask_reduce(df::tract::ReduceMask::MAX);
         let model = df::tract::DfTract::new(df::tract::DfParams::default(), &runtime)
-        .map_err(|e| anyhow!("load DeepFilterNet: {e:#}"))?;
+            .map_err(|e| anyhow!("load DeepFilterNet: {e:#}"))?;
         if model.hop_size != FRAME || model.sr != crate::dsp::SR as usize {
             return Err(anyhow!(
                 "DeepFilterNet model is {} Hz / {} hop, expected 48 kHz / {FRAME}",
@@ -408,7 +422,12 @@ impl DeepFilterWorker {
                     }
                 }
             })?;
-        Ok(Self { requests, replies, seq: 0, ready: false })
+        Ok(Self {
+            requests,
+            replies,
+            seq: 0,
+            ready: false,
+        })
     }
 
     /// `Ok(None)` while loading or when the frame is late; `Err` is fatal.
@@ -462,34 +481,61 @@ mod tests {
         let (_reply_tx, replies) = crossbeam_channel::bounded(1);
         drop(request_rx);
         let mut cleaner = Cleaner::new();
-        cleaner.deep = Some(DeepFilterWorker { requests, replies, seq: 0, ready: true });
+        cleaner.deep = Some(DeepFilterWorker {
+            requests,
+            replies,
+            seq: 0,
+            ready: true,
+        });
 
         assert!(cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none());
         assert!(cleaner.deep_failed);
         assert!(cleaner.deep.is_none(), "discard the unusable worker");
-        assert_eq!(cleaner.state(&Params { model: Model::DeepFilter, ..Params::default() }),
-            ModelState::DeepFilterFailed);
-        assert!(cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none(), "keep fallback stable without spawning another worker");
+        assert_eq!(
+            cleaner.state(&Params {
+                model: Model::DeepFilter,
+                ..Params::default()
+            }),
+            ModelState::DeepFilterFailed
+        );
+        assert!(
+            cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none(),
+            "keep fallback stable without spawning another worker"
+        );
     }
 
     #[test]
     fn deepfilter_skips_stale_replies_and_accepts_the_current_frame() {
         let (requests, request_rx) = crossbeam_channel::bounded(1);
         let (reply_tx, replies) = crossbeam_channel::bounded(2);
-        let mut worker = DeepFilterWorker { requests, replies, seq: 0, ready: true };
+        let mut worker = DeepFilterWorker {
+            requests,
+            replies,
+            seq: 0,
+            ready: true,
+        };
         reply_tx.send(DeepReply::Frame(0, [0.1; FRAME])).unwrap();
         reply_tx.send(DeepReply::Frame(1, [0.5; FRAME])).unwrap();
 
         // A current reply already in the queue needs no waiting allowance.
-        assert_eq!(worker.process(&[0.25; FRAME], 0.8, Duration::ZERO).unwrap(), Some([0.5; FRAME]));
+        assert_eq!(
+            worker.process(&[0.25; FRAME], 0.8, Duration::ZERO).unwrap(),
+            Some([0.5; FRAME])
+        );
         assert_eq!(request_rx.try_recv().unwrap(), (1, [0.25; FRAME], 0.8));
 
         reply_tx.send(DeepReply::Frame(1, [0.5; FRAME])).unwrap();
         reply_tx.send(DeepReply::Ready).unwrap();
-        assert_eq!(worker.process(&[0.0; FRAME], 1.0, Duration::ZERO).unwrap(), None,
-            "stale replies cannot substitute for the new frame or keep the caller waiting");
+        assert_eq!(
+            worker.process(&[0.0; FRAME], 1.0, Duration::ZERO).unwrap(),
+            None,
+            "stale replies cannot substitute for the new frame or keep the caller waiting"
+        );
         assert_eq!(request_rx.try_recv().unwrap().0, 2);
-        assert!(worker.ready, "a missed deadline keeps the worker available for later frames");
+        assert!(
+            worker.ready,
+            "a missed deadline keeps the worker available for later frames"
+        );
     }
 
     #[test]
@@ -497,11 +543,23 @@ mod tests {
         let (requests, request_rx) = crossbeam_channel::bounded(1);
         let (_reply_tx, replies) = crossbeam_channel::bounded(1);
         requests.send((0, [0.0; FRAME], 1.0)).unwrap();
-        let mut worker = DeepFilterWorker { requests, replies, seq: 0, ready: true };
+        let mut worker = DeepFilterWorker {
+            requests,
+            replies,
+            seq: 0,
+            ready: true,
+        };
 
-        assert!(matches!(worker.process(&[0.0; FRAME], 1.0, Duration::ZERO), Ok(None)));
+        assert!(matches!(
+            worker.process(&[0.0; FRAME], 1.0, Duration::ZERO),
+            Ok(None)
+        ));
         assert!(worker.ready, "a busy worker remains usable");
-        assert_eq!(request_rx.try_recv().unwrap().0, 0, "keep the earlier queued frame when skipping the new one");
+        assert_eq!(
+            request_rx.try_recv().unwrap().0,
+            0,
+            "keep the earlier queued frame when skipping the new one"
+        );
     }
 
     // Deterministic xorshift RNG so the test needs no rand dependency.
@@ -545,9 +603,15 @@ mod tests {
             ..Default::default()
         };
         let mut cleaner = Cleaner::new();
-        let bypass = Params { bypass: true, ..base };
+        let bypass = Params {
+            bypass: true,
+            ..base
+        };
         let (out, _) = cleaner.process(&[0.1f32; FRAME], &bypass);
-        assert!(out.iter().all(|&s| (s - 0.1).abs() < 1e-6), "bypass must pass mic through");
+        assert!(
+            out.iter().all(|&s| (s - 0.1).abs() < 1e-6),
+            "bypass must pass mic through"
+        );
 
         let gated = Params {
             gate_enabled: true,
@@ -579,8 +643,9 @@ mod tests {
         let (rms_in, rms_out) = (rms(&noise), rms(&out));
         eprintln!("reduction {rms_in} -> {rms_out} ratio={}", rms_out / rms_in);
         for amp in [0.003f32, 0.01, 0.1] {
-            let n: Vec<f32> =
-                (0..SR as usize).map(|_| rng.next_uniform() * amp * SCALE).collect();
+            let n: Vec<f32> = (0..SR as usize)
+                .map(|_| rng.next_uniform() * amp * SCALE)
+                .collect();
             let (o, _) = run_frames(&n);
             eprintln!("amp={amp} ratio={}", rms(&o) / rms(&n));
         }
@@ -616,14 +681,19 @@ mod tests {
                 let f0 = 140.0 + 60.0 * (t * 1.3).sin() + 25.0 * (t * 4.7).sin();
                 phase += TAU * f0 / SR as f32;
                 let env = 0.5 + 0.5 * (t * 3.1).sin().abs();
-                0.15 * env * (1..=8).map(|h| (phase * h as f32).sin() / h as f32).sum::<f32>()
+                0.15 * env
+                    * (1..=8)
+                        .map(|h| (phase * h as f32).sin() / h as f32)
+                        .sum::<f32>()
             })
             .collect()
     }
 
     fn best_lag(input: &[f32], output: &[f32], max_lag: usize) -> usize {
         let corr = |lag: usize| -> f32 {
-            (max_lag..input.len()).map(|i| input[i - lag] * output[i]).sum()
+            (max_lag..input.len())
+                .map(|i| input[i - lag] * output[i])
+                .sum()
         };
         (0..max_lag)
             .max_by(|&a, &b| corr(a).total_cmp(&corr(b)))
@@ -659,7 +729,11 @@ mod tests {
     #[test]
     fn model_delays_match_alignment_constants() {
         let voice = wandering_voice(0.6);
-        let p = Params { highpass: false, voice_gate: false, ..Default::default() };
+        let p = Params {
+            highpass: false,
+            voice_gate: false,
+            ..Default::default()
+        };
         for (model, frames) in [
             (Model::Rnnoise, RNNOISE_DELAY_FRAMES),
             (Model::DeepFilter, DEEP_DELAY_FRAMES),
@@ -703,7 +777,11 @@ mod tests {
             .iter()
             .map(|s| s + 0.003 * rng.next_uniform())
             .collect();
-        let p = Params { highpass: false, voice_gate: false, ..Default::default() };
+        let p = Params {
+            highpass: false,
+            voice_gate: false,
+            ..Default::default()
+        };
         let settled = SR as usize..voice.len() - SR as usize / 10;
         let change = |scale: f32| {
             let x: Vec<f32> = voice.iter().map(|s| s * scale).collect();
@@ -727,17 +805,29 @@ mod tests {
     fn deep_filter_restores_original_levels_when_boost_changes() {
         let mut voice = wandering_voice(1.0);
         for (i, sample) in voice.iter_mut().enumerate() {
-            *sample *= if i < SR as usize / 3 || i >= 2 * SR as usize / 3 { 0.02 } else { 1.0 };
+            *sample *= if i < SR as usize / 3 || i >= 2 * SR as usize / 3 {
+                0.02
+            } else {
+                1.0
+            };
         }
         // With reduction at zero, normalization must cancel itself even as
         // the voice jumps between quiet and loud. Compare aligned samples.
-        let p = Params { strength: 0.0, highpass: false, voice_gate: false, ..Default::default() };
+        let p = Params {
+            strength: 0.0,
+            highpass: false,
+            voice_gate: false,
+            ..Default::default()
+        };
         let out = run_cleaner(&voice, &p);
         let end = voice.len() - DEEP_DELAY_FRAMES * FRAME;
         let error: Vec<f32> = voice[..end].iter().zip(&out).map(|(x, y)| x - y).collect();
         let relative_error = energy(&error) / energy(&voice[..end]);
         assert!(out.iter().all(|s| s.is_finite()));
-        assert!(relative_error < 0.001, "gain compensation changed the signal: {relative_error}");
+        assert!(
+            relative_error < 0.001,
+            "gain compensation changed the signal: {relative_error}"
+        );
     }
 
     #[test]
@@ -763,7 +853,13 @@ mod tests {
         );
         // The gate itself must not cost the voice anything. (Level vs. the
         // input is the model's business, and this buzz is not real speech.)
-        let ungated = run_cleaner(&mix, &Params { voice_gate: false, ..Default::default() });
+        let ungated = run_cleaner(
+            &mix,
+            &Params {
+                voice_gate: false,
+                ..Default::default()
+            },
+        );
         let voiced = SR as usize + SR as usize / 5..mix.len();
         let kept = db(energy(&out[voiced.clone()])) - db(energy(&ungated[voiced]));
         assert!(kept > -0.5, "voice gate cost the voice {kept:.1} dB");
@@ -811,9 +907,14 @@ mod tests {
     fn score(clean: &[f32], out: &[f32]) -> (f32, f32, f32) {
         let pad_frames = SR as usize / FRAME;
         let n = clean.len() / FRAME;
-        let (mut pad, mut pad_n, mut gap, mut gap_n, mut sig, mut err) =
-            (0.0, 0, 0.0, 0, 0.0, 0.0);
-        for (i, (c, o)) in clean.as_chunks::<FRAME>().0.iter().zip(out.as_chunks::<FRAME>().0).enumerate() {
+        let (mut pad, mut pad_n, mut gap, mut gap_n, mut sig, mut err) = (0.0, 0, 0.0, 0, 0.0, 0.0);
+        for (i, (c, o)) in clean
+            .as_chunks::<FRAME>()
+            .0
+            .iter()
+            .zip(out.as_chunks::<FRAME>().0)
+            .enumerate()
+        {
             if i + 10 < pad_frames || i > n - pad_frames + 40 {
                 pad += energy(o);
                 pad_n += 1;
@@ -825,7 +926,11 @@ mod tests {
                 err += c.iter().zip(o).map(|(c, o)| (c - o) * (c - o)).sum::<f32>();
             }
         }
-        (db(pad / pad_n as f32), db(gap / gap_n.max(1) as f32), db(sig / err))
+        (
+            db(pad / pad_n as f32),
+            db(gap / gap_n.max(1) as f32),
+            db(sig / err),
+        )
     }
 
     /// Compare configurations on a real speech recording (any format
@@ -839,11 +944,33 @@ mod tests {
         let peak = speech.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         let speech: Vec<f32> = speech.iter().map(|s| s * 0.5 / peak).collect();
 
-        let off = Params { highpass: false, voice_gate: false, ..Default::default() };
+        let off = Params {
+            highpass: false,
+            voice_gate: false,
+            ..Default::default()
+        };
         let configs = [
-            ("rnnoise", Params { model: Model::Rnnoise, ..off }),
-            ("rnnoise+hp+gate", Params { model: Model::Rnnoise, ..Default::default() }),
-            ("deepfilter", Params { model: Model::DeepFilter, ..off }),
+            (
+                "rnnoise",
+                Params {
+                    model: Model::Rnnoise,
+                    ..off
+                },
+            ),
+            (
+                "rnnoise+hp+gate",
+                Params {
+                    model: Model::Rnnoise,
+                    ..Default::default()
+                },
+            ),
+            (
+                "deepfilter",
+                Params {
+                    model: Model::DeepFilter,
+                    ..off
+                },
+            ),
             ("deepfilter+hp+gate", Params::default()),
         ];
         eprintln!("silence / between words (dBFS) / speech SDR (dB, higher is better)");

@@ -1,11 +1,12 @@
-"""Sign a release executable for OpenMic's updater.
+"""Sign a release file for OpenMic's updater.
 
-Writes <exe>.sig: a hex Ed25519 signature over the message that
+Writes <file>.sig: a hex Ed25519 signature over the message that
 src/update.rs checks (`signed_message`): the asset's file name and its
 SHA-256. The private key (32-byte seed, hex) comes from the
 OPENMIC_SIGNING_KEY environment variable, a GitHub Actions secret.
 
     python scripts/sign_release.py openmic-v0.6.2-windows-x64.exe
+    python scripts/sign_release.py openmic-v0.12.0-linux-x86_64.tar.gz
 """
 
 import hashlib

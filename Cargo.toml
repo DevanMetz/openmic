@@ -20,7 +20,13 @@ audio_thread_priority = { version = "0.35", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 directories = "6.0"
+# glow instead of the default wgpu renderer. eframe's own x11/wayland
+# features also turn wgpu on, so the Linux target below enables those
+# window backends on the glutin copy this feature already links.
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+# Inflate the Linux release archive after its signature check. rust_backend
+# is miniz_oxide, already in the lockfile, so this does not need a system zlib.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 global-hotkey = "0.8"
 parking_lot = "0.12"
 rfd = "0.15.4"
@@ -48,10 +54,33 @@ tract-pulse = "=0.21.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
-cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
-# Same crate winit and global-hotkey already link. Keeps the level strip
-# above other X11 windows. The connection is pure Rust, so this adds no library.
-x11rb = { version = "0.13.2", default-features = false }
+
+# realtime-dbus makes cpal's ALSA (and the shared audio_thread_priority crate)
+# ask RealtimeKit. Without that feature the call succeeds and does nothing.
+cpal = { version = "0.18.2", features = ["realtime", "realtime-dbus", "pulseaudio"] }
+audio_thread_priority = { version = "0.35", default-features = false, features = ["with_dbus"] }
+# X11 dictation and monitor placement share this connection.
+x11rb = { version = "0.13.2", default-features = false, features = ["xtest", "randr", "resource_manager"] }
+xkeysym = "0.2.1"
+# Enable window surfaces on both Wayland and X11.
+glutin = { version = "=0.32.3", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
+glutin-winit = { version = "=0.5.0", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
+# StatusNotifierItem tray. ksni speaks D-Bus itself, so the build does not
+# need GTK or libappindicator. Desktops without a StatusNotifier host fail
+# at runtime and OpenMic keeps the window instead.
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+# Wayland global shortcuts. async-std matches rfd's ashpd; tokio cannot be
+# enabled at the same time. pollster and the futures crates drive the portal
+# from a worker thread (they are already in the build through rfd).
+ashpd = { version = "0.11.1", default-features = false, features = ["async-std"] }
+pollster = "0.4.0"
+futures-util = "0.3.34"
+futures-channel = "0.3.34"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The portal test serves GlobalShortcuts. zbus is already linked through ashpd;
+# the interface macro resolves `::zbus` only when this crate depends on it.
+zbus = { version = "5.19.0", default-features = false, features = ["async-io"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

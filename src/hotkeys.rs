@@ -1,6 +1,10 @@
 //! System-wide shortcuts: turn a key press in the window into a shortcut
-//! such as "Ctrl+Alt+1", register shortcuts with Windows, and deliver their
-//! presses as app commands even while the window is hidden.
+//! such as "Ctrl+Alt+1", register it with the OS, and deliver presses as
+//! app commands even while the window is hidden.
+//!
+//! Windows and X11 use a global key grab. A Wayland session uses the desktop
+//! global-shortcuts portal when that interface is installed, and the X11 grab
+//! otherwise.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,14 +17,22 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use parking_lot::Mutex;
 
 use crate::gui::Command;
+#[cfg(target_os = "linux")]
+use crate::logfile;
 
 /// The registered shortcuts and what each one does.
 pub struct Hotkeys {
-    manager: GlobalHotKeyManager,
+    backend: Backend,
     /// Read by the event handler, which runs in the window's message loop.
     actions: Arc<Mutex<Actions>>,
     registered: Vec<HotKey>,
     bindings: Vec<(String, Command)>,
+}
+
+enum Backend {
+    Keys(GlobalHotKeyManager),
+    #[cfg(target_os = "linux")]
+    Portal(crate::portal_shortcuts::PortalShortcuts),
 }
 
 #[derive(Default)]
@@ -47,6 +59,23 @@ impl Actions {
 impl Hotkeys {
     /// Presses are sent to `commands` and wake the app through `ctx`.
     pub fn new(ctx: &egui::Context, commands: Sender<Command>) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if crate::portal_shortcuts::session_wants_portal() {
+            match crate::portal_shortcuts::connect(ctx, commands.clone()) {
+                Ok(Some(portal)) => {
+                    return Ok(Self {
+                        backend: Backend::Portal(portal),
+                        actions: Arc::default(),
+                        registered: Vec::new(),
+                        bindings: Vec::new(),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => logfile::warn(format_args!(
+                    "Wayland global shortcuts failed ({err:#}); shortcuts only reach X11 windows"
+                )),
+            }
+        }
         let manager = GlobalHotKeyManager::new().context("start global hotkeys")?;
         let actions: Arc<Mutex<Actions>> = Arc::default();
         let lookup = Arc::clone(&actions);
@@ -59,7 +88,7 @@ impl Hotkeys {
             }
         }));
         Ok(Self {
-            manager,
+            backend: Backend::Keys(manager),
             actions,
             registered: Vec::new(),
             bindings: Vec::new(),
@@ -67,34 +96,49 @@ impl Hotkeys {
     }
 
     /// Register exactly `bindings` (if they changed since the last call).
-    /// Returns the shortcuts Windows refused, usually because another app
-    /// already owns them.
+    /// Returns the shortcuts the system refused, usually because another app
+    /// already owns them. A Wayland portal refusal arrives later and is only
+    /// logged: the saved shortcut is left in place, same as Windows.
     pub fn set(&mut self, bindings: Vec<(String, Command)>) -> Vec<String> {
         if bindings == self.bindings {
             return Vec::new();
         }
-        let _ = self.manager.unregister_all(&self.registered);
-        self.registered.clear();
-        let mut actions = HashMap::new();
-        let mut refused = Vec::new();
-        for (text, command) in &bindings {
-            match text.parse::<HotKey>() {
-                Ok(hotkey) if self.manager.register(hotkey).is_ok() => {
-                    actions.insert(hotkey.id(), command.clone());
-                    self.registered.push(hotkey);
+        match &mut self.backend {
+            Backend::Keys(manager) => {
+                let _ = manager.unregister_all(&self.registered);
+                self.registered.clear();
+                let mut actions = HashMap::new();
+                let mut refused = Vec::new();
+                for (text, command) in &bindings {
+                    match text.parse::<HotKey>() {
+                        Ok(hotkey) if manager.register(hotkey).is_ok() => {
+                            actions.insert(hotkey.id(), command.clone());
+                            self.registered.push(hotkey);
+                        }
+                        _ => refused.push(text.clone()),
+                    }
                 }
-                _ => refused.push(text.clone()),
+                self.actions.lock().bindings = actions;
+                self.bindings = bindings;
+                refused
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Portal(portal) => {
+                let (actions, planned, refused) = crate::portal_shortcuts::plan(&bindings);
+                portal.replace(planned);
+                self.actions.lock().bindings = actions;
+                self.bindings = bindings;
+                refused
             }
         }
-        self.actions.lock().bindings = actions;
-        self.bindings = bindings;
-        refused
     }
 
     /// Whether the last registration attempted this exact binding but
     /// could not activate it. An edit not yet passed to `set` is pending.
     pub fn was_refused(&self, shortcut: &str, command: &Command) -> bool {
-        self.bindings.iter().any(|(text, action)| text == shortcut && action == command)
+        self.bindings
+            .iter()
+            .any(|(text, action)| text == shortcut && action == command)
             && match shortcut.parse::<HotKey>() {
                 Ok(key) => self.actions.lock().bindings.get(&key.id()) != Some(command),
                 Err(_) => true,
@@ -114,12 +158,19 @@ pub fn combo(key: egui::Key, mods: egui::Modifiers) -> Result<String, &'static s
         "CloseBracket" => "BracketRight",
         name => name,
     };
-    let spare = matches!(name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()), Some(13..=24));
+    let spare = matches!(
+        name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()),
+        Some(13..=24)
+    );
     if !spare && !mods.ctrl && !mods.alt {
         return Err("Hold Ctrl or Alt with the key (F13-F24 work alone)");
     }
     let mut text = String::new();
-    for (held, label) in [(mods.ctrl, "Ctrl+"), (mods.alt, "Alt+"), (mods.shift, "Shift+")] {
+    for (held, label) in [
+        (mods.ctrl, "Ctrl+"),
+        (mods.alt, "Alt+"),
+        (mods.shift, "Shift+"),
+    ] {
         if held {
             text.push_str(label);
         }
@@ -154,8 +205,14 @@ mod tests {
     #[test]
     fn combos_read_naturally_and_parse() {
         assert_eq!(combo(egui::Key::Num1, CTRL_ALT).unwrap(), "Ctrl+Alt+1");
-        assert_eq!(combo(egui::Key::M, egui::Modifiers::CTRL | egui::Modifiers::SHIFT).unwrap(), "Ctrl+Shift+M");
-        assert_eq!(combo(egui::Key::Equals, egui::Modifiers::ALT).unwrap(), "Alt+Equal");
+        assert_eq!(
+            combo(egui::Key::M, egui::Modifiers::CTRL | egui::Modifiers::SHIFT).unwrap(),
+            "Ctrl+Shift+M"
+        );
+        assert_eq!(
+            combo(egui::Key::Equals, egui::Modifiers::ALT).unwrap(),
+            "Alt+Equal"
+        );
         assert_eq!(combo(egui::Key::F13, egui::Modifiers::NONE).unwrap(), "F13");
     }
 
@@ -164,7 +221,10 @@ mod tests {
         assert!(combo(egui::Key::M, egui::Modifiers::NONE).is_err());
         assert!(combo(egui::Key::M, egui::Modifiers::SHIFT).is_err());
         assert!(combo(egui::Key::F5, egui::Modifiers::NONE).is_err());
-        assert!(combo(egui::Key::F30, CTRL_ALT).is_err(), "Windows has no F30 shortcut");
+        assert!(
+            combo(egui::Key::F30, CTRL_ALT).is_err(),
+            "Windows has no F30 shortcut"
+        );
     }
 
     #[test]
@@ -177,22 +237,38 @@ mod tests {
     fn held_dictation_releases_after_shortcuts_are_cleared_or_reassigned() {
         let mut actions = Actions::default();
         actions.bindings.insert(1, Command::Dictate);
-        assert_eq!(actions.event(1, HotKeyState::Pressed), Some(Command::Dictate));
+        assert_eq!(
+            actions.event(1, HotKeyState::Pressed),
+            Some(Command::Dictate)
+        );
         actions.bindings.clear();
-        assert_eq!(actions.event(1, HotKeyState::Released), Some(Command::DictateReleased));
+        assert_eq!(
+            actions.event(1, HotKeyState::Released),
+            Some(Command::DictateReleased)
+        );
 
         actions.bindings.insert(1, Command::Dictate);
         actions.event(1, HotKeyState::Pressed);
         actions.bindings.insert(1, Command::ToggleMute);
-        assert_eq!(actions.event(1, HotKeyState::Released), Some(Command::DictateReleased));
-        assert_eq!(actions.event(1, HotKeyState::Released), None, "a release is handled only once");
+        assert_eq!(
+            actions.event(1, HotKeyState::Released),
+            Some(Command::DictateReleased)
+        );
+        assert_eq!(
+            actions.event(1, HotKeyState::Released),
+            None,
+            "a release is handled only once"
+        );
     }
 
     #[test]
     fn rebinding_a_held_key_does_not_release_the_new_action() {
         let mut actions = Actions::default();
         actions.bindings.insert(1, Command::ToggleMute);
-        assert_eq!(actions.event(1, HotKeyState::Pressed), Some(Command::ToggleMute));
+        assert_eq!(
+            actions.event(1, HotKeyState::Pressed),
+            Some(Command::ToggleMute)
+        );
         actions.bindings.insert(1, Command::Dictate);
         assert_eq!(actions.event(1, HotKeyState::Released), None);
     }
