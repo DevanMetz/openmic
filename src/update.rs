@@ -22,10 +22,38 @@ const LATEST_RELEASE: &str = "https://api.github.com/repos/DevanMetz/openmic/rel
 pub const RELEASES_PAGE: &str = "https://github.com/DevanMetz/openmic/releases";
 
 /// Releases only carry a Windows executable for the in-app updater. On Linux
-/// the UI links to the release page instead; tests still exercise the
-/// Windows-only controls.
+/// the version number opens the releases page instead. Tests still exercise
+/// the Windows controls unless they opt out.
 pub fn updates_supported() -> bool {
+    #[cfg(test)]
+    if UPDATES_UNSUPPORTED.with(std::cell::Cell::get) {
+        return false;
+    }
     cfg!(windows) || cfg!(test)
+}
+
+#[cfg(test)]
+thread_local! {
+    static UPDATES_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Draw the Linux UI, which has no in-app installer.
+#[cfg(test)]
+pub struct WithoutUpdater;
+
+#[cfg(test)]
+impl WithoutUpdater {
+    pub fn enter() -> Self {
+        UPDATES_UNSUPPORTED.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WithoutUpdater {
+    fn drop(&mut self) {
+        UPDATES_UNSUPPORTED.with(|flag| flag.set(false));
+    }
 }
 
 /// The release workflow signs each executable with the private half of this

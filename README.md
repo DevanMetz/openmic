@@ -51,7 +51,7 @@ While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its pr
 
 To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
 
-Not available on Linux: the notification-area tray (closing the window quits), the in-app updater (download new releases from the releases page), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11).
+Not available on Linux: the notification-area tray (closing the window quits), the in-app updater (click the version number to open the releases page), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11).
 
 ## Windows requirements
 

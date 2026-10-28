@@ -30,10 +30,27 @@ impl App {
         }
     }
 
-    /// The version beside the title; clicking it checks for updates now.
+    /// The version beside the title. With an in-app updater, clicking it
+    /// checks now. Otherwise it opens the releases page.
     pub(super) fn draw_version(&mut self, ui: &mut egui::Ui) {
         if !update::updates_supported() {
-            ui.label(RichText::new(VERSION).weak());
+            let button = ui
+                .add(egui::Button::new(RichText::new(VERSION).weak()).frame(false))
+                .on_hover_text("Open the releases page");
+            if button.has_focus() {
+                ui.painter().rect_stroke(
+                    button.rect,
+                    egui::CornerRadius::same(2),
+                    ui.visuals().selection.stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+            ui.ctx().accesskit_node_builder(button.id, |node| {
+                node.set_description("Open the releases page");
+            });
+            if button.clicked() {
+                open_url(ui.ctx(), update::RELEASES_PAGE);
+            }
             return;
         }
         let status = self.updater.status();
@@ -1250,6 +1267,89 @@ mod tests {
                     assert_eq!(serde_json::to_value(&download.app.settings).unwrap(), original);
                     assert!(download.app.dirty_since.is_none());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn without_an_updater_the_version_opens_releases_and_the_log_folder_stays() {
+        let _guard = crate::update::WithoutUpdater::enter();
+        assert!(!update::updates_supported());
+        for dark in [false, true] {
+            for activation in ["enter", "space", "pointer", "accessible"] {
+                let mut app = App::stopped(crate::config::Settings::default());
+                let original = serde_json::to_value(&app.settings).unwrap();
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+                widgets::configure_text_styles(&ctx);
+                ctx.enable_accesskit();
+                let size = egui::vec2(760.0, 880.0);
+                for _ in 0..3 {
+                    draw(&mut app, &ctx, size, Vec::new());
+                }
+                let output = draw(&mut app, &ctx, size, Vec::new());
+                let version = control(&output, Role::Button, VERSION);
+                let description = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .find(|(id, _)| *id == version).unwrap().1.description().unwrap();
+                assert_eq!(description, "Open the releases page");
+                draw(&mut app, &ctx, size, vec![action(Action::Focus, version)]);
+                for _ in 0..2 {
+                    draw(&mut app, &ctx, size, Vec::new());
+                }
+                let opened = || {
+                    ctx.data(|data| data.get_temp::<Vec<String>>(egui::Id::new("opened-urls")).unwrap_or_default())
+                };
+                match activation {
+                    "pointer" => {
+                        let output = draw(&mut app, &ctx, size, Vec::new());
+                        let bounds = output.platform_output.accesskit_update.unwrap().nodes.iter()
+                            .find(|(id, _)| *id == version).unwrap().1.bounds().unwrap();
+                        let pos = egui::pos2(((bounds.x0 + bounds.x1) * 0.5) as f32, ((bounds.y0 + bounds.y1) * 0.5) as f32);
+                        assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains(pos));
+                        for pressed in [true, false] {
+                            draw(&mut app, &ctx, size, vec![
+                                egui::Event::PointerMoved(pos),
+                                egui::Event::PointerButton {
+                                    pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                                },
+                            ]);
+                        }
+                    }
+                    "accessible" => {
+                        draw(&mut app, &ctx, size, vec![action(Action::Click, version)]);
+                    }
+                    _ => {
+                        let held = if activation == "space" { egui::Key::Space } else { egui::Key::Enter };
+                        draw(&mut app, &ctx, size, held_events(held));
+                        for _ in 0..3 {
+                            draw(&mut app, &ctx, size, held_events(held));
+                            assert_eq!(opened(), vec![update::RELEASES_PAGE.to_owned()], "{activation} repeats");
+                        }
+                        draw(&mut app, &ctx, size, vec![key(held, false)]);
+                    }
+                }
+                assert_eq!(opened(), vec![update::RELEASES_PAGE.to_owned()], "{activation}");
+                assert!(!app.manual_update_check && app.updater.status() == &Status::Idle);
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+
+                app.page = crate::gui::Page::Settings;
+                for _ in 0..3 {
+                    draw(&mut app, &ctx, size, Vec::new());
+                }
+                let output = draw(&mut app, &ctx, size, Vec::new());
+                let labels: Vec<_> = output.platform_output.accesskit_update.as_ref().unwrap().nodes.iter()
+                    .filter_map(|(_, node)| node.label()).collect();
+                assert!(labels.contains(&"Open log folder"), "{labels:?}");
+                assert!(!labels.contains(&"Check for updates daily"), "{labels:?}");
+                assert!(!labels.iter().any(|label| label.contains("check now")), "{labels:?}");
+                let logs = control(&output, Role::Button, "Open log folder");
+                draw(&mut app, &ctx, size, vec![action(Action::Click, logs)]);
+                assert_eq!(opened(), vec![
+                    update::RELEASES_PAGE.to_owned(),
+                    crate::logfile::dir().display().to_string(),
+                ]);
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+                assert!(app.dirty_since.is_none() && !app.quitting && app.update_error.is_none());
             }
         }
     }
