@@ -6,7 +6,7 @@ SHA-256. The private key (32-byte seed, hex) comes from the
 OPENMIC_SIGNING_KEY environment variable, a GitHub Actions secret.
 
     python scripts/sign_release.py openmic-v0.6.2-windows-x64.exe
-    python scripts/sign_release.py openmic-v0.12.0-linux-x86_64.tar.gz
+    python scripts/sign_release.py openmic-v0.13.0-linux-x86_64.tar.gz
 """
 
 import hashlib
