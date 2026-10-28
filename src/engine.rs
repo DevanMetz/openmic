@@ -79,8 +79,8 @@ pub struct StatsSnapshot {
 
 /// One device as the host reports it. `id` is the backend id (`DeviceId::id`),
 /// empty when the host cannot provide one. PulseAudio monitor sources use
-/// `{sink}.monitor` here; their display names are translated. Only the
-/// non-Windows monitor matching reads it, so Windows builds do not carry it.
+/// `{sink}.monitor` here; their display names are translated. Linux also
+/// uses it to rank ALSA routes. Windows builds do not carry it.
 pub struct ListedDevice {
     pub name: String,
     #[cfg(not(windows))]
@@ -98,11 +98,11 @@ pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
     if let Ok(devices) = iter {
         for device in devices {
             #[cfg(target_os = "linux")]
-            if !output && host.id() == cpal::HostId::Alsa {
+            if host.id() == cpal::HostId::Alsa {
                 let id = device.id().map(|id| id.id().to_owned()).unwrap_or_default();
                 let description = device.description().ok();
                 let name = device.to_string();
-                if is_noop_alsa_input(
+                if is_noop_alsa_device(
                     &id,
                     std::iter::once(name.as_str()).chain(
                         description
@@ -120,34 +120,97 @@ pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
             });
         }
     }
+    #[cfg(target_os = "linux")]
+    if host.id() == cpal::HostId::Alsa {
+        // Stable ordering keeps the backend's order within each preference.
+        listed.sort_by_key(|device| alsa_device_rank(&device.id));
+    }
     listed
+}
+
+/// Prefer configured routing over direct hardware, then other ALSA plugins.
+/// CPAL's ALSA default device is the PCM named `default`.
+#[cfg(target_os = "linux")]
+fn alsa_device_rank(id: &str) -> u8 {
+    match id.split(':').next().unwrap_or(id).trim() {
+        "default" => 0,
+        "pipewire" => 1,
+        "sysdefault" => 2,
+        "plughw" => 3,
+        "hw" => 4,
+        _ => 5,
+    }
 }
 
 /// ALSA's null PCM can be exposed under an alias, so inspect its description too.
 #[cfg(target_os = "linux")]
-fn is_noop_alsa_input<'a>(id: &str, descriptions: impl IntoIterator<Item = &'a str>) -> bool {
-    id.trim().eq_ignore_ascii_case("null")
+pub(crate) fn is_noop_alsa_device<'a>(
+    id: &str,
+    descriptions: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    id.split(':')
+        .next()
+        .unwrap_or(id)
+        .trim()
+        .eq_ignore_ascii_case("null")
         || descriptions.into_iter().any(|description| {
             let text = description.trim().to_ascii_lowercase();
             text == "null"
-                || (text.contains("discard all samples") && text.contains("generate zero samples"))
+                || text.contains("discard all samples")
+                || text.contains("generate zero samples")
         })
 }
 
 #[cfg(all(test, target_os = "linux"))]
 #[test]
-fn filters_alsa_noop_inputs_by_id_or_description() {
-    assert!(is_noop_alsa_input("null", ["Anything"]));
-    assert!(is_noop_alsa_input("alias", ["Null"]));
-    assert!(is_noop_alsa_input(
+fn filters_alsa_noop_devices_by_id_or_description() {
+    assert!(is_noop_alsa_device("null", ["Anything"]));
+    assert!(is_noop_alsa_device("null:CARD=0", ["Anything"]));
+    assert!(is_noop_alsa_device(
+        "alias",
+        ["Discard all samples (playback)"]
+    ));
+    assert!(is_noop_alsa_device(
+        "alias",
+        ["Generate zero samples (capture)"]
+    ));
+    assert!(is_noop_alsa_device("alias", ["Null"]));
+    assert!(is_noop_alsa_device(
         "alias",
         [
             "Dummy",
             "Discard all samples (playback) or generate zero samples (capture)"
         ]
     ));
-    assert!(!is_noop_alsa_input("hw:0", ["USB microphone"]));
-    assert!(!is_noop_alsa_input("hw:1", ["Null Audio USB microphone"]));
+    assert!(!is_noop_alsa_device("hw:0", ["USB microphone"]));
+    assert!(!is_noop_alsa_device("hw:1", ["Null Audio USB microphone"]));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn alsa_defaults_precede_hardware_and_other_plugins() {
+    let mut ids = [
+        "rate",
+        "hw:0",
+        "plughw:1",
+        "sysdefault:CARD=USB",
+        "pipewire",
+        "default",
+        "hw:1",
+    ];
+    ids.sort_by_key(|id| alsa_device_rank(id));
+    assert_eq!(
+        ids,
+        [
+            "default",
+            "pipewire",
+            "sysdefault:CARD=USB",
+            "plughw:1",
+            "hw:0",
+            "hw:1",
+            "rate"
+        ]
+    );
 }
 
 /// Deduped friendly names for a direction. The first device keeps the name.

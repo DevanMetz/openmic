@@ -89,6 +89,12 @@ pub fn choose_routes_with_monitors(
     monitors: &[String],
 ) {
     let needs = |current: &String, pool: &[String]| {
+        #[cfg(target_os = "linux")]
+        if crate::engine::is_noop_alsa_device(current, [current.as_str()])
+            && cpal::default_host().id() == cpal::HostId::Alsa
+        {
+            return true;
+        }
         current.is_empty() || (replace_missing && !pool.contains(current))
     };
     if needs(&s.microphone, inputs) {
