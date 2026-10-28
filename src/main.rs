@@ -62,13 +62,10 @@ fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliAction {
             Some("--help" | "-h") => action = CliAction::Help,
             Some("--version" | "-V") if action != CliAction::Help => action = CliAction::Version,
             Some("--version" | "-V" | "--minimized") => {}
+            // Passed by the updater with the old copy's process ID. A missing
+            // or bad ID only skips the wait, as it always has.
             Some("--after-update") => {
-                if !args
-                    .next()
-                    .is_some_and(|pid| pid.to_str().is_some_and(|pid| pid.parse::<u32>().is_ok()))
-                {
-                    return CliAction::Error("--after-update requires a process ID".into());
-                }
+                args.next();
             }
             _ => return CliAction::Error(format!("unknown argument: {}", arg.to_string_lossy())),
         }
@@ -262,11 +259,8 @@ mod tests {
             assert_eq!(parse(&[flag]), CliAction::Version);
         }
         assert!(matches!(parse(&["--unknown"]), CliAction::Error(_)));
-        assert!(matches!(parse(&["--after-update"]), CliAction::Error(_)));
-        assert!(matches!(
-            parse(&["--after-update", "nope"]),
-            CliAction::Error(_)
-        ));
+        assert_eq!(parse(&["--after-update"]), CliAction::Launch);
+        assert_eq!(parse(&["--after-update", "nope"]), CliAction::Launch);
     }
 
     #[test]
