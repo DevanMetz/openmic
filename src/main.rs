@@ -24,6 +24,15 @@ mod virtual_mic;
 mod viz;
 mod widgets;
 
+/// Keeps the Linux glutin features in Cargo.toml attached to this crate.
+/// eframe creates the window; nothing here runs at startup.
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
+mod linux_gl {
+    use glutin as _;
+    use glutin_winit as _;
+}
+
 use std::sync::Arc;
 
 use eframe::egui;
