@@ -29,6 +29,8 @@ mod virtual_mic;
 mod viz;
 mod widgets;
 #[cfg(target_os = "linux")]
+mod x11_above;
+#[cfg(target_os = "linux")]
 mod x11_type;
 
 /// Keeps the Linux glutin features in Cargo.toml attached to this crate.

@@ -32,7 +32,7 @@ Status of each Windows user-facing feature on Linux in this tree: `working`, `pa
 | Window on Wayland | working | `Cargo.toml`, `src/main.rs` — EGL `wl_egl_window`. The compositor draws the frame, or winit's fallback frame does when the compositor asks for client-side decorations |
 | Restored window position kept on a connected monitor | working on X11 | `src/monitors.rs`, `src/gui/mod.rs` |
 | Initial window size fitted to the work area | working on X11 | `src/monitors.rs`, `src/main.rs` |
-| Always-on-top strip on X11 | partial | `src/gui/overlay.rs` — `with_always_on_top` asks for `_NET_WM_STATE_ABOVE` once. `raise_meter` does not run again when another window is focused |
+| Always-on-top strip on X11 | working | `src/gui/overlay.rs`, `src/x11_above.rs` — `_NET_WM_STATE_ABOVE` is set when the strip opens and again when focus changes, without focusing it |
 | Always-on-top strip on Wayland | not possible | `src/gui/overlay.rs` — xdg-shell has no stacking request. A layer-shell surface would replace the strip. The compositor's keep-above rule is the equivalent |
 | Strip hover hints kept inside the monitor work area | partial | `src/gui/overlay.rs` — `monitor_work_area` is `None` |
 | Minimize to the strip, and always show the strip | working | `src/gui/overlay.rs`, `src/gui/settings_tab.rs` |

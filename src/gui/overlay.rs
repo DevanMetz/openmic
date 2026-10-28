@@ -31,6 +31,11 @@ const MAX_NAME: usize = 18;
 const GRIP: f32 = 6.0;
 /// Output above this counts as your voice going out.
 const SPEAKING_DB: f32 = -45.0;
+/// Window title of the strip. Windows finds the same window with `FindWindowW`,
+/// which needs its own string literal (`w!("OpenMic level")`).
+const STRIP_TITLE: &str = "OpenMic level";
+/// Hover details. On X11 it is raised with the strip so a restack does not cover it.
+const HINT_TITLE: &str = "OpenMic hint";
 
 fn label_font() -> FontId {
     FontId::proportional(12.0)
@@ -237,7 +242,7 @@ impl App {
         }
         // Constant while shown: egui turns any change into a resize or move.
         let builder = ViewportBuilder::default()
-            .with_title("OpenMic level")
+            .with_title(STRIP_TITLE)
             .with_inner_size([self.overlay_spawn_width, HEIGHT])
             .with_min_inner_size([MIN_WIDTH, HEIGHT])
             .with_max_inner_size([MAX_WIDTH, HEIGHT])
@@ -311,8 +316,9 @@ impl App {
 /// Keeps the meter above other always-on-top windows. Windows raises the
 /// taskbar again whenever another window comes to the front, so a meter
 /// placed on the taskbar vanished under it when you clicked elsewhere.
-/// Re-assert the meter's place when the foreground window changes, and
-/// every couple of seconds in case something else rose above it.
+/// X11 window managers restack the same way. Re-assert the meter's place
+/// when the foreground window changes, and every couple of seconds in case
+/// something else rose above it. The raise leaves keyboard focus alone.
 #[derive(Debug, Default)]
 pub(super) struct OnTop {
     foreground: Option<isize>,
@@ -345,7 +351,12 @@ fn foreground() -> Option<isize> {
     (!window.is_invalid()).then_some(window.0 as isize)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn foreground() -> Option<isize> {
+    crate::x11_above::foreground_window()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn foreground() -> Option<isize> {
     None
 }
@@ -361,6 +372,7 @@ fn raise_meter() {
     use windows::core::w;
     // SAFETY: plain Win32 calls on a window we check belongs to this process.
     unsafe {
+        // `w!` needs a literal; this is `STRIP_TITLE`.
         let Ok(meter) = FindWindowW(None, w!("OpenMic level")) else {
             return;
         };
@@ -381,7 +393,12 @@ fn raise_meter() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn raise_meter() {
+    crate::x11_above::raise_windows(&[STRIP_TITLE, HINT_TITLE]);
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn raise_meter() {}
 
 fn to_db(peak: f32) -> f32 {
@@ -669,7 +686,7 @@ fn show_hint_window(ui: &egui::Ui, text: String, anchor: Rect, work: Option<Rect
     let position = hint_position(anchor, size, work);
     let style = ui.style().clone();
     let builder = ViewportBuilder::default()
-        .with_title("OpenMic hint")
+        .with_title(HINT_TITLE)
         .with_inner_size(size)
         .with_position(position)
         .with_active(false)
