@@ -14,6 +14,7 @@ import os
 import sys
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 
 def main() -> None:
@@ -32,7 +33,8 @@ def main() -> None:
 
     with open(exe + ".sig", "w", newline="\n") as f:
         f.write(signature.hex() + "\n")
-    public = key.public_key().public_bytes_raw().hex()
+    # public_bytes_raw() needs cryptography 40+; ubuntu-22.04 ships 3.4.8.
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
     print(f"signed {name} (sha256 {digest}) with key {public}")
 
 
