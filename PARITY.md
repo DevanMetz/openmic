@@ -36,7 +36,7 @@ Status of each Windows user-facing feature on Linux in this tree: `working`, `pa
 | Always-on-top strip on Wayland | not possible | `src/gui/overlay.rs` — xdg-shell has no stacking request. A layer-shell surface would replace the strip. The compositor's keep-above rule is the equivalent |
 | Strip hover hints kept inside the monitor work area | partial | `src/gui/overlay.rs` — `monitor_work_area` is `None` |
 | Minimize to the strip, and always show the strip | working | `src/gui/overlay.rs`, `src/gui/settings_tab.rs` |
-| System light or dark theme | partial | winit reports no system theme on X11 (`theme` is `None`) and on Wayland only a theme this process already set, so egui stays on its dark fallback |
+| System light or dark theme | working | `src/system_theme.rs` — follows the desktop Settings portal live on X11 and Wayland; falls back to GTK color-scheme / gtk-theme via gsettings when unavailable or unspecified |
 | Screen reader | working | `Cargo.toml` (eframe `accesskit`, `accesskit_unix`) |
 | One running copy (lock) | working | `src/instance.rs` |
 | Settings saved across launches | working | `src/config.rs` |

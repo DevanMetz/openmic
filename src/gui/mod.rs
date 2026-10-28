@@ -272,6 +272,8 @@ pub struct App {
     window_placement: overlay::Placement,
     /// The window was minimized last frame (to catch the moment it is).
     was_minimized: bool,
+    #[cfg(target_os = "linux")]
+    system_theme: Option<crate::system_theme::Monitor>,
     mic_test: mic_test::MicTest,
     update_error: Option<String>,
 }
@@ -288,6 +290,10 @@ impl App {
     ) -> Self {
         widgets::configure_text_styles(ctx);
         let mut app = Self::stopped(settings);
+        #[cfg(target_os = "linux")]
+        {
+            app.system_theme = Some(crate::system_theme::start(ctx));
+        }
         app.updated_at = just_updated.then(Instant::now);
         {
             // Development builds never replace themselves on their own.
@@ -413,6 +419,8 @@ impl App {
             overlay_on_top: overlay::OnTop::default(),
             window_placement: overlay::Placement::default(),
             was_minimized: false,
+            #[cfg(target_os = "linux")]
+            system_theme: None,
             mic_test: mic_test::MicTest::default(),
             update_error: None,
         }

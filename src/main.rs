@@ -23,6 +23,8 @@ mod portal_shortcuts;
 mod record;
 mod resample;
 mod rt;
+#[cfg(target_os = "linux")]
+mod system_theme;
 mod tray;
 mod update;
 mod virtual_mic;
