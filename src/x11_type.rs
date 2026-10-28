@@ -3,8 +3,8 @@
 //! Each character is bound to an unused keycode and sent with the XTEST
 //! extension, then that keycode is cleared. The keysym is the character
 //! itself, so the active layout and Caps Lock do not change what is typed.
-//! Wayland clients never receive XTEST events, so those sessions keep the
-//! transcript for copying.
+//! Wayland clients never receive XTEST events; `wayland_type` handles those
+//! sessions with native keyboard backends.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;

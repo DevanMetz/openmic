@@ -27,6 +27,8 @@ mod tray;
 mod update;
 mod virtual_mic;
 mod viz;
+#[cfg(target_os = "linux")]
+mod wayland_type;
 mod widgets;
 #[cfg(target_os = "linux")]
 mod x11_above;

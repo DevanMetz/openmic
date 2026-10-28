@@ -3829,6 +3829,8 @@ dependencies = [
  "tract-pulse",
  "tray-icon",
  "ureq",
+ "wayland-client",
+ "wayland-protocols-misc",
  "windows",
  "windows-core",
  "winreg",

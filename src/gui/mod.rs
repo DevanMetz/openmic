@@ -1598,6 +1598,8 @@ impl eframe::App for App {
 
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "linux")]
+        crate::wayland_type::observe_context(ctx);
         self.tick(ctx);
         if self.quitting {
             return;
