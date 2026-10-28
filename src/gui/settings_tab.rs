@@ -120,20 +120,20 @@ impl App {
         );
     }
 
-    /// The daily check; checking now and installing happen in the header.
+    /// The daily check, where the in-app updater exists. The log folder stays
+    /// available either way; checking now and installing happen in the header.
     fn draw_updates(&mut self, ui: &mut egui::Ui) {
-        if !crate::update::updates_supported() {
-            return;
+        if crate::update::updates_supported() {
+            let updates = ui
+                .checkbox(&mut self.settings.check_for_updates, "Check for updates daily")
+                .on_hover_text("Asks GitHub for the latest OpenMic release; nothing else is sent");
+            widgets::scroll_on_focus(&updates);
+            if updates.changed() {
+                self.touch();
+            }
+            ui.weak("Click the version number at the top to check now.");
+            ui.add_space(4.0);
         }
-        let updates = ui
-            .checkbox(&mut self.settings.check_for_updates, "Check for updates daily")
-            .on_hover_text("Asks GitHub for the latest OpenMic release; nothing else is sent");
-        widgets::scroll_on_focus(&updates);
-        if updates.changed() {
-            self.touch();
-        }
-        ui.weak("Click the version number at the top to check now.");
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let logs = ui
                 .button("Open log folder")

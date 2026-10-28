@@ -20,6 +20,9 @@ audio_thread_priority = { version = "0.35", default-features = false }
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
 directories = "6.0"
+# glow instead of the default wgpu renderer. eframe's own x11/wayland
+# features also turn wgpu on, so the Linux target below enables those
+# window backends on the glutin copy this feature already links.
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 global-hotkey = "0.8"
 parking_lot = "0.12"
@@ -49,10 +52,12 @@ tract-pulse = "=0.21.4"
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
 cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
-# Already in the lockfile (global-hotkey and winit). Dictation uses them to
-# type into the focused X11 window. No new crates.
-x11rb = { version = "0.13.2", features = ["xtest"] }
+# X11 dictation and monitor placement share this connection.
+x11rb = { version = "0.13.2", features = ["xtest", "randr", "resource_manager"] }
 xkeysym = "0.2.1"
+# Enable window surfaces on both Wayland and X11.
+glutin = { version = "=0.32.3", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
+glutin-winit = { version = "=0.5.0", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

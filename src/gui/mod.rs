@@ -1663,18 +1663,44 @@ fn on_a_monitor([x, y]: [i32; 2]) -> bool {
     !unsafe { MonitorFromPoint(POINT { x: x.saturating_add(16), y: y.saturating_add(16) }, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn on_a_monitor(px: [i32; 2]) -> bool {
+    crate::monitors::on_a_monitor(px)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn on_a_monitor(_: [i32; 2]) -> bool {
     true
 }
 
-fn open_url(ctx: &egui::Context, url: &str) {
+fn open_url(ctx: &egui::Context, target: &str) {
     widgets::finish_keyboard_activation(ctx);
     #[cfg(test)]
-    ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<String>>(egui::Id::new("opened-urls")).push(url.to_owned()));
-    // Explorer hands URLs to the default browser.
+    ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<String>>(egui::Id::new("opened-urls")).push(target.to_owned()));
+    // Tests record the target instead of launching a browser or file manager.
     #[cfg(not(test))]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    {
+        let program = open_program();
+        if let Err(error) = spawn_open(program, target) {
+            crate::logfile::warn(format_args!("could not open {target} with {program}: {error}"));
+        }
+    }
+}
+
+/// Explorer opens a URL in the browser and a folder in the file manager.
+/// Linux uses `xdg-open` for both.
+fn open_program() -> &'static str {
+    if cfg!(windows) { "explorer" } else { "xdg-open" }
+}
+
+fn spawn_open(program: &str, target: &str) -> std::io::Result<()> {
+    std::process::Command::new(program)
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Input that can change a numeric field's text, including undo and redo.
@@ -1967,6 +1993,21 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn links_and_folders_use_the_platform_opener() {
+        if cfg!(windows) {
+            assert_eq!(open_program(), "explorer");
+        } else {
+            assert_eq!(open_program(), "xdg-open");
+        }
+    }
+
+    #[test]
+    fn a_missing_opener_is_reported() {
+        let error = spawn_open("openmic-missing-opener", "https://example.com").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -2895,11 +2936,16 @@ mod tests {
         assert_eq!(app.settings.window_size, Some([744.0, 842.0]), "and the size in points");
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_saved_position_off_every_monitor_is_ignored() {
         use eframe::App as _;
-        assert!(!on_a_monitor([-100_000, -100_000]) || !cfg!(windows));
+        // Windows always has a monitor list. Linux only does on X11; Wayland
+        // and a missing server keep the saved position, which this test skips.
+        #[cfg(windows)]
+        assert!(!on_a_monitor([-100_000, -100_000]), "Windows reports connected monitors");
+        if on_a_monitor([-100_000, -100_000]) {
+            return;
+        }
         let mut app = App::stopped(Settings { window_position: Some([-100_000, -100_000]), ..Settings::default() });
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
@@ -2917,7 +2963,7 @@ mod tests {
             .values()
             .flat_map(|v| &v.commands)
             .any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
-        assert!(!placed, "the window stays where Windows put it");
+        assert!(!placed, "an off-screen saved position is not applied");
     }
 
     /// egui's built-in fonts lack many symbols (check marks, arrows, most
