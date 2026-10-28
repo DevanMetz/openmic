@@ -1664,7 +1664,12 @@ fn on_a_monitor([x, y]: [i32; 2]) -> bool {
     !unsafe { MonitorFromPoint(POINT { x: x.saturating_add(16), y: y.saturating_add(16) }, MONITOR_DEFAULTTONULL) }.is_invalid()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn on_a_monitor(px: [i32; 2]) -> bool {
+    crate::monitors::on_a_monitor(px)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn on_a_monitor(_: [i32; 2]) -> bool {
     true
 }
@@ -2932,11 +2937,16 @@ mod tests {
         assert_eq!(app.settings.window_size, Some([744.0, 842.0]), "and the size in points");
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_saved_position_off_every_monitor_is_ignored() {
         use eframe::App as _;
-        assert!(!on_a_monitor([-100_000, -100_000]) || !cfg!(windows));
+        // Windows always has a monitor list. Linux only does on X11; Wayland
+        // and a missing server keep the saved position, which this test skips.
+        #[cfg(windows)]
+        assert!(!on_a_monitor([-100_000, -100_000]), "Windows reports connected monitors");
+        if on_a_monitor([-100_000, -100_000]) {
+            return;
+        }
         let mut app = App::stopped(Settings { window_position: Some([-100_000, -100_000]), ..Settings::default() });
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
@@ -2954,7 +2964,7 @@ mod tests {
             .values()
             .flat_map(|v| &v.commands)
             .any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
-        assert!(!placed, "the window stays where Windows put it");
+        assert!(!placed, "an off-screen saved position is not applied");
     }
 
     /// egui's built-in fonts lack many symbols (check marks, arrows, most

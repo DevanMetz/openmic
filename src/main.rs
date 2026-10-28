@@ -15,6 +15,8 @@ mod hotkeys;
 mod icon;
 mod instance;
 mod logfile;
+#[cfg(any(target_os = "linux", test))]
+mod monitors;
 mod playback;
 mod record;
 mod resample;
@@ -137,7 +139,12 @@ fn work_area_size() -> Option<[f32; 2]> {
     ])
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn work_area_size() -> Option<[f32; 2]> {
+    monitors::primary_work_area_points()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn work_area_size() -> Option<[f32; 2]> {
     None
 }
@@ -159,6 +166,18 @@ mod tests {
         assert_eq!(fit_window_size(None, Some([600.0, 400.0])), [MIN_SIZE.0, MIN_SIZE.1]);
         for invalid in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
             assert_eq!(fit_window_size(Some([invalid, invalid]), None), [NATURAL_SIZE.0, NATURAL_SIZE.1]);
+        }
+    }
+
+    #[test]
+    fn a_connected_screen_limits_the_restored_window() {
+        let Some(area) = work_area_size() else { return };
+        assert!(area[0].is_finite() && area[1].is_finite() && area[0] > 0.0 && area[1] > 0.0, "{area:?}");
+        let fitted = fit_window_size(Some([10_000.0, 10_000.0]), Some(area));
+        assert!(fitted[0] >= MIN_SIZE.0 && fitted[1] >= MIN_SIZE.1, "{fitted:?}");
+        assert!(fitted[0] <= area[0].max(MIN_SIZE.0) && fitted[1] <= area[1].max(MIN_SIZE.1), "{fitted:?} vs {area:?}");
+        if area[0] > MIN_SIZE.0 + 40.0 && area[1] > MIN_SIZE.1 + 40.0 {
+            assert!(fitted[0] < 10_000.0 && fitted[1] < 10_000.0, "a huge window is fitted to {area:?}, got {fitted:?}");
         }
     }
 }

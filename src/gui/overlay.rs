@@ -569,7 +569,21 @@ fn monitor_work_area(window: Rect, ppp: f32) -> Option<Rect> {
         Pos2::new(info.rcWork.right as f32, info.rcWork.bottom as f32)) / ppp)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn monitor_work_area(window: Rect, ppp: f32) -> Option<Rect> {
+    if !ppp.is_finite() || ppp <= 0.0 {
+        return None;
+    }
+    let pixels = window * ppp;
+    let window_px = crate::monitors::PxRect::from_f32_edges(pixels.left(), pixels.top(), pixels.right(), pixels.bottom())?;
+    let work = crate::monitors::work_area_pixels(window_px)?;
+    Some(Rect::from_min_max(
+        Pos2::new(work.x as f32, work.y as f32),
+        Pos2::new(work.right() as f32, work.bottom() as f32),
+    ) / ppp)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn monitor_work_area(_: Rect, _: f32) -> Option<Rect> { None }
 
 fn pad_button(
@@ -1805,10 +1819,12 @@ mod tests {
         assert_eq!(Placement::default().step(Some([1, 1]), None, Some(1.0)), (None, false));
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_strip_saved_off_every_monitor_keeps_its_default_position() {
         for saved in [[-100_000, -100_000], [i32::MAX, i32::MAX]] {
+            if super::super::on_a_monitor(saved) {
+                continue;
+            }
             let mut app = App::stopped(Settings { collapsed: true, overlay_position: Some(saved), ..Settings::default() });
             let ctx = egui::Context::default();
             let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(DEFAULT_WIDTH, HEIGHT));
