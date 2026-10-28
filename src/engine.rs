@@ -79,9 +79,11 @@ pub struct StatsSnapshot {
 
 /// One device as the host reports it. `id` is the backend id (`DeviceId::id`),
 /// empty when the host cannot provide one. PulseAudio monitor sources use
-/// `{sink}.monitor` here; their display names are translated.
+/// `{sink}.monitor` here; their display names are translated. Only the
+/// non-Windows monitor matching reads it, so Windows builds do not carry it.
 pub struct ListedDevice {
     pub name: String,
+    #[cfg(not(windows))]
     pub id: String,
 }
 
@@ -95,10 +97,10 @@ pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
     };
     if let Ok(devices) = iter {
         for device in devices {
-            let id = device.id().map(|id| id.id().to_owned()).unwrap_or_default();
             listed.push(ListedDevice {
                 name: device.to_string(),
-                id,
+                #[cfg(not(windows))]
+                id: device.id().map(|id| id.id().to_owned()).unwrap_or_default(),
             });
         }
     }
