@@ -6,8 +6,8 @@
 mod config;
 mod decode;
 mod default_mic;
-mod dictation;
 mod denoise;
+mod dictation;
 mod dsp;
 mod engine;
 mod gui;
@@ -15,14 +15,28 @@ mod hotkeys;
 mod icon;
 mod instance;
 mod logfile;
+#[cfg(any(target_os = "linux", test))]
+mod monitors;
 mod playback;
 mod record;
 mod resample;
+mod rt;
 mod tray;
 mod update;
 mod virtual_mic;
 mod viz;
 mod widgets;
+#[cfg(target_os = "linux")]
+mod x11_type;
+
+/// Keeps the Linux glutin features in Cargo.toml attached to this crate.
+/// eframe creates the window; nothing here runs at startup.
+#[cfg(target_os = "linux")]
+#[allow(dead_code, unused_imports)]
+mod linux_gl {
+    use glutin as _;
+    use glutin_winit as _;
+}
 
 use std::sync::Arc;
 
@@ -40,7 +54,11 @@ fn main() -> eframe::Result<()> {
     logfile::info(format_args!(
         "OpenMic v{}{} started{}",
         env!("CARGO_PKG_VERSION"),
-        if cfg!(debug_assertions) { " (dev build)" } else { "" },
+        if cfg!(debug_assertions) {
+            " (dev build)"
+        } else {
+            ""
+        },
         if updated { " after an update" } else { "" },
     ));
     // The Linux virtual microphone must exist before devices are listed.
@@ -48,10 +66,12 @@ fn main() -> eframe::Result<()> {
         logfile::warn(format_args!("virtual microphone unavailable: {e:#}"));
     }
     let settings = config::Settings::load();
-    // Windows startup launches straight into the notification area.
-    // (A collapsed OpenMic opens as the strip, with the window hidden.)
+    // --minimized (login startup) launches straight into the notification
+    // area when one exists. A collapsed OpenMic opens as the strip, with
+    // the window hidden.
     let start_hidden = settings.load_error.is_none()
-        && ((settings.close_to_tray && std::env::args().any(|arg| arg == config::MINIMIZED_ARG)) || settings.collapsed);
+        && ((settings.close_to_tray && std::env::args().any(|arg| arg == config::MINIMIZED_ARG))
+            || settings.collapsed);
     let icon = egui::IconData {
         rgba: icon::rgba(64, false),
         width: 64,
@@ -73,7 +93,15 @@ fn main() -> eframe::Result<()> {
                 .with_visible(!start_hidden),
             ..Default::default()
         },
-        Box::new(move |cc| Ok(Box::new(gui::App::new(settings, &cc.egui_ctx, start_hidden, instance, updated)))),
+        Box::new(move |cc| {
+            Ok(Box::new(gui::App::new(
+                settings,
+                &cc.egui_ctx,
+                start_hidden,
+                instance,
+                updated,
+            )))
+        }),
     );
     // Normal window close and eframe errors both release the virtual mic.
     virtual_mic::shutdown();
@@ -92,8 +120,16 @@ fn initial_size(saved: Option<[f32; 2]>) -> [f32; 2] {
 
 fn fit_window_size(saved: Option<[f32; 2]>, available: Option<[f32; 2]>) -> [f32; 2] {
     let [width, height] = saved.unwrap_or([NATURAL_SIZE.0, NATURAL_SIZE.1]);
-    let width = if width.is_finite() { width.max(MIN_SIZE.0) } else { NATURAL_SIZE.0 };
-    let height = if height.is_finite() { height.max(MIN_SIZE.1) } else { NATURAL_SIZE.1 };
+    let width = if width.is_finite() {
+        width.max(MIN_SIZE.0)
+    } else {
+        NATURAL_SIZE.0
+    };
+    let height = if height.is_finite() {
+        height.max(MIN_SIZE.1)
+    } else {
+        NATURAL_SIZE.1
+    };
     match available {
         Some([max_width, max_height]) => [
             width.min(max_width - 40.0).max(MIN_SIZE.0),
@@ -108,7 +144,9 @@ fn fit_window_size(saved: Option<[f32; 2]>, available: Option<[f32; 2]>) -> [f32
 fn work_area_size() -> Option<[f32; 2]> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::HiDpi::GetDpiForSystem;
-    use windows::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
     let mut area = RECT::default();
     // SAFETY: SPI_GETWORKAREA writes one RECT to the pointer we pass.
     unsafe {
@@ -122,13 +160,20 @@ fn work_area_size() -> Option<[f32; 2]> {
     }
     // SAFETY: no arguments; returns the system DPI (96 = 100%).
     let dpi = unsafe { GetDpiForSystem() };
-    (dpi > 0).then(|| [
-        (area.right - area.left) as f32 * 96.0 / dpi as f32,
-        (area.bottom - area.top) as f32 * 96.0 / dpi as f32,
-    ])
+    (dpi > 0).then(|| {
+        [
+            (area.right - area.left) as f32 * 96.0 / dpi as f32,
+            (area.bottom - area.top) as f32 * 96.0 / dpi as f32,
+        ]
+    })
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn work_area_size() -> Option<[f32; 2]> {
+    monitors::primary_work_area_points()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn work_area_size() -> Option<[f32; 2]> {
     None
 }
@@ -139,17 +184,56 @@ mod tests {
 
     #[test]
     fn restored_windows_fit_smaller_screens_in_both_directions() {
-        assert_eq!(fit_window_size(Some([2200.0, 1300.0]), Some([1280.0, 720.0])), [1240.0, 680.0]);
+        assert_eq!(
+            fit_window_size(Some([2200.0, 1300.0]), Some([1280.0, 720.0])),
+            [1240.0, 680.0]
+        );
         assert_eq!(fit_window_size(None, Some([1024.0, 768.0])), [760.0, 728.0]);
-        assert_eq!(fit_window_size(Some([744.0, 842.0]), Some([1920.0, 1080.0])), [744.0, 842.0]);
+        assert_eq!(
+            fit_window_size(Some([744.0, 842.0]), Some([1920.0, 1080.0])),
+            [744.0, 842.0]
+        );
     }
 
     #[test]
     fn restored_sizes_remain_usable_when_preferences_or_screen_queries_fail() {
-        assert_eq!(fit_window_size(Some([0.0, 50.0]), None), [MIN_SIZE.0, MIN_SIZE.1]);
-        assert_eq!(fit_window_size(None, Some([600.0, 400.0])), [MIN_SIZE.0, MIN_SIZE.1]);
+        assert_eq!(
+            fit_window_size(Some([0.0, 50.0]), None),
+            [MIN_SIZE.0, MIN_SIZE.1]
+        );
+        assert_eq!(
+            fit_window_size(None, Some([600.0, 400.0])),
+            [MIN_SIZE.0, MIN_SIZE.1]
+        );
         for invalid in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
-            assert_eq!(fit_window_size(Some([invalid, invalid]), None), [NATURAL_SIZE.0, NATURAL_SIZE.1]);
+            assert_eq!(
+                fit_window_size(Some([invalid, invalid]), None),
+                [NATURAL_SIZE.0, NATURAL_SIZE.1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_connected_screen_limits_the_restored_window() {
+        let Some(area) = work_area_size() else { return };
+        assert!(
+            area[0].is_finite() && area[1].is_finite() && area[0] > 0.0 && area[1] > 0.0,
+            "{area:?}"
+        );
+        let fitted = fit_window_size(Some([10_000.0, 10_000.0]), Some(area));
+        assert!(
+            fitted[0] >= MIN_SIZE.0 && fitted[1] >= MIN_SIZE.1,
+            "{fitted:?}"
+        );
+        assert!(
+            fitted[0] <= area[0].max(MIN_SIZE.0) && fitted[1] <= area[1].max(MIN_SIZE.1),
+            "{fitted:?} vs {area:?}"
+        );
+        if area[0] > MIN_SIZE.0 + 40.0 && area[1] > MIN_SIZE.1 + 40.0 {
+            assert!(
+                fitted[0] < 10_000.0 && fitted[1] < 10_000.0,
+                "a huge window is fitted to {area:?}, got {fitted:?}"
+            );
         }
     }
 }

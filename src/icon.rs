@@ -4,7 +4,6 @@
 
 const CYAN: [f32; 3] = [0x38 as f32, 0xbd as f32, 0xf8 as f32];
 const RED: [f32; 3] = [0xf8 as f32, 0x71 as f32, 0x71 as f32];
-#[cfg(windows)]
 const AMBER: [f32; 3] = [0xfb as f32, 0xbf as f32, 0x24 as f32];
 
 /// Square RGBA pixels, `size` x `size`.
@@ -13,7 +12,6 @@ pub fn rgba(size: u32, muted: bool) -> Vec<u8> {
 }
 
 /// The icon while speech to text is listening.
-#[cfg(windows)]
 pub fn listening_rgba(size: u32) -> Vec<u8> {
     draw(size, AMBER, false)
 }
@@ -78,6 +76,10 @@ mod tests {
         assert_eq!(at(0, 0)[3], 0, "corners are transparent");
         assert_eq!(at(16, 12), [18, 18, 18, 255], "capsule");
         assert_eq!(at(4, 16), [0x38, 0xbd, 0xf8, 255], "badge");
-        assert_eq!(rgba(size, true)[((16 * size + 4) * 4) as usize], 0xf8, "muted is red");
+        assert_eq!(
+            rgba(size, true)[((16 * size + 4) * 4) as usize],
+            0xf8,
+            "muted is red"
+        );
     }
 }

@@ -26,6 +26,10 @@ pub const RELEASES_PAGE: &str = "https://github.com/DevanMetz/openmic/releases";
 /// Tests still exercise the controls on every host. Other Linux architectures
 /// have no release archive, so the updater stays off there.
 pub fn updates_supported() -> bool {
+    #[cfg(test)]
+    if UPDATES_UNSUPPORTED.with(std::cell::Cell::get) {
+        return false;
+    }
     cfg!(test) || package_name("0", std::env::consts::OS, std::env::consts::ARCH).is_some()
 }
 
@@ -40,10 +44,35 @@ fn package_name(tag: &str, os: &str, arch: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static UPDATES_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Draw the Linux UI, which has no in-app installer.
+#[cfg(test)]
+pub struct WithoutUpdater;
+
+#[cfg(test)]
+impl WithoutUpdater {
+    pub fn enter() -> Self {
+        UPDATES_UNSUPPORTED.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WithoutUpdater {
+    fn drop(&mut self) {
+        UPDATES_UNSUPPORTED.with(|flag| flag.set(false));
+    }
+}
+
 /// The release workflow signs each executable with the private half of this
 /// Ed25519 key (a GitHub Actions secret); updates without a valid signature
 /// are refused, so a tampered release can't install itself.
-const RELEASE_KEY: [u8; 32] = hex32("038930dcfe3be8b281437f0fee9a9112ba999e4da32b2f59f6a64db5ce4943d3");
+const RELEASE_KEY: [u8; 32] =
+    hex32("038930dcfe3be8b281437f0fee9a9112ba999e4da32b2f59f6a64db5ce4943d3");
 
 /// How often a running OpenMic looks for a new release.
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -57,7 +86,11 @@ pub type Version = (u64, u64, u64);
 
 /// "v0.6.0" or "0.6.0"; pre-release tags such as "v0.7.0-rc1" are not offered.
 pub fn parse_version(tag: &str) -> Option<Version> {
-    let mut parts = tag.strip_prefix('v').unwrap_or(tag).split('.').map(|p| p.parse::<u64>().ok());
+    let mut parts = tag
+        .strip_prefix('v')
+        .unwrap_or(tag)
+        .split('.')
+        .map(|p| p.parse::<u64>().ok());
     let version = (parts.next()??, parts.next()??, parts.next()??);
     parts.next().is_none().then_some(version)
 }
@@ -87,7 +120,12 @@ fn newer_release(json: &str, current: Version) -> Result<Option<Release>> {
     newer_release_for(json, current, std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn newer_release_for(json: &str, current: Version, os: &str, arch: &str) -> Result<Option<Release>> {
+fn newer_release_for(
+    json: &str,
+    current: Version,
+    os: &str,
+    arch: &str,
+) -> Result<Option<Release>> {
     #[derive(Deserialize)]
     struct Latest {
         tag_name: String,
@@ -107,15 +145,25 @@ fn newer_release_for(json: &str, current: Version, os: &str, arch: &str) -> Resu
         return Ok(None);
     }
     let Some(exe_name) = package_name(&latest.tag_name, os, arch) else {
-        bail!("in-app updates are not published for {os} {arch}; download a build from the releases page");
+        bail!(
+            "in-app updates are not published for {os} {arch}; download a build from the releases page"
+        );
     };
-    let find = |suffix: &str| latest.assets.iter().find(|a| a.name == format!("{exe_name}{suffix}"));
+    let find = |suffix: &str| {
+        latest
+            .assets
+            .iter()
+            .find(|a| a.name == format!("{exe_name}{suffix}"))
+    };
     let (Some(exe), Some(sha)) = (find(""), find(".sha256")) else {
         let kind = if os == "linux" { "Linux" } else { "Windows" };
         bail!("{} has no {kind} download yet", latest.tag_name);
     };
     let Some(sig) = find(".sig") else {
-        bail!("{} isn't signed; download it from the releases page", latest.tag_name);
+        bail!(
+            "{} isn't signed; download it from the releases page",
+            latest.tag_name
+        );
     };
     Ok(Some(Release {
         exe_url: exe.browser_download_url.clone(),
@@ -137,7 +185,9 @@ fn parse_checksum(text: &str) -> Result<[u8; 32]> {
         bail!("the release checksum is malformed");
     }
     for (byte, pair) in hash.iter_mut().zip(hex.as_bytes().chunks(2)) {
-        let pair = std::str::from_utf8(pair).ok().and_then(|p| u8::from_str_radix(p, 16).ok());
+        let pair = std::str::from_utf8(pair)
+            .ok()
+            .and_then(|p| u8::from_str_radix(p, 16).ok());
         *byte = pair.context("the release checksum is malformed")?;
     }
     Ok(hash)
@@ -171,11 +221,19 @@ fn signed_message(exe_name: &str, sha256: &[u8]) -> String {
 }
 
 /// Check a hex Ed25519 signature (the `.sig` asset) over the release.
-fn verify_signature(key: &[u8; 32], exe_name: &str, sha256: &[u8], signature_hex: &str) -> Result<()> {
+fn verify_signature(
+    key: &[u8; 32],
+    exe_name: &str,
+    sha256: &[u8],
+    signature_hex: &str,
+) -> Result<()> {
     use ed25519_dalek::{Signature, VerifyingKey};
     let hex = signature_hex.trim();
     let bytes: Vec<u8> = (0..hex.len() / 2)
-        .map(|i| hex.get(2 * i..2 * i + 2).and_then(|p| u8::from_str_radix(p, 16).ok()))
+        .map(|i| {
+            hex.get(2 * i..2 * i + 2)
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+        })
         .collect::<Option<_>>()
         .filter(|b: &Vec<u8>| hex.len() == 128 && b.len() == 64)
         .context("the update's signature is malformed")?;
@@ -196,7 +254,10 @@ struct Paths {
 
 impl Paths {
     fn for_exe(exe: PathBuf) -> Self {
-        let name = exe.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = exe
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Self {
             staged: exe.with_file_name(format!("{name}.update")),
             old: exe.with_file_name(format!("{name}.old")),
@@ -205,7 +266,9 @@ impl Paths {
     }
 
     fn current() -> Result<Self> {
-        Ok(Self::for_exe(std::env::current_exe().context("locate OpenMic")?))
+        Ok(Self::for_exe(
+            std::env::current_exe().context("locate OpenMic")?,
+        ))
     }
 }
 
@@ -228,7 +291,9 @@ fn linux_archive(name: &str) -> bool {
 
 /// The release script packs `openmic` under a directory named after the asset.
 fn linux_binary_member(asset_name: &str) -> Result<String> {
-    let stem = asset_name.strip_suffix(".tar.gz").context("the Linux update is not a .tar.gz")?;
+    let stem = asset_name
+        .strip_suffix(".tar.gz")
+        .context("the Linux update is not a .tar.gz")?;
     Ok(format!("{stem}/openmic"))
 }
 
@@ -270,9 +335,17 @@ fn padded_size(size: usize) -> usize {
 
 fn check_tar_header(header: &[u8; 512]) -> Result<()> {
     let stored = parse_octal(&header[148..156])?;
-    let sum = header.iter().copied().enumerate().fold(0u32, |sum, (index, byte)| {
-        sum + u32::from(if (148..156).contains(&index) { b' ' } else { byte })
-    });
+    let sum = header
+        .iter()
+        .copied()
+        .enumerate()
+        .fold(0u32, |sum, (index, byte)| {
+            sum + u32::from(if (148..156).contains(&index) {
+                b' '
+            } else {
+                byte
+            })
+        });
     if u64::from(sum) != stored {
         bail!("the update archive is damaged");
     }
@@ -281,12 +354,23 @@ fn check_tar_header(header: &[u8; 512]) -> Result<()> {
 
 fn tar_name(header: &[u8; 512]) -> Result<String> {
     let name = tar_field(&header[..100])?;
-    let prefix = if &header[257..262] == b"ustar" { tar_field(&header[345..500])? } else { "" };
-    if prefix.is_empty() { Ok(name.to_owned()) } else { Ok(format!("{prefix}/{name}")) }
+    let prefix = if &header[257..262] == b"ustar" {
+        tar_field(&header[345..500])?
+    } else {
+        ""
+    };
+    if prefix.is_empty() {
+        Ok(name.to_owned())
+    } else {
+        Ok(format!("{prefix}/{name}"))
+    }
 }
 
 fn tar_field(field: &[u8]) -> Result<&str> {
-    let end = field.iter().position(|byte| *byte == 0).unwrap_or(field.len());
+    let end = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
     std::str::from_utf8(&field[..end]).context("the update archive has a damaged file name")
 }
 
@@ -299,7 +383,9 @@ fn tar_size(header: &[u8; 512]) -> Result<usize> {
 }
 
 fn parse_octal(field: &[u8]) -> Result<u64> {
-    let text = std::str::from_utf8(field).ok().context("the update archive is damaged")?;
+    let text = std::str::from_utf8(field)
+        .ok()
+        .context("the update archive is damaged")?;
     let text = text.trim_matches(|c: char| c == '\0' || c.is_whitespace());
     if text.is_empty() {
         return Ok(0);
@@ -352,7 +438,9 @@ impl<R: Read> Read for Limited<R> {
                 "the update archive is too large",
             ));
         }
-        let max = usize::try_from(self.left).unwrap_or(usize::MAX).min(buf.len());
+        let max = usize::try_from(self.left)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
         let n = self.inner.read(&mut buf[..max])?;
         self.left -= u64::try_from(n).unwrap_or(0);
         Ok(n)
@@ -366,7 +454,8 @@ fn write_linux_binary(asset_name: &str, gzipped: &[u8], dest: &Path) -> Result<(
     let binary = extract_linux_binary(gzipped, asset_name)?;
     let tmp = dest.with_extension("extracting");
     let write = (|| -> Result<()> {
-        let mut file = File::create(&tmp).with_context(|| format!("save the update in {}", tmp.display()))?;
+        let mut file =
+            File::create(&tmp).with_context(|| format!("save the update in {}", tmp.display()))?;
         file.write_all(&binary).context("save the update")?;
         file.sync_all().context("save the update")?;
         make_executable(&tmp)?;
@@ -385,7 +474,8 @@ fn make_executable(path: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = fs::metadata(path)?.permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(path, perms).with_context(|| format!("mark {} executable", path.display()))?;
+        fs::set_permissions(path, perms)
+            .with_context(|| format!("mark {} executable", path.display()))?;
     }
     #[cfg(not(unix))]
     {
@@ -425,13 +515,17 @@ fn download(
         let response = response.context("download the update")?;
         let mut reader = response.into_body().into_reader();
         let mut out = File::create(&partial).with_context(|| {
-            format!("save the update beside OpenMic in {}", partial.parent().unwrap_or(dest).display())
+            format!(
+                "save the update beside OpenMic in {}",
+                partial.parent().unwrap_or(dest).display()
+            )
         })?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 1 << 16];
         let mut got = 0u64;
         loop {
-            let n = read_download_chunk(&mut reader, &mut buf, cancel).context("download the update")?;
+            let n = read_download_chunk(&mut reader, &mut buf, cancel)
+                .context("download the update")?;
             if n == 0 {
                 break;
             }
@@ -492,7 +586,9 @@ fn roll_back(paths: &Paths) {
 /// and saves settings on the way out). Returns whether this launch is the
 /// new version starting up. This must not touch the running copy's files.
 pub fn wait_for_previous_version() -> bool {
-    let mut args = std::env::args().skip_while(|a| a != AFTER_UPDATE_ARG).skip(1);
+    let mut args = std::env::args()
+        .skip_while(|a| a != AFTER_UPDATE_ARG)
+        .skip(1);
     let predecessor = args.next().and_then(|pid| pid.parse::<u32>().ok());
     if let Some(pid) = predecessor {
         wait_for_exit(pid, Duration::from_secs(20));
@@ -519,7 +615,9 @@ fn cleanup_update_files(paths: &Paths) {
 #[cfg(windows)]
 fn wait_for_exit(pid: u32, timeout: Duration) {
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
     // SAFETY: plain Win32 calls on a handle we open and close here.
     unsafe {
         if let Ok(process) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
@@ -555,7 +653,8 @@ fn process_has_exited(pid: u32) -> bool {
 /// itself contain spaces and `)`.
 #[cfg(any(test, not(windows)))]
 fn process_state(stat: &str) -> Option<&str> {
-    stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next())
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
 }
 
 /// What the updater is doing, for the window.
@@ -567,7 +666,10 @@ pub enum Status {
     Available(Release),
     Downloading(Release),
     /// Keep the release and its error available for an explicit retry.
-    DownloadFailed { release: Release, error: String },
+    DownloadFailed {
+        release: Release,
+        error: String,
+    },
     /// Downloaded and verified; restarting installs it.
     Ready(Release),
     /// The release check failed before a download was offered.
@@ -635,7 +737,11 @@ impl Updater {
 
     /// Collect finished work, and start the daily check when `enabled`.
     pub fn tick(&mut self, enabled: bool) {
-        if self.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
             let event = self.worker.take().unwrap().join().unwrap_or_else(|_| {
                 let error = anyhow::anyhow!("Update task stopped unexpectedly; try again");
                 match &self.status {
@@ -644,12 +750,19 @@ impl Updater {
                 }
             });
             match &event {
-                Event::Checked(Ok(Some(release))) => logfile::info(format_args!("update available: {}", release.tag)),
+                Event::Checked(Ok(Some(release))) => {
+                    logfile::info(format_args!("update available: {}", release.tag))
+                }
                 Event::Checked(Err(e)) => logfile::warn(format_args!("update check failed: {e:#}")),
                 Event::Downloaded(release, Ok(())) => {
-                    logfile::info(format_args!("update {} downloaded and verified", release.tag));
+                    logfile::info(format_args!(
+                        "update {} downloaded and verified",
+                        release.tag
+                    ));
                 }
-                Event::Downloaded(_, Err(e)) => logfile::warn(format_args!("update download stopped: {e:#}")),
+                Event::Downloaded(_, Err(e)) => {
+                    logfile::warn(format_args!("update download stopped: {e:#}"))
+                }
                 Event::Checked(Ok(None)) => {}
             }
             self.status = match event {
@@ -660,11 +773,21 @@ impl Updater {
                 Event::Downloaded(release, Err(_)) if self.cancel.load(Ordering::Relaxed) => {
                     Status::Available(release)
                 }
-                Event::Downloaded(release, Err(e)) => Status::DownloadFailed { release, error: format!("{e:#}") },
+                Event::Downloaded(release, Err(e)) => Status::DownloadFailed {
+                    release,
+                    error: format!("{e:#}"),
+                },
             };
         }
-        let idle = matches!(self.status, Status::Idle | Status::UpToDate | Status::Failed(_));
-        if enabled && self.automatic && idle && self.last_check.is_none_or(|t| t.elapsed() >= CHECK_EVERY) {
+        let idle = matches!(
+            self.status,
+            Status::Idle | Status::UpToDate | Status::Failed(_)
+        );
+        if enabled
+            && self.automatic
+            && idle
+            && self.last_check.is_none_or(|t| t.elapsed() >= CHECK_EVERY)
+        {
             self.check();
         }
     }
@@ -677,21 +800,34 @@ impl Updater {
         self.status = Status::Checking;
         #[cfg(test)]
         if let Some(completion) = self.next_check.take() {
-            self.spawn("test-update-check", move |_, _| Event::Checked(
-                completion.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("Update check fixture closed")))));
+            self.spawn("test-update-check", move |_, _| {
+                Event::Checked(
+                    completion
+                        .recv()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Update check fixture closed"))),
+                )
+            });
             return;
         }
-        self.spawn("openmic-update-check", |_, _| Event::Checked(check(&agent(), &feed())));
+        self.spawn("openmic-update-check", |_, _| {
+            Event::Checked(check(&agent(), &feed()))
+        });
     }
 
     /// Download and verify the available release, or retry a failed download.
     pub fn download(&mut self) {
-        let (Status::Available(release) | Status::DownloadFailed { release, .. }) = &self.status else { return };
+        let (Status::Available(release) | Status::DownloadFailed { release, .. }) = &self.status
+        else {
+            return;
+        };
         let release = release.clone();
         let paths = match Paths::current() {
             Ok(paths) => paths,
             Err(e) => {
-                self.status = Status::DownloadFailed { release, error: format!("{e:#}") };
+                self.status = Status::DownloadFailed {
+                    release,
+                    error: format!("{e:#}"),
+                };
                 return;
             }
         };
@@ -701,15 +837,35 @@ impl Updater {
         #[cfg(test)]
         let completion = self.next_download.take();
         #[cfg(test)]
-        if let Some((_, done)) = &completion { self.done.store(*done, Ordering::Relaxed); }
+        if let Some((_, done)) = &completion {
+            self.done.store(*done, Ordering::Relaxed);
+        }
         self.spawn("openmic-update-download", move |done, cancel| {
             #[cfg(test)]
             let result = if let Some((completion, _)) = completion {
-                completion.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("Update download fixture closed")))
+                completion
+                    .recv()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Update download fixture closed")))
                     .and_then(|()| check_download_cancelled(cancel))
-            } else { download(&agent(), &release, &RELEASE_KEY, &paths.staged, done, cancel) };
+            } else {
+                download(
+                    &agent(),
+                    &release,
+                    &RELEASE_KEY,
+                    &paths.staged,
+                    done,
+                    cancel,
+                )
+            };
             #[cfg(not(test))]
-            let result = download(&agent(), &release, &RELEASE_KEY, &paths.staged, done, cancel);
+            let result = download(
+                &agent(),
+                &release,
+                &RELEASE_KEY,
+                &paths.staged,
+                done,
+                cancel,
+            );
             Event::Downloaded(release, result)
         });
     }
@@ -725,11 +881,15 @@ impl Updater {
     /// Put the downloaded version in place and start it. The caller then
     /// quits; the new copy waits for that before it opens any devices.
     pub fn install(&mut self) -> Result<()> {
-        let Status::Ready(_) = &self.status else { bail!("no update is ready") };
+        let Status::Ready(_) = &self.status else {
+            bail!("no update is ready")
+        };
         #[cfg(test)]
         {
             self.install_attempts += 1;
-            if let Some(error) = &self.install_error { bail!("{error}"); }
+            if let Some(error) = &self.install_error {
+                bail!("{error}");
+            }
         }
         let paths = Paths::current()?;
         replace(&paths)?;
@@ -744,7 +904,11 @@ impl Updater {
         Ok(())
     }
 
-    fn spawn(&mut self, name: &str, work: impl FnOnce(&AtomicU64, &AtomicBool) -> Event + Send + 'static) {
+    fn spawn(
+        &mut self,
+        name: &str,
+        work: impl FnOnce(&AtomicU64, &AtomicBool) -> Event + Send + 'static,
+    ) {
         let wake = Arc::clone(&self.wake);
         let (done, cancel) = (Arc::clone(&self.done), Arc::clone(&self.cancel));
         let spawned = thread::Builder::new().name(name.into()).spawn(move || {
@@ -758,7 +922,10 @@ impl Updater {
                 let message = format!("Could not start update task: {error}");
                 logfile::warn(&message);
                 self.status = match &self.status {
-                    Status::Downloading(release) => Status::DownloadFailed { release: release.clone(), error: message },
+                    Status::Downloading(release) => Status::DownloadFailed {
+                        release: release.clone(),
+                        error: message,
+                    },
                     _ => Status::Failed(message),
                 };
                 (self.wake)();
@@ -783,22 +950,31 @@ impl Updater {
     }
 
     /// Exercise GUI actions through the real worker lifecycle without networking.
-    pub(crate) fn hold_next_download_for_test(&mut self, done: u64) -> crossbeam_channel::Sender<Result<()>> {
+    pub(crate) fn hold_next_download_for_test(
+        &mut self,
+        done: u64,
+    ) -> crossbeam_channel::Sender<Result<()>> {
         let (completion, wait) = crossbeam_channel::bounded(1);
         self.next_download = Some((wait, done));
         completion
     }
 
-    pub(crate) fn hold_next_check_for_test(&mut self) -> crossbeam_channel::Sender<Result<Option<Release>>> {
+    pub(crate) fn hold_next_check_for_test(
+        &mut self,
+    ) -> crossbeam_channel::Sender<Result<Option<Release>>> {
         let (completion, wait) = crossbeam_channel::bounded(1);
         self.next_check = Some(wait);
         completion
     }
 
     /// Keep keyboard fixtures from replacing or starting the test executable.
-    pub(crate) fn reject_installs_for_test(&mut self, error: &str) { self.install_error = Some(error.into()); }
+    pub(crate) fn reject_installs_for_test(&mut self, error: &str) {
+        self.install_error = Some(error.into());
+    }
 
-    pub(crate) fn install_attempts_for_test(&self) -> usize { self.install_attempts }
+    pub(crate) fn install_attempts_for_test(&self) -> usize {
+        self.install_attempts
+    }
 }
 
 #[cfg(test)]
@@ -830,10 +1006,17 @@ mod tests {
         assert_eq!(parse_version("v0.6.0"), Some((0, 6, 0)));
         assert_eq!(parse_version("0.0.1"), Some((0, 0, 1)));
         assert!(parse_version("v0.10.0") > parse_version("v0.9.9"));
-        assert_eq!(parse_version("v0.7.0-rc1"), None, "pre-releases are not offered");
+        assert_eq!(
+            parse_version("v0.7.0-rc1"),
+            None,
+            "pre-releases are not offered"
+        );
         assert_eq!(parse_version("v1.2"), None);
         assert_eq!(parse_version("v1.2.3.4"), None);
-        assert_eq!(current_version(), parse_version(env!("CARGO_PKG_VERSION")).unwrap());
+        assert_eq!(
+            current_version(),
+            parse_version(env!("CARGO_PKG_VERSION")).unwrap()
+        );
     }
 
     /// A release listing with the executable plus assets with these suffixes.
@@ -862,24 +1045,42 @@ mod tests {
 
     #[test]
     fn only_a_newer_signed_release_is_offered() {
-        let release = windows_release(&release_json("v0.7.0", SIGNED), (0, 6, 0)).unwrap().unwrap();
+        let release = windows_release(&release_json("v0.7.0", SIGNED), (0, 6, 0))
+            .unwrap()
+            .unwrap();
         assert_eq!(release.tag, "v0.7.0");
         assert_eq!(release.exe_name, "openmic-v0.7.0-windows-x64.exe");
         assert_eq!(release.exe_url, "https://example.test/v0.7.0.exe");
         assert_eq!(release.sha_url, "https://example.test/v0.7.0.sha256");
         assert_eq!(release.sig_url, "https://example.test/v0.7.0.sig");
         assert_eq!(release.size, 5);
-        assert_eq!(release.notes, "", "a release without notes still offers the update");
+        assert_eq!(
+            release.notes, "",
+            "a release without notes still offers the update"
+        );
 
-        let with_notes = release_json("v0.7.0", SIGNED).replacen('{', r###"{"body": "## Fixes\n- Faster","###, 1);
+        let with_notes = release_json("v0.7.0", SIGNED).replacen(
+            '{',
+            r###"{"body": "## Fixes\n- Faster","###,
+            1,
+        );
         let release = windows_release(&with_notes, (0, 6, 0)).unwrap().unwrap();
         assert_eq!(release.notes, "## Fixes\n- Faster");
 
-        assert_eq!(windows_release(&release_json("v0.6.0", SIGNED), (0, 6, 0)).unwrap(), None);
-        assert_eq!(windows_release(&release_json("v0.5.0", SIGNED), (0, 6, 0)).unwrap(), None);
+        assert_eq!(
+            windows_release(&release_json("v0.6.0", SIGNED), (0, 6, 0)).unwrap(),
+            None
+        );
+        assert_eq!(
+            windows_release(&release_json("v0.5.0", SIGNED), (0, 6, 0)).unwrap(),
+            None
+        );
         assert!(windows_release(&release_json("v0.7.0", &[".sig"]), (0, 6, 0)).is_err());
         let unsigned = windows_release(&release_json("v0.7.0", &[".sha256"]), (0, 6, 0));
-        assert!(unsigned.unwrap_err().to_string().contains("isn't signed"), "never install unsigned");
+        assert!(
+            unsigned.unwrap_err().to_string().contains("isn't signed"),
+            "never install unsigned"
+        );
     }
 
     #[test]
@@ -893,21 +1094,40 @@ mod tests {
         let json = format!(
             r#"{{"tag_name":"{tag}","html_url":"https://example.test/{tag}","assets":[{},{},{},{},{},{}]}}"#,
             asset(&windows, "https://example.test/win", 9),
-            asset(&format!("{windows}.sha256"), "https://example.test/win.sha256", 1),
+            asset(
+                &format!("{windows}.sha256"),
+                "https://example.test/win.sha256",
+                1
+            ),
             asset(&format!("{windows}.sig"), "https://example.test/win.sig", 1),
             asset(&archive, "https://example.test/linux.tar.gz", 4),
-            asset(&format!("{archive}.sha256"), "https://example.test/linux.sha256", 1),
-            asset(&format!("{archive}.sig"), "https://example.test/linux.sig", 1),
+            asset(
+                &format!("{archive}.sha256"),
+                "https://example.test/linux.sha256",
+                1
+            ),
+            asset(
+                &format!("{archive}.sig"),
+                "https://example.test/linux.sig",
+                1
+            ),
         );
-        let linux = newer_release_for(&json, (0, 12, 0), "linux", "x86_64").unwrap().unwrap();
+        let linux = newer_release_for(&json, (0, 12, 0), "linux", "x86_64")
+            .unwrap()
+            .unwrap();
         assert_eq!(linux.exe_name, archive);
         assert_eq!(linux.exe_url, "https://example.test/linux.tar.gz");
         assert_eq!(linux.sha_url, "https://example.test/linux.sha256");
         assert_eq!(linux.sig_url, "https://example.test/linux.sig");
         assert_eq!(linux.size, 4);
 
-        let windows_release = newer_release_for(&json, (0, 12, 0), "windows", "aarch64").unwrap().unwrap();
-        assert_eq!(windows_release.exe_name, windows, "Windows keeps installing the published x64 executable");
+        let windows_release = newer_release_for(&json, (0, 12, 0), "windows", "aarch64")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            windows_release.exe_name, windows,
+            "Windows keeps installing the published x64 executable"
+        );
 
         let without_linux_sig = json.replace(&format!(r#""{archive}.sig""#), r#""other.sig""#);
         let unsigned = newer_release_for(&without_linux_sig, (0, 12, 0), "linux", "x86_64");
@@ -925,7 +1145,8 @@ mod tests {
     #[test]
     #[ignore]
     fn release_script_signatures_verify_with_the_embedded_key() {
-        let path = PathBuf::from(std::env::var("OPENMIC_SIGNED_FILE").expect("set OPENMIC_SIGNED_FILE"));
+        let path =
+            PathBuf::from(std::env::var("OPENMIC_SIGNED_FILE").expect("set OPENMIC_SIGNED_FILE"));
         let exe = fs::read(&path).unwrap();
         let signature = fs::read_to_string(path.with_extension("exe.sig")).unwrap();
         let name = path.file_name().unwrap().to_str().unwrap();
@@ -945,7 +1166,11 @@ mod tests {
     fn sign(key: &ed25519_dalek::SigningKey, exe_name: &str, exe: &[u8]) -> String {
         use ed25519_dalek::Signer;
         let signature = key.sign(signed_message(exe_name, &Sha256::digest(exe)).as_bytes());
-        signature.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        signature
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     #[test]
@@ -957,7 +1182,13 @@ mod tests {
         verify_signature(&public, name, &Sha256::digest(b"exe"), &signature).unwrap();
         assert!(verify_signature(&public, name, &Sha256::digest(b"other"), &signature).is_err());
         assert!(
-            verify_signature(&public, "openmic-v0.8.0-windows-x64.exe", &Sha256::digest(b"exe"), &signature).is_err(),
+            verify_signature(
+                &public,
+                "openmic-v0.8.0-windows-x64.exe",
+                &Sha256::digest(b"exe"),
+                &signature
+            )
+            .is_err(),
             "an old signed build can't pose as a newer release"
         );
         assert!(verify_signature(&RELEASE_KEY, name, &Sha256::digest(b"exe"), &signature).is_err());
@@ -977,7 +1208,11 @@ mod tests {
     /// Each connection answers one request as keep-alive, then hangs up
     /// without a reply if another request arrives on it: the stale pooled
     /// connection that once failed a real update with "peer disconnected".
-    fn serve(body: Vec<u8>, checksum: String, signature: String) -> (String, thread::JoinHandle<()>) {
+    fn serve(
+        body: Vec<u8>,
+        checksum: String,
+        signature: String,
+    ) -> (String, thread::JoinHandle<()>) {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1006,7 +1241,12 @@ mod tests {
                 } else {
                     checksum.as_bytes()
                 };
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", content.len()).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    content.len()
+                )
+                .unwrap();
                 stream.write_all(content).unwrap();
                 open.push(thread::spawn(move || {
                     if read_request(&mut reader).is_some() {
@@ -1037,7 +1277,11 @@ mod tests {
 
     /// Serve `exe` with a checksum of `listed` and a signature by `signer`,
     /// then download it as the updater does, trusting the test key.
-    fn fetch(exe: &'static [u8], listed: &[u8], signer: &ed25519_dalek::SigningKey) -> (Result<()>, tempfile::TempDir, u64) {
+    fn fetch(
+        exe: &'static [u8],
+        listed: &[u8],
+        signer: &ed25519_dalek::SigningKey,
+    ) -> (Result<()>, tempfile::TempDir, u64) {
         let checksum = format!("{:x}  openmic.exe", Sha256::digest(listed));
         let (base, server) = serve(exe.to_vec(), checksum, sign(signer, "openmic.exe", exe));
         let dir = tempfile::tempdir().unwrap();
@@ -1045,7 +1289,14 @@ mod tests {
         let trusted = test_key().verifying_key().to_bytes();
         let release = test_release(&base, exe.len() as u64);
         let dest = dir.path().join("openmic.exe.update");
-        let result = download(&agent(), &release, &trusted, &dest, &done, &AtomicBool::new(false));
+        let result = download(
+            &agent(),
+            &release,
+            &trusted,
+            &dest,
+            &done,
+            &AtomicBool::new(false),
+        );
         server.join().unwrap();
         (result, dir, done.load(Ordering::Relaxed))
     }
@@ -1054,9 +1305,16 @@ mod tests {
     fn a_verified_download_is_kept() {
         let (result, dir, done) = fetch(b"new exe", b"new exe", &test_key());
         result.unwrap();
-        assert_eq!(fs::read(dir.path().join("openmic.exe.update")).unwrap(), b"new exe");
+        assert_eq!(
+            fs::read(dir.path().join("openmic.exe.update")).unwrap(),
+            b"new exe"
+        );
         assert_eq!(done, 7);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no partial file left");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no partial file left"
+        );
     }
 
     fn write_octal(field: &mut [u8], value: u64) {
@@ -1116,7 +1374,11 @@ mod tests {
             ("openmic-v9.9.9-linux-x86_64/README.md", b'0', b"notes"),
         ]);
         let checksum = format!("{:x}  {asset}", Sha256::digest(&archive));
-        let (base, server) = serve(archive.clone(), checksum, sign(&test_key(), asset, &archive));
+        let (base, server) = serve(
+            archive.clone(),
+            checksum,
+            sign(&test_key(), asset, &archive),
+        );
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("openmic.update");
         fs::write(&dest, b"previous staged binary").unwrap();
@@ -1131,16 +1393,28 @@ mod tests {
             size: archive.len() as u64,
         };
         download(
-            &agent(), &release, &test_key().verifying_key().to_bytes(), &dest,
-            &AtomicU64::new(0), &AtomicBool::new(false),
-        ).unwrap();
+            &agent(),
+            &release,
+            &test_key().verifying_key().to_bytes(),
+            &dest,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         server.join().unwrap();
         assert_eq!(fs::read(&dest).unwrap(), binary);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "the archive itself is not installed");
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the archive itself is not installed"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
     }
 
@@ -1149,11 +1423,15 @@ mod tests {
         let asset = "openmic-v9.9.9-linux-x86_64.tar.gz";
         let member = "openmic-v9.9.9-linux-x86_64/openmic";
         let symlink = pack_tar_gz(&[(member, b'2', b"")]);
-        let error = extract_linux_binary(&symlink, asset).unwrap_err().to_string();
+        let error = extract_linux_binary(&symlink, asset)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not a regular file"), "{error}");
 
         let traversal = pack_tar_gz(&[("../openmic", b'0', b"evil")]);
-        let error = extract_linux_binary(&traversal, asset).unwrap_err().to_string();
+        let error = extract_linux_binary(&traversal, asset)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("no OpenMic binary"), "{error}");
 
         let mut header = ustar_header(member, b'0', 0);
@@ -1164,18 +1442,24 @@ mod tests {
         header[148..154].copy_from_slice(text.as_bytes());
         header[154] = 0;
         header[155] = b' ';
-        let error = extract_linux_binary(&gzip_tar(&header), asset).unwrap_err().to_string();
+        let error = extract_linux_binary(&gzip_tar(&header), asset)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("too large"), "{error}");
 
         let mut damaged = ustar_header(member, b'0', 0);
         damaged[148] ^= 1;
-        let error = extract_linux_binary(&gzip_tar(&damaged), asset).unwrap_err().to_string();
+        let error = extract_linux_binary(&gzip_tar(&damaged), asset)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("damaged"), "{error}");
 
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("openmic.update");
         fs::write(&dest, b"keep the previous binary").unwrap();
-        let error = write_linux_binary(asset, &symlink, &dest).unwrap_err().to_string();
+        let error = write_linux_binary(asset, &symlink, &dest)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not a regular file"), "{error}");
         assert_eq!(fs::read(&dest).unwrap(), b"keep the previous binary");
         assert!(!dest.with_extension("extracting").exists());
@@ -1199,7 +1483,10 @@ mod tests {
             .expect("tar");
         assert!(status.success());
         let bytes = fs::read(dir.path().join(format!("{stem}.tar.gz"))).unwrap();
-        assert_eq!(extract_linux_binary(&bytes, &format!("{stem}.tar.gz")).unwrap(), b"from-gnu-tar");
+        assert_eq!(
+            extract_linux_binary(&bytes, &format!("{stem}.tar.gz")).unwrap(),
+            b"from-gnu-tar"
+        );
     }
 
     #[test]
@@ -1212,18 +1499,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_new_version_waits_until_the_previous_process_has_exited() {
-        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let pid = child.id();
         assert!(!process_has_exited(pid), "a live process is still running");
         child.kill().unwrap();
         let started = Instant::now();
         wait_for_exit(pid, Duration::from_secs(5));
         assert!(process_has_exited(pid));
-        assert!(started.elapsed() < Duration::from_secs(4), "a zombie is not waited out");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "a zombie is not waited out"
+        );
         let _ = child.wait();
         let started = Instant::now();
         wait_for_exit(pid, Duration::from_secs(5));
-        assert!(started.elapsed() < Duration::from_millis(500), "a reaped process does not block startup");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a reaped process does not block startup"
+        );
     }
 
     #[test]
@@ -1235,7 +1531,12 @@ mod tests {
         // The sample has no request URLs: cancellation must win before any
         // attempt to fetch or parse metadata, or to touch the staged file.
         let result = download(
-            &agent(), &Release::sample("v9.0.0"), &RELEASE_KEY, &dest, &done, &AtomicBool::new(true),
+            &agent(),
+            &Release::sample("v9.0.0"),
+            &RELEASE_KEY,
+            &dest,
+            &done,
+            &AtomicBool::new(true),
         );
         assert_eq!(result.unwrap_err().to_string(), "download cancelled");
         assert_eq!(done.load(Ordering::Relaxed), 17);
@@ -1265,7 +1566,9 @@ mod tests {
             };
             // Accepted sockets can inherit the listener's nonblocking mode on Windows.
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let mut reader = std::io::BufReader::new(&mut stream);
             let mut request = String::new();
             reader.read_line(&mut request).unwrap();
@@ -1273,22 +1576,34 @@ mod tests {
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() { break; }
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
             }
             // Cancel while the metadata request is in flight. The response
             // is valid, but the signature and executable must not be fetched.
             cancelled.store(true, Ordering::Relaxed);
             let checksum = "0".repeat(64);
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{checksum}").unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{checksum}"
+            )
+            .unwrap();
         });
         let release = Release {
-            sha_url: format!("{base}/checksum"), sig_url: format!("{base}/signature"),
-            exe_url: format!("{base}/executable"), ..Release::sample("v9.0.0")
+            sha_url: format!("{base}/checksum"),
+            sig_url: format!("{base}/signature"),
+            exe_url: format!("{base}/executable"),
+            ..Release::sample("v9.0.0")
         };
         let dir = tempfile::tempdir().unwrap();
         let result = download(
-            &download_agent(Duration::from_secs(1)), &release, &RELEASE_KEY,
-            &dir.path().join("openmic.exe.update"), &AtomicU64::new(0), &cancel,
+            &download_agent(Duration::from_secs(1)),
+            &release,
+            &RELEASE_KEY,
+            &dir.path().join("openmic.exe.update"),
+            &AtomicU64::new(0),
+            &cancel,
         );
         server.join().unwrap();
         assert_eq!(result.unwrap_err().to_string(), "download cancelled");
@@ -1349,14 +1664,21 @@ mod tests {
             &paths.staged.with_extension("part"),
             &paths.staged.with_extension("extracting"),
         ];
-        for path in leftovers { fs::write(path, b"earlier update").unwrap(); }
+        for path in leftovers {
+            fs::write(path, b"earlier update").unwrap();
+        }
         let another_exe = Paths::for_exe(dir.path().join("other.exe"));
         fs::write(&another_exe.staged, b"another executable's update").unwrap();
 
         cleanup_update_files(&paths);
         assert_eq!(fs::read(&paths.exe).unwrap(), b"running executable");
-        for path in leftovers { assert!(!path.exists()); }
-        assert_eq!(fs::read(&another_exe.staged).unwrap(), b"another executable's update");
+        for path in leftovers {
+            assert!(!path.exists());
+        }
+        assert_eq!(
+            fs::read(&another_exe.staged).unwrap(),
+            b"another executable's update"
+        );
         cleanup_update_files(&paths); // missing leftovers do not block startup
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
@@ -1374,11 +1696,16 @@ mod tests {
         let mut updater = Updater::new(true, || {});
         updater.last_check = Some(Instant::now());
         updater.status = Status::Checking;
-        updater.spawn("test-update-crash", |_, _| panic!("simulated check failure"));
+        updater.spawn("test-update-crash", |_, _| {
+            panic!("simulated check failure")
+        });
         wait_for_worker(&updater);
         updater.tick(true);
         assert!(matches!(updater.status(), Status::Failed(error) if error.contains("try again")));
-        assert!(updater.worker.is_none(), "a crash must not immediately retry the daily check");
+        assert!(
+            updater.worker.is_none(),
+            "a crash must not immediately retry the daily check"
+        );
 
         updater.status = Status::Checking;
         updater.spawn("test-update-retry", |_, _| Event::Checked(Ok(None)));
@@ -1400,15 +1727,19 @@ mod tests {
             });
             wait_for_worker(&updater);
             assert_eq!(updater.progress(), Some((123, release.size)));
-            if cancelled { updater.cancel_download(); }
+            if cancelled {
+                updater.cancel_download();
+            }
             updater.tick(false);
             assert!(updater.progress().is_none());
             assert!(updater.worker.is_none());
             if cancelled {
                 assert_eq!(updater.status(), &Status::Available(release));
             } else {
-                assert!(matches!(updater.status(), Status::DownloadFailed { release: retained, error }
-                    if retained == &release && error.contains("try again")));
+                assert!(
+                    matches!(updater.status(), Status::DownloadFailed { release: retained, error }
+                    if retained == &release && error.contains("try again"))
+                );
             }
         }
     }
@@ -1417,19 +1748,33 @@ mod tests {
     fn failed_update_download_can_retry_without_losing_the_release_or_error() {
         let mut updater = Updater::new(true, || {});
         // A malformed URI fails before networking or any executable writes.
-        let release = Release { sha_url: "http://[invalid".into(), ..Release::sample("v9.0.0") };
-        updater.status = Status::DownloadFailed { release: release.clone(), error: "earlier failure".into() };
+        let release = Release {
+            sha_url: "http://[invalid".into(),
+            ..Release::sample("v9.0.0")
+        };
+        updater.status = Status::DownloadFailed {
+            release: release.clone(),
+            error: "earlier failure".into(),
+        };
         updater.done.store(123, Ordering::Relaxed);
         updater.cancel.store(true, Ordering::Relaxed);
         updater.download();
         assert_eq!(updater.status(), &Status::Downloading(release.clone()));
         assert_eq!(updater.progress(), Some((0, release.size)));
-        assert!(!updater.cancel.load(Ordering::Relaxed), "retry clears the previous cancellation");
+        assert!(
+            !updater.cancel.load(Ordering::Relaxed),
+            "retry clears the previous cancellation"
+        );
         wait_for_worker(&updater);
         updater.tick(true);
-        assert!(matches!(updater.status(), Status::DownloadFailed { release: retained, error }
-            if retained == &release && error.contains("checksum")));
-        assert!(updater.worker.is_none(), "an automatic check must not replace a failed download");
+        assert!(
+            matches!(updater.status(), Status::DownloadFailed { release: retained, error }
+            if retained == &release && error.contains("checksum"))
+        );
+        assert!(
+            updater.worker.is_none(),
+            "an automatic check must not replace a failed download"
+        );
         assert!(updater.progress().is_none());
     }
 
@@ -1449,7 +1794,10 @@ mod tests {
         assert_eq!(updater.status(), &Status::Downloading(release.clone()));
         assert!(!updater.download_cancelling());
         updater.cancel_download();
-        assert!(updater.download_cancelling(), "show cancellation while the worker is still stopping");
+        assert!(
+            updater.download_cancelling(),
+            "show cancellation while the worker is still stopping"
+        );
         release_worker.send(()).unwrap();
         wait_for_worker(&updater);
         updater.tick(false);
@@ -1464,7 +1812,9 @@ mod tests {
         let release = Release::sample("v9.0.0");
         updater.status = Status::Downloading(release.clone());
         let downloaded = release.clone();
-        updater.spawn("test-download-done", move |_, _| Event::Downloaded(downloaded, Ok(())));
+        updater.spawn("test-download-done", move |_, _| {
+            Event::Downloaded(downloaded, Ok(()))
+        });
         wait_for_worker(&updater);
         updater.cancel_download(); // a completed verified download is still ready
         updater.tick(false);

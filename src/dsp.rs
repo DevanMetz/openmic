@@ -277,7 +277,14 @@ pub struct Clip {
 impl Clip {
     pub fn new(key: u64, samples: std::sync::Arc<Vec<f32>>, gain: f32) -> Self {
         let end = samples.len();
-        Self { key, samples, range: 0..end, pos: 0, paused: false, gain }
+        Self {
+            key,
+            samples,
+            range: 0..end,
+            pos: 0,
+            paused: false,
+            gain,
+        }
     }
 
     /// Select trim points in seconds without copying the cached audio.
@@ -316,7 +323,11 @@ impl Mixer {
     /// Keys of the clips currently sounding.
     #[cfg(test)]
     pub fn playing_keys(&self) -> Vec<u64> {
-        self.voices.iter().filter(|v| !v.paused).map(|v| v.key).collect()
+        self.voices
+            .iter()
+            .filter(|v| !v.paused)
+            .map(|v| v.key)
+            .collect()
     }
 
     /// Each loaded clip's progress, paused state, and selected duration.
@@ -434,7 +445,12 @@ mod tests {
         let loud = [0.1_f32; FRAME]; // -20 dBFS
         let reopened = apply_processing(&loud, &clean, &params, &mut gate_gain);
         assert_eq!(gate_gain, 1.0);
-        assert!(reopened.iter().zip(&clean).all(|(a, b)| (a - b).abs() < 1e-6));
+        assert!(
+            reopened
+                .iter()
+                .zip(&clean)
+                .all(|(a, b)| (a - b).abs() < 1e-6)
+        );
     }
 
     #[test]
@@ -452,9 +468,16 @@ mod tests {
 
     #[test]
     fn mute_silences_frame() {
-        let params = Params { mute: true, ..Default::default() };
+        let params = Params {
+            mute: true,
+            ..Default::default()
+        };
         let ones = [1.0_f32; FRAME];
-        assert!(apply_processing(&ones, &ones, &params, &mut 1.0f32).iter().all(|&s| s == 0.0));
+        assert!(
+            apply_processing(&ones, &ones, &params, &mut 1.0f32)
+                .iter()
+                .all(|&s| s == 0.0)
+        );
     }
 
     fn clip(key: u64, samples: Vec<f32>) -> Clip {
@@ -476,7 +499,11 @@ mod tests {
         ] {
             let clip = Clip::new(7, std::sync::Arc::clone(&source), 0.5).with_trim(start, end);
             assert_eq!(clip.samples(), &source[range.clone()]);
-            assert_eq!(clip.samples().as_ptr(), source[range.clone()].as_ptr(), "even a trimmed clip shares its source buffer");
+            assert_eq!(
+                clip.samples().as_ptr(),
+                source[range.clone()].as_ptr(),
+                "even a trimmed clip shares its source buffer"
+            );
             let mut mixer = Mixer::default();
             mixer.play(clip, false);
             assert_eq!(mixer.playing_keys().is_empty(), range.is_empty());
@@ -488,19 +515,45 @@ mod tests {
     #[test]
     fn trimmed_playback_preserves_boundaries_progress_and_paused_route_handoffs() {
         let mut samples = vec![0.9; 12_000];
-        for level in [0.1, 0.2, 0.3, 0.4] { samples.extend(vec![level; 6_000]); }
+        for level in [0.1, 0.2, 0.3, 0.4] {
+            samples.extend(vec![level; 6_000]);
+        }
         samples.extend(vec![-0.9; 12_000]);
         let source = std::sync::Arc::new(samples);
         let mut mixer = Mixer::default();
-        mixer.play(Clip::new(7, std::sync::Arc::clone(&source), 0.5).with_trim(0.25, Some(0.75)), false);
+        mixer.play(
+            Clip::new(7, std::sync::Arc::clone(&source), 0.5).with_trim(0.25, Some(0.75)),
+            false,
+        );
         let mut first = vec![0.0; 6_000];
         mixer.mix(&mut first, 1.0);
-        assert_eq!(first, vec![0.05; 6_000], "skip the prefix and apply per-pad gain");
-        assert_eq!(mixer.progress(), [ClipProgress { key: 7, fraction: 0.25, paused: false, duration: 0.5 }], "progress is relative to the selected duration");
+        assert_eq!(
+            first,
+            vec![0.05; 6_000],
+            "skip the prefix and apply per-pad gain"
+        );
+        assert_eq!(
+            mixer.progress(),
+            [ClipProgress {
+                key: 7,
+                fraction: 0.25,
+                paused: false,
+                duration: 0.5
+            }],
+            "progress is relative to the selected duration"
+        );
         mixer.toggle_pause(7, false);
         let mut routed = Mixer::default();
         routed.resume(mixer.take_remaining());
-        assert_eq!(routed.progress(), [ClipProgress { key: 7, fraction: 0.25, paused: true, duration: 0.5 }]);
+        assert_eq!(
+            routed.progress(),
+            [ClipProgress {
+                key: 7,
+                fraction: 0.25,
+                paused: true,
+                duration: 0.5
+            }]
+        );
         let mut paused = [0.01; 32];
         routed.mix(&mut paused, 1.0);
         assert_eq!(paused, [0.01; 32]);
@@ -533,13 +586,19 @@ mod tests {
         assert!(mixer.playing_keys().is_empty());
 
         // Mute must not silence the soundboard.
-        let params = Params { mute: true, ..Default::default() };
+        let params = Params {
+            mute: true,
+            ..Default::default()
+        };
         let muted_mic = apply_processing(&[1.0; FRAME], &[1.0; FRAME], &params, &mut 1.0f32);
         mixer.play(clip(1, vec![0.25; FRAME]), false);
         let mut mixed = muted_mic;
         mixer.mix(&mut mixed, 0.5);
         assert!(mixed.iter().all(|&s| (s - 0.125).abs() < 1e-6));
-        assert!(mixer.playing_keys().is_empty(), "a clip ends on its last sample");
+        assert!(
+            mixer.playing_keys().is_empty(),
+            "a clip ends on its last sample"
+        );
     }
 
     #[test]
@@ -547,14 +606,24 @@ mod tests {
         let mut mixer = Mixer::default();
         mixer.play(clip(1, vec![0.1; FRAME * 4]), true);
         mixer.mix(&mut [0.0; FRAME], 1.0);
-        mixer.play(Clip::new(2, std::sync::Arc::new(vec![0.2; FRAME * 4]), 0.5), true);
+        mixer.play(
+            Clip::new(2, std::sync::Arc::new(vec![0.2; FRAME * 4]), 0.5),
+            true,
+        );
         let mut frame = [0.0; FRAME];
         mixer.mix(&mut frame, 1.0);
-        assert!(frame.iter().all(|&s| (s - 0.2).abs() < 1e-6), "0.1 + 0.2 * 0.5");
+        assert!(
+            frame.iter().all(|&s| (s - 0.2).abs() < 1e-6),
+            "0.1 + 0.2 * 0.5"
+        );
         assert_eq!(mixer.playing_keys(), vec![1, 2]);
 
         mixer.play(clip(1, vec![0.1; FRAME * 4]), true);
-        assert_eq!(mixer.playing_keys(), vec![2, 1], "pad 1 restarted, not doubled");
+        assert_eq!(
+            mixer.playing_keys(),
+            vec![2, 1],
+            "pad 1 restarted, not doubled"
+        );
 
         mixer.set_gain(2, 0.0);
         let mut frame = [0.0; FRAME];
@@ -562,7 +631,11 @@ mod tests {
         assert!(frame.iter().all(|&s| (s - 0.1).abs() < 1e-6));
 
         mixer.play(clip(3, vec![0.1; FRAME]), false);
-        assert_eq!(mixer.playing_keys(), vec![3], "without overlap a pad replaces the rest");
+        assert_eq!(
+            mixer.playing_keys(),
+            vec![3],
+            "without overlap a pad replaces the rest"
+        );
     }
 
     #[test]
@@ -575,21 +648,48 @@ mod tests {
         assert!(mixer.playing_keys().is_empty());
         let mut mic = [0.05; 8];
         mixer.mix(&mut mic, 1.0);
-        assert_eq!(mic, [0.05; 8], "paused audio contributes nothing to the mic");
-        assert_eq!(mixer.progress(), [ClipProgress { key: 1, fraction: 0.25, paused: true, duration: 4.0 / SR as f32 }], "the playhead stays put");
+        assert_eq!(
+            mic, [0.05; 8],
+            "paused audio contributes nothing to the mic"
+        );
+        assert_eq!(
+            mixer.progress(),
+            [ClipProgress {
+                key: 1,
+                fraction: 0.25,
+                paused: true,
+                duration: 4.0 / SR as f32
+            }],
+            "the playhead stays put"
+        );
 
         assert_eq!(mixer.toggle_pause(1, false), Some(false));
         let mut rest = [0.0; 3];
         mixer.mix(&mut rest, 1.0);
         assert_eq!(rest, [0.2, 0.3, 0.4], "resume does not replay the start");
         assert!(mixer.progress().is_empty());
-        assert_eq!(mixer.toggle_pause(1, false), None, "a finished clip can start again");
+        assert_eq!(
+            mixer.toggle_pause(1, false),
+            None,
+            "a finished clip can start again"
+        );
 
         mixer.play(clip(1, samples), false);
-        assert_eq!(mixer.progress(), [ClipProgress { key: 1, fraction: 0.0, paused: false, duration: 4.0 / SR as f32 }]);
+        assert_eq!(
+            mixer.progress(),
+            [ClipProgress {
+                key: 1,
+                fraction: 0.0,
+                paused: false,
+                duration: 4.0 / SR as f32
+            }]
+        );
         mixer.toggle_pause(1, false);
         mixer.stop();
-        assert!(mixer.progress().is_empty(), "Stop clips also discards paused playheads");
+        assert!(
+            mixer.progress().is_empty(),
+            "Stop clips also discards paused playheads"
+        );
     }
 
     #[test]
@@ -602,19 +702,45 @@ mod tests {
         let mut frame = [0.0; 2];
         mixer.mix(&mut frame, 1.0);
         assert_eq!(frame, [0.2; 2]);
-        assert_eq!(mixer.progress(), [
-            ClipProgress { key: 1, fraction: 0.25, paused: true, duration: 8.0 / SR as f32 },
-            ClipProgress { key: 2, fraction: 0.5, paused: false, duration: 8.0 / SR as f32 },
-        ]);
+        assert_eq!(
+            mixer.progress(),
+            [
+                ClipProgress {
+                    key: 1,
+                    fraction: 0.25,
+                    paused: true,
+                    duration: 8.0 / SR as f32
+                },
+                ClipProgress {
+                    key: 2,
+                    fraction: 0.5,
+                    paused: false,
+                    duration: 8.0 / SR as f32
+                },
+            ]
+        );
 
         mixer.toggle_pause(1, true);
         assert_eq!(mixer.playing_keys(), [1, 2], "resuming respects overlap");
         mixer.toggle_pause(1, true);
         mixer.toggle_pause(1, false);
-        assert_eq!(mixer.progress(), [ClipProgress { key: 1, fraction: 0.25, paused: false, duration: 8.0 / SR as f32 }], "without overlap, resuming replaces other clips");
+        assert_eq!(
+            mixer.progress(),
+            [ClipProgress {
+                key: 1,
+                fraction: 0.25,
+                paused: false,
+                duration: 8.0 / SR as f32
+            }],
+            "without overlap, resuming replaces other clips"
+        );
         mixer.toggle_pause(1, false);
         mixer.stop_key(1);
-        assert_eq!(mixer.toggle_pause(1, false), None, "removing a paused pad discards its playhead");
+        assert_eq!(
+            mixer.toggle_pause(1, false),
+            None,
+            "removing a paused pad discards its playhead"
+        );
     }
 
     #[test]
@@ -643,7 +769,10 @@ mod tests {
         resumed.resume(handed);
         let mut next = [0.0f32; 2];
         resumed.mix(&mut next, 1.0);
-        assert!((next[0] - 0.3).abs() < 1e-6 && (next[1] - 0.4).abs() < 1e-6, "{next:?}");
+        assert!(
+            (next[0] - 0.3).abs() < 1e-6 && (next[1] - 0.4).abs() < 1e-6,
+            "{next:?}"
+        );
 
         resumed.toggle_pause(7, false);
         let mut switched = Mixer::default();
@@ -651,7 +780,16 @@ mod tests {
         let mut silence = [0.0; 2];
         switched.mix(&mut silence, 1.0);
         assert_eq!(silence, [0.0; 2]);
-        assert_eq!(switched.progress(), [ClipProgress { key: 7, fraction: 0.625, paused: true, duration: 8.0 / SR as f32 }], "a route change preserves pause and position");
+        assert_eq!(
+            switched.progress(),
+            [ClipProgress {
+                key: 7,
+                fraction: 0.625,
+                paused: true,
+                duration: 8.0 / SR as f32
+            }],
+            "a route change preserves pause and position"
+        );
         switched.toggle_pause(7, false);
         switched.mix(&mut silence, 1.0);
         assert!((silence[0] - 0.5).abs() < 1e-6 && (silence[1] - 0.6).abs() < 1e-6);
@@ -671,16 +809,30 @@ mod tests {
     fn highpass_cuts_rumble_and_keeps_voice_band() {
         let mut rumble = tone(30.0);
         HighPass::new(HIGHPASS_HZ).process(&mut rumble);
-        assert!(tail_peak(&rumble) < 0.03, "30 Hz peak {}", tail_peak(&rumble));
+        assert!(
+            tail_peak(&rumble) < 0.03,
+            "30 Hz peak {}",
+            tail_peak(&rumble)
+        );
 
         let mut voice = tone(300.0);
         HighPass::new(HIGHPASS_HZ).process(&mut voice);
-        assert!(tail_peak(&voice) > 0.95, "300 Hz peak {}", tail_peak(&voice));
+        assert!(
+            tail_peak(&voice) > 0.95,
+            "300 Hz peak {}",
+            tail_peak(&voice)
+        );
     }
 
     #[test]
     fn highpass_response_matches_the_filter() {
-        for (freq, cutoff) in [(30.0, 80.0), (50.0, 80.0), (80.0, 80.0), (150.0, 80.0), (150.0, 160.0)] {
+        for (freq, cutoff) in [
+            (30.0, 80.0),
+            (50.0, 80.0),
+            (80.0, 80.0),
+            (150.0, 80.0),
+            (150.0, 160.0),
+        ] {
             let mut x = tone(freq);
             let mut hp = HighPass::new(HIGHPASS_HZ);
             hp.set_cutoff(cutoff); // retuning must give the same filter

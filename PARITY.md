@@ -1,66 +1,47 @@
-# Linux parity
+# Linux / Windows parity
 
-Windows is the reference. Status describes this tree: `working`, `partial`, `missing`, or `not possible`.
+Status of each Windows user-facing feature on Linux in this tree: `working`, `partial`, `missing`, or `not possible`.
 
 | Feature | Linux | Code |
 |---|---|---|
-| DeepFilterNet 3 noise suppression | working | `src/denoise.rs` |
-| RNNoise | working | `vendor/rnnoise`, `src/denoise.rs` |
-| Voice gate | working | `src/dsp.rs` |
-| Level gate (quiet cut-off) | working | `src/dsp.rs` |
-| Rumble filter | working | `src/dsp.rs` |
-| Input gain, output gain, noise-reduction strength | working | `src/dsp.rs`, `src/denoise.rs` |
-| Bypass | working | `src/dsp.rs`, `src/gui/mod.rs` |
-| Microphone mute | working | `src/engine.rs`, `src/gui/mod.rs` |
-| Live scope and draggable voice rows | working | `src/viz.rs`, `src/gui/mic_tab.rs` |
-| Processing presets, including saved ones | working | `src/config.rs`, `src/gui/mic_tab.rs` |
-| Microphone, processed output, and headphone monitor selection | working | `src/gui/routes.rs`, `src/engine.rs` |
-| Virtual cable for Discord and other apps | partial | `src/virtual_mic.rs` |
-| Make that cable the default microphone while running | working | `src/default_mic.rs`, `src/gui/mic_tab.rs` |
-| Live routing changes, clip playheads kept | working | `src/engine.rs` |
-| Reconnect after a device is unplugged | working | `src/engine.rs`, `src/gui/mod.rs` |
-| Wait for a saved device that connects after launch | working | `src/gui/mod.rs` |
-| Steady latency and clock-drift correction on OpenMic's own streams | working | `src/engine.rs` |
-| Audio threads in the Pro Audio / real-time class | partial | `src/engine.rs`, `Cargo.toml` |
-| Headphone monitor | working | `src/engine.rs`, `src/playback.rs` |
-| Test my mic (5 seconds, raw and cleaned, not into the cable) | working | `src/gui/mic_test.rs`, `src/playback.rs` |
-| Global hotkeys (mute, bypass, stop clips, dictation, each pad) | partial | `src/hotkeys.rs` |
-| Speech to text on this PC, including model download and removal | working | `src/dictation.rs` |
-| Type the transcript into the focused app | missing | `src/dictation.rs` |
-| Soundboard: add, play, pause, stop, reorder, search, overlap, volume, trim, star | working | `src/gui/sound_tab.rs`, `src/gui/clips.rs` |
-| Drop audio files onto the window | working | `src/gui/mod.rs` |
-| File dialogs for adding clips and saving a WAV | working | `src/gui/sound_tab.rs` |
-| Record the microphone to a WAV | working | `src/record.rs` |
-| Record computer audio from a playback device | partial | `src/record.rs` |
-| Notification area: keep running when the window closes, tray menu | missing | `src/tray.rs`, `src/gui/settings_tab.rs` |
-| Always-on-top strip | partial | `src/gui/overlay.rs` |
-| Minimize to the strip | working | `src/gui/mod.rs` |
-| Always show the strip | working | `src/gui/overlay.rs`, `src/config.rs` |
-| Strip drag, resize, pad scroll, and hover hints | partial | `src/gui/overlay.rs` |
-| Reopen at the saved window size and position | partial | `src/main.rs`, `src/gui/mod.rs` |
-| Start on login | partial | `src/config.rs` |
-| Start processing automatically | working | `src/config.rs`, `src/gui/mod.rs` |
-| One copy at a time; launching again shows the running window | partial | `src/instance.rs` |
-| In-app updates (daily check, download, verify, restart) | working | `src/update.rs`, `src/gui/updates.rs`, `.github/workflows/release.yml` |
-| Check for updates daily | working | `src/gui/settings_tab.rs`, `src/update.rs` |
-| Open the releases page, log folder, and settings folder | working | `src/gui/mod.rs` |
-| Light and dark theme following the system | working | `src/gui/mod.rs` |
-| Screen reader and keyboard navigation | working | `src/gui/mod.rs` |
-| Settings saved atomically, with a recovery screen if the file will not load | working | `src/config.rs`, `src/gui/startup.rs` |
+| DeepFilterNet 3 and RNNoise, voice gate, rumble filter, gains, level gate, bypass, mute, presets | working | `src/denoise.rs`, `src/dsp.rs`, `src/gui/mic_tab.rs` |
+| Live scope and the voice rows | working | `src/gui/mic_tab.rs`, `src/viz.rs` |
+| Microphone, processed output, and headphone monitor routing, with live changes and reconnect | working | `src/engine.rs`, `src/gui/routes.rs` |
+| Devices opened at their native format and resampled to the 48 kHz DSP core | working | `src/engine.rs`, `src/resample.rs` |
+| 10 ms PulseAudio buffers and clock-drift correction | working | `src/engine.rs` |
+| Real-time priority for audio threads | working | `src/rt.rs`, `src/engine.rs` — requests RealtimeKit priority and logs refusals |
+| Virtual cable (null sink and remap source), removed on exit | working | `src/virtual_mic.rs` |
+| Virtual cable at 48 kHz with a short buffer | working | `src/virtual_mic.rs` — PulseAudio buffer capped at 50 ms |
+| Virtual microphone becomes the default source while OpenMic runs, and the previous default is restored | working | `src/default_mic.rs` |
+| Separate communications default device | not possible | `src/default_mic.rs` — PulseAudio has one default source, so console and communications both follow it |
+| First-run checklist, including creating the virtual microphone | working | `src/gui/mic_tab.rs`, `src/virtual_mic.rs` |
+| Record the microphone | working | `src/record.rs` |
+| Record computer audio from an output's monitor source | working | `src/record.rs` — matches the PulseAudio name |
+| Test my mic (raw and cleaned, never into the virtual cable) | working | `src/playback.rs`, `src/gui/mic_test.rs` |
+| Soundboard pads, trim, search, overlap, drag-and-drop reorder, WAV/FLAC/OGG/MP3/AIFF | working | `src/gui/clips.rs`, `src/decode.rs`, `src/gui/sound_tab.rs` |
+| Drag clips onto the window | working | `src/gui/mod.rs` |
+| Global hotkeys on X11 (mute, bypass, stop clips, dictation, pads) | working | `src/hotkeys.rs` |
+| Global hotkeys on Wayland | missing | `src/hotkeys.rs` — `global-hotkey` grabs keys on X11 only |
+| Dictation transcription on this computer, including model download | working | `src/dictation.rs` |
+| Dictation typed into the focused app | X11 | `src/x11_type.rs` — on Wayland the transcript is shown and can be copied |
+| Notification area, close-to-tray, and the tray menu | working | `src/tray.rs`, `src/gui/settings_tab.rs` — requires a StatusNotifier host; closing quits if the tray cannot start |
+| A second launch shows the running window | working | `src/instance.rs` |
+| Start on login | working | `src/config.rs` — respects disabled XDG autostart entries |
+| Start processing automatically, and wait for a device that connects after launch | working | `src/gui/mod.rs`, `src/config.rs` |
+| Window on X11 | working | `Cargo.toml`, `src/main.rs` — GLX, then EGL, on the glutin eframe already links |
+| Window on Wayland | working | `Cargo.toml`, `src/main.rs` — EGL `wl_egl_window`. The compositor draws the frame, or winit's fallback frame does when the compositor asks for client-side decorations |
+| Restored window position kept on a connected monitor | working on X11 | `src/monitors.rs`, `src/gui/mod.rs` |
+| Initial window size fitted to the work area | working on X11 | `src/monitors.rs`, `src/main.rs` |
+| Always-on-top strip on X11 | partial | `src/gui/overlay.rs` — `with_always_on_top` asks for `_NET_WM_STATE_ABOVE` once. `raise_meter` does not run again when another window is focused |
+| Always-on-top strip on Wayland | not possible | `src/gui/overlay.rs` — xdg-shell has no stacking request. A layer-shell surface would replace the strip. The compositor's keep-above rule is the equivalent |
+| Strip hover hints kept inside the monitor work area | partial | `src/gui/overlay.rs` — `monitor_work_area` is `None` |
+| Minimize to the strip, and always show the strip | working | `src/gui/overlay.rs`, `src/gui/settings_tab.rs` |
+| System light or dark theme | partial | winit reports no system theme on X11 (`theme` is `None`) and on Wayland only a theme this process already set, so egui stays on its dark fallback |
+| Screen reader | working | `Cargo.toml` (eframe `accesskit`, `accesskit_unix`) |
+| One running copy (lock) | working | `src/instance.rs` |
+| Settings saved across launches | working | `src/config.rs` |
+| File open and save dialogs | working | `src/gui/mod.rs` (rfd, xdg-desktop-portal) |
+| Open a link, a folder, or the releases page | working | `src/gui/mod.rs` — uses `xdg-open` on Linux and Explorer on Windows |
+| In-app updater and the daily update check | working | `src/update.rs`, `src/gui/updates.rs`, `.github/workflows/release.yml` — Linux x86_64 installs the signed release archive; other Linux architectures have no published archive |
+| Open log folder | working | `src/gui/settings_tab.rs`, `src/gui/mod.rs` |
 | Log file | working | `src/logfile.rs` |
-| First-run setup checklist | working | `src/gui/mic_tab.rs` |
-
-## Notes
-
-- **Virtual cable.** `pactl` creates **OpenMic Virtual Cable** and **OpenMic Microphone**, and removes them on exit. The null sink keeps the server's default rate and buffer, often 44.1 kHz and about 2 seconds. OpenMic's own streams still request 10 ms.
-- **Default microphone.** PulseAudio has one default source, not Windows' separate console and communications roles. OpenMic saves and restores that one source. That is the native equivalent.
-- **Real-time priority.** The processing thread calls `promote_current_thread_to_real_time`, but `audio_thread_priority` is built without dbus, so on Linux the call leaves the thread at normal priority. Capture and playback callbacks are not raised. Windows joins the Pro Audio class.
-- **Hotkeys.** X11 grabs work through `global-hotkey`. Wayland sessions do not: that crate has no Wayland backend. The native equivalent is the GlobalShortcuts portal. It is not implemented, so this is missing on Wayland and working on X11.
-- **Dictation typing.** Linux keeps the transcript on the page to copy. Windows types it into the focused window.
-- **Computer audio.** Recording opens a monitor source whose description is `Monitor of {output}`. PulseAudio translates that description, so a non-English label does not match and can be chosen as a microphone.
-- **Notification area.** `Tray::new` fails. Closing the window quits. The close-to-tray setting is hidden. There is no tray icon to reopen a hidden window.
-- **Strip and window placement.** The strip asks to stay on top, but nothing re-raises it after another window or the panel covers it, and Wayland has no standard always-on-top flag. Hover hints and the restored window are not fitted to a work area: `monitor_work_area` returns nothing, `on_a_monitor` accepts every position, and `work_area_size` returns nothing. A saved position can reopen off-screen.
-- **Start on login.** OpenMic writes `~/.config/autostart/openmic.desktop` and treats any existing file as enabled, including one a desktop disabled. The command passes `--minimized`, which suppresses the strip, and there is no tray for that launch to hide in.
-- **Second launch.** The lock file stops another process. It does not ask the running copy to show its window.
-- **Updates.** The published Linux build is x86_64. Its updater downloads `openmic-<tag>-linux-x86_64.tar.gz`, checks the SHA-256 and Ed25519 signature, and replaces the running binary with the `openmic` file inside the archive. Other architectures are not possible until a release publishes an archive for them. Windows still installs `openmic-<tag>-windows-x64.exe`.
-- **Links and folders.** `xdg-open` opens the releases page, the log folder, and the settings folder. Windows still uses Explorer. A missing `xdg-open` is written to the log.

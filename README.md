@@ -18,7 +18,7 @@ Audio stays on your computer. Nothing is kept unless you use **Record** or speec
 - Live routing changes with automatic stream handoff (soundboard playheads preserved)
 - Recovers on its own when a device is unplugged and plugged back in
 - Low, steady latency: output queues hold ~25 ms and track clock drift between devices, so the delay never creeps up over a long session
-- Audio threads run in Windows' Pro Audio scheduling class, for fewer dropouts under load
+- Audio threads run in Windows' Pro Audio scheduling class, and on Linux at real-time priority through RealtimeKit, for fewer dropouts under load
 - Noise-reduction strength, input/output gain and an optional level-based gate
 - Processing presets (Balanced, Mechanical keyboard, Quiet room, Noisy room, Low CPU) plus your own
 - Live bypass and microphone mute
@@ -45,13 +45,15 @@ Prebuilt Windows x64 executables are attached to each [GitHub release](https://g
 
 ## Linux
 
-Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://github.com/DevanMetz/openmic/releases), extract it, and run `./openmic`. A running x86_64 copy can update itself: click the version number, then **Update** and **Restart to update**. OpenMic downloads that archive, checks its SHA-256 checksum and signature, and replaces the binary that is running. PulseAudio, or PipeWire with `pipewire-pulse`, and the `pactl` command are required (`pulseaudio-utils` on Debian/Ubuntu, `pipewire-pulse` on PipeWire-only systems). Without them OpenMic still runs, but has no virtual microphone. Links and folders open with `xdg-open` (`xdg-utils`).
+Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://github.com/DevanMetz/openmic/releases), extract it, and run `./openmic`. A running x86_64 copy can update itself: click the version number, then **Update** and **Restart to update**. OpenMic downloads that archive, checks its SHA-256 checksum and signature, and replaces the binary that is running. PulseAudio, or PipeWire with `pipewire-pulse`, and the `pactl` command are required (`pulseaudio-utils` on Debian/Ubuntu, `pipewire-pulse` on PipeWire-only systems). Without them OpenMic still runs, but has no virtual microphone. Links and folders open with `xdg-open` (`xdg-utils`). The window opens on Wayland and on X11.
 
-While OpenMic runs it creates a null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord/OBS/browsers to select as their microphone. Both are removed when OpenMic exits, and leftovers from a crash are replaced on the next launch. **Start on login** writes an XDG autostart entry. OpenMic uses 10 ms PulseAudio buffers, takes a single-instance lock, and records computer audio from the selected output's monitor source.
+While OpenMic runs it creates a 48 kHz stereo null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord, OBS and browsers. Both are removed on exit. A leftover from a crash, or a cable that is not 48 kHz stereo, is replaced on the next launch. On PulseAudio the cable's buffer is capped at 50 ms instead of the null sink's 2 s default. OpenMic opens its streams at 10 ms. **Start on login** writes an XDG autostart entry and opens OpenMic the way you left it. Turning that entry off in the desktop’s startup settings leaves it off. Launching OpenMic again brings the running window back. Computer audio is recorded from the selected output's monitor source, matched by its PulseAudio name so a translated description still records the selected output and is not chosen as a microphone. On X11, a window or strip saved on a monitor that is no longer connected opens on a connected one, and the window is fitted to the work area. Audio threads ask RealtimeKit (`rtkit`) for real-time priority; without it they keep normal priority and OpenMic logs the refusal.
 
-To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
+Closing the window hides OpenMic in the notification area when the desktop shows StatusNotifier icons, and quits otherwise.
 
-Not available on Linux: the notification-area tray (closing the window quits), dictation typing into other apps (the transcript is shown and can be copied), and global hotkeys on Wayland (they work on X11). Other CPU architectures have no published archive, so they have no in-app updater.
+To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libdbus-1-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
+
+Not available on Linux: global hotkeys on Wayland (they work on X11). Other CPU architectures have no published archive, so they have no in-app updater. Dictation types into the focused app on X11; on Wayland the transcript is shown to copy.
 
 ## Windows requirements
 
@@ -184,7 +186,7 @@ Holding **Enter** or **Space** on **Set…** opens capture once. Release that ke
 
 Focused settings stay visible when you resize the window. Clicking **Cancel** or **Clear** in a shortcut row keeps the page where you scrolled.
 
-Closing the window hides OpenMic to the notification area, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
+Closing the window hides OpenMic to the notification area when one is available, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
 
 ## Updates
 

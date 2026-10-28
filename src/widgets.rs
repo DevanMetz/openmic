@@ -16,7 +16,11 @@ const LIGHT_CYAN: Color32 = Color32::from_rgb(0x07, 0x59, 0x85);
 pub fn configure_text_styles(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         let visuals = &mut style.visuals;
-        visuals.weak_text_color = Some(Color32::from_gray(if visuals.dark_mode { 160 } else { 100 }));
+        visuals.weak_text_color = Some(Color32::from_gray(if visuals.dark_mode {
+            160
+        } else {
+            100
+        }));
         if !visuals.dark_mode {
             visuals.hyperlink_color = LIGHT_CYAN;
         }
@@ -47,28 +51,70 @@ pub fn text_color(ui: &egui::Ui, accent: Color32) -> Color32 {
 /// Consume an action before focus moves to a replacement control.
 pub fn finish_keyboard_activation(ctx: &egui::Context) {
     let id = egui::Id::new(("held-activation", ctx.viewport_id()));
-    let (enter, space, space_pressed) = ctx.input(|input| (input.key_down(egui::Key::Enter),
-        input.key_down(egui::Key::Space), input.key_pressed(egui::Key::Space)));
-    ctx.input_mut(|input| input.events.retain(|event| !matches!(event,
-        egui::Event::Key { key: egui::Key::Enter | egui::Key::Space, pressed: true, .. })
-        && !((space || space_pressed) && matches!(event, egui::Event::Text(text) if text == " "))));
+    let (enter, space, space_pressed) = ctx.input(|input| {
+        (
+            input.key_down(egui::Key::Enter),
+            input.key_down(egui::Key::Space),
+            input.key_pressed(egui::Key::Space),
+        )
+    });
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Enter | egui::Key::Space,
+                    pressed: true,
+                    ..
+                }
+            ) && !((space || space_pressed)
+                && matches!(event, egui::Event::Text(text) if text == " "))
+        })
+    });
     ctx.data_mut(|data| {
-        if enter || space { data.insert_temp(id, (enter, space)); }
-        else { data.remove::<(bool, bool)>(id); }
+        if enter || space {
+            data.insert_temp(id, (enter, space));
+        } else {
+            data.remove::<(bool, bool)>(id);
+        }
     });
 }
 
 /// Ignore repeats of a completed action until its activation keys are released.
 pub fn consume_held_activation(ctx: &egui::Context) {
     let id = egui::Id::new(("held-activation", ctx.viewport_id()));
-    let Some((mut enter, mut space)) = ctx.data(|data| data.get_temp::<(bool, bool)>(id)) else { return };
+    let Some((mut enter, mut space)) = ctx.data(|data| data.get_temp::<(bool, bool)>(id)) else {
+        return;
+    };
     if ctx.input(|input| input.focused) {
         ctx.input_mut(|input| {
             input.events.retain(|event| match event {
-                egui::Event::Key { key: egui::Key::Enter, pressed: false, .. } => { enter = false; true },
-                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => { space = false; true },
-                egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => !enter,
-                egui::Event::Key { key: egui::Key::Space, pressed: true, .. } => !space,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: false,
+                    ..
+                } => {
+                    enter = false;
+                    true
+                }
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    pressed: false,
+                    ..
+                } => {
+                    space = false;
+                    true
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    ..
+                } => !enter,
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    pressed: true,
+                    ..
+                } => !space,
                 egui::Event::Text(text) if space && text == " " => false,
                 _ => true,
             });
@@ -76,24 +122,38 @@ pub fn consume_held_activation(ctx: &egui::Context) {
             enter &= input.key_down(egui::Key::Enter);
             space &= input.key_down(egui::Key::Space);
         });
-    } else { enter = false; space = false; }
+    } else {
+        enter = false;
+        space = false;
+    }
     ctx.data_mut(|data| {
-        if enter || space { data.insert_temp(id, (enter, space)); }
-        else { data.remove::<(bool, bool)>(id); }
+        if enter || space {
+            data.insert_temp(id, (enter, space));
+        } else {
+            data.remove::<(bool, bool)>(id);
+        }
     });
 }
 
 /// Reveal focused controls when navigating or resizing the viewport.
 pub fn scroll_on_focus(response: &Response) {
-    let layout = (response.ctx.content_rect().size(), response.ctx.zoom_factor());
-    let id = response.id.with(("focus-viewport", response.ctx.viewport_id()));
+    let layout = (
+        response.ctx.content_rect().size(),
+        response.ctx.zoom_factor(),
+    );
+    let id = response
+        .id
+        .with(("focus-viewport", response.ctx.viewport_id()));
     let reflowed = response.ctx.data_mut(|data| {
         let previous = data.get_temp::<(Vec2, f32)>(id);
         data.insert_temp(id, layout);
         previous.is_some_and(|previous| previous != layout)
     });
-    if response.has_focus() && (response.gained_focus() || reflowed)
-        && response.ctx.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+    if response.has_focus()
+        && (response.gained_focus() || reflowed)
+        && response
+            .ctx
+            .input(|input| !input.pointer.any_down() && !input.pointer.any_released())
     {
         response.scroll_to_me(Some(Align::Center));
     }
@@ -122,7 +182,12 @@ pub fn card<R>(
             ui.horizontal(|ui| {
                 let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 14.0), Sense::hover());
                 ui.painter().rect_filled(bar, 1.5, accent);
-                ui.label(egui::RichText::new(title).strong().size(13.0).color(text_color(ui, accent)));
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(13.0)
+                        .color(text_color(ui, accent)),
+                );
                 ui.with_layout(Layout::right_to_left(Align::Center), header_right);
             });
             ui.add_space(6.0);
@@ -134,9 +199,9 @@ pub fn card<R>(
 /// A small rounded status badge.
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
     let foreground = text_color(ui, color);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), FontId::proportional(11.0), foreground);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), FontId::proportional(11.0), foreground);
     let size = galley.size() + Vec2::new(14.0, 4.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter()
@@ -295,7 +360,13 @@ pub fn level_meter(ui: &mut egui::Ui, label: &str, peak: Option<f32>, hold: &mut
 /// quiet speech still shows. `peaks` holds one level per time block. With
 /// `window` set, that many blocks span the width and the newest sits at the
 /// right edge (a live, scrolling view); otherwise all of `peaks` is fitted.
-pub fn waveform(ui: &mut egui::Ui, peaks: &[f32], window: Option<usize>, height: f32, color: Color32) -> Response {
+pub fn waveform(
+    ui: &mut egui::Ui,
+    peaks: &[f32],
+    window: Option<usize>,
+    height: f32,
+    color: Color32,
+) -> Response {
     const FLOOR_DB: f32 = -48.0;
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
@@ -304,7 +375,10 @@ pub fn waveform(ui: &mut egui::Ui, peaks: &[f32], window: Option<usize>, height:
     painter.rect_filled(rect, CornerRadius::same(6), visuals.extreme_bg_color);
     let mid = rect.center().y;
     painter.line_segment(
-        [Pos2::new(rect.left() + 4.0, mid), Pos2::new(rect.right() - 4.0, mid)],
+        [
+            Pos2::new(rect.left() + 4.0, mid),
+            Pos2::new(rect.right() - 4.0, mid),
+        ],
         Stroke::new(1.0, outline(visuals).gamma_multiply(0.5)),
     );
 
@@ -324,7 +398,10 @@ pub fn waveform(ui: &mut egui::Ui, peaks: &[f32], window: Option<usize>, height:
         let h = ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * half;
         let x = rect.left() + 4.0 + column as f32 * 3.0 + 1.0;
         painter.line_segment(
-            [Pos2::new(x, mid - h.max(0.5)), Pos2::new(x, mid + h.max(0.5))],
+            [
+                Pos2::new(x, mid - h.max(0.5)),
+                Pos2::new(x, mid + h.max(0.5)),
+            ],
             Stroke::new(2.0, color),
         );
     }

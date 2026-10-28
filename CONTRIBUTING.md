@@ -1,10 +1,10 @@
 # Contributing to OpenMic
 
-OpenMic is a Windows Rust desktop app with real-time audio processing. Focused pull requests for audio behavior, device handling, UI, tests, and documentation are welcome.
+OpenMic is a Rust desktop app for Windows and Linux with real-time audio processing. Focused pull requests for audio behavior, device handling, UI, tests, and documentation are welcome.
 
 ## Build and check
 
-Follow the [requirements and build instructions](README.md#requirements) for the Rust MSVC toolchain, Clang, and the optional VB-Audio Virtual Cable. The first build fetches a pinned DeepFilterNet dependency.
+Follow the [Windows requirements](README.md#windows-requirements) or the [Linux](README.md#linux) build instructions. The first build fetches a pinned DeepFilterNet dependency.
 
 ```sh
 cargo test
