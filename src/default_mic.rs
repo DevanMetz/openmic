@@ -8,7 +8,7 @@
 //! SoundSwitch do. COM work runs on a short-lived MTA thread so it never
 //! touches the GUI thread's apartment. Linux uses pactl's default source.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 /// The default recording endpoints before OpenMic changed them, persisted so
@@ -62,11 +62,18 @@ fn restore_roles(
     let mut failure = None;
     for (before, current, role) in [
         (&saved.console, &now.console, Role::Console),
-        (&saved.communications, &now.communications, Role::Communications),
+        (
+            &saved.communications,
+            &now.communications,
+            Role::Communications,
+        ),
     ] {
         // Do not rewrite a role the user changed. A missing old endpoint for
         // one role must not prevent the other role from being restored.
-        if current == ours && before != current && let Err(e) = set_role(before, role) {
+        if current == ours
+            && before != current
+            && let Err(e) = set_role(before, role)
+        {
             failure.get_or_insert(e);
         }
     }
@@ -88,17 +95,17 @@ fn on_com_thread<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'stat
 #[cfg(windows)]
 #[allow(non_snake_case)] // COM method names
 mod imp {
-    use anyhow::{anyhow, Context, Result};
-    use windows::core::{interface, IUnknown, IUnknown_Vtbl, GUID, HRESULT, PCWSTR};
+    use anyhow::{Context, Result, anyhow};
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
     use windows::Win32::Media::Audio::{
-        eCapture, eCommunications, eConsole, ERole, IMMDeviceEnumerator, MMDeviceEnumerator,
-        DEVICE_STATE_ACTIVE,
+        DEVICE_STATE_ACTIVE, ERole, IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+        eCommunications, eConsole,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
-        STGM_READ,
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+        CoUninitialize, STGM_READ,
     };
+    use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR, interface};
 
     use super::{Role, SavedDefaults};
 
@@ -167,7 +174,10 @@ mod imp {
         let id = |role| -> Result<String> {
             take_id(unsafe { e.GetDefaultAudioEndpoint(eCapture, role)?.GetId() }?)
         };
-        Ok(SavedDefaults { console: id(eConsole)?, communications: id(eCommunications)? })
+        Ok(SavedDefaults {
+            console: id(eConsole)?,
+            communications: id(eCommunications)?,
+        })
     }
 
     pub fn set_role(id: &str, role: Role) -> Result<()> {
@@ -190,7 +200,7 @@ mod imp {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
 
     use super::{Role, SavedDefaults};
 
@@ -213,7 +223,10 @@ mod imp {
         if source.is_empty() {
             bail!("pactl returned no default source");
         }
-        Ok(SavedDefaults { console: source.clone(), communications: source })
+        Ok(SavedDefaults {
+            console: source.clone(),
+            communications: source,
+        })
     }
 
     pub fn set_role(id: &str, _role: Role) -> Result<()> {
@@ -264,7 +277,10 @@ mod imp {
         fn source_names_skip_the_index_and_extra_columns() {
             let text = "0\talsa_output.pci.monitor\tmodule-alsa-card.c\ts16le 2ch 48000Hz\tSUSPENDED\n\
                         1\topenmic_mic\tmodule-remap-source.c\tfloat32le 1ch 48000Hz\tIDLE\n";
-            assert_eq!(source_names(text), ["alsa_output.pci.monitor", "openmic_mic"]);
+            assert_eq!(
+                source_names(text),
+                ["alsa_output.pci.monitor", "openmic_mic"]
+            );
             assert!(source_names("").is_empty());
         }
     }
@@ -273,7 +289,7 @@ mod imp {
 #[cfg(all(not(windows), not(target_os = "linux")))]
 mod imp {
     use super::{Role, SavedDefaults};
-    use anyhow::{anyhow, Result};
+    use anyhow::{Result, anyhow};
 
     pub struct ComApartment;
 
@@ -284,10 +300,14 @@ mod imp {
         Ok(None)
     }
     pub fn current() -> Result<SavedDefaults> {
-        Err(anyhow!("default devices are not supported on this platform"))
+        Err(anyhow!(
+            "default devices are not supported on this platform"
+        ))
     }
     pub fn set_role(_: &str, _: Role) -> Result<()> {
-        Err(anyhow!("default devices are not supported on this platform"))
+        Err(anyhow!(
+            "default devices are not supported on this platform"
+        ))
     }
 }
 
@@ -296,7 +316,10 @@ mod tests {
     use super::*;
 
     fn defaults(console: &str, communications: &str) -> SavedDefaults {
-        SavedDefaults { console: console.into(), communications: communications.into() }
+        SavedDefaults {
+            console: console.into(),
+            communications: communications.into(),
+        }
     }
 
     #[test]
@@ -322,10 +345,21 @@ mod tests {
         let mut restored = Vec::new();
         let result = restore_roles(&saved, "cable", &now, |id, role| {
             restored.push((id.to_owned(), role));
-            if role == Role::Console { Err(anyhow!("endpoint unavailable")) } else { Ok(()) }
+            if role == Role::Console {
+                Err(anyhow!("endpoint unavailable"))
+            } else {
+                Ok(())
+            }
         });
-        assert!(result.is_err(), "keep the recovery snapshot for a later retry");
-        assert_eq!(restored.len(), 2, "communications is attempted even if console fails");
+        assert!(
+            result.is_err(),
+            "keep the recovery snapshot for a later retry"
+        );
+        assert_eq!(
+            restored.len(),
+            2,
+            "communications is attempted even if console fails"
+        );
 
         now.communications = "headset".into();
         restored.clear();
@@ -339,9 +373,12 @@ mod tests {
 
     #[test]
     fn defaults_that_already_pointed_at_cable_need_no_restore() {
-        restore_roles(&defaults("cable", "cable"), "cable", &defaults("cable", "cable"), |_, _| {
-            panic!("unchanged defaults should not be rewritten")
-        })
+        restore_roles(
+            &defaults("cable", "cable"),
+            "cable",
+            &defaults("cable", "cable"),
+            |_, _| panic!("unchanged defaults should not be rewritten"),
+        )
         .unwrap();
     }
 }

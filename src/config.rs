@@ -1,4 +1,8 @@
-use std::{fs, io::Write, path::{Path, PathBuf}};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -6,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::default_mic::SavedDefaults;
 use crate::dictation::SpeechModel;
-use crate::dsp::{Model, HIGHPASS_HZ, VOICE_THRESHOLD};
+use crate::dsp::{HIGHPASS_HZ, Model, VOICE_THRESHOLD};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -163,14 +167,31 @@ pub struct Pad {
 
 impl Pad {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, name: None, volume: 1.0, hotkey: None, start: 0.0, end: None, starred: false }
+        Self {
+            path,
+            name: None,
+            volume: 1.0,
+            hotkey: None,
+            start: 0.0,
+            end: None,
+            starred: false,
+        }
     }
 
     pub fn display_name(&self) -> String {
-        self.name.as_deref().filter(|name| !name.trim().is_empty()).map_or_else(
-            || self.path.file_stem().unwrap_or(self.path.as_os_str()).to_string_lossy().into_owned(),
-            str::to_owned,
-        )
+        self.name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map_or_else(
+                || {
+                    self.path
+                        .file_stem()
+                        .unwrap_or(self.path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned()
+                },
+                str::to_owned,
+            )
     }
 }
 
@@ -203,9 +224,23 @@ impl From<PadRepr> for Pad {
     fn from(repr: PadRepr) -> Self {
         match repr {
             PadRepr::Path(path) => Pad::new(path),
-            PadRepr::Full { path, name, volume, hotkey, start, end, starred } => {
-                Pad { path, name, volume, hotkey, start, end, starred }
-            }
+            PadRepr::Full {
+                path,
+                name,
+                volume,
+                hotkey,
+                start,
+                end,
+                starred,
+            } => Pad {
+                path,
+                name,
+                volume,
+                hotkey,
+                start,
+                end,
+                starred,
+            },
         }
     }
 }
@@ -285,14 +320,25 @@ pub struct Preset {
 pub fn builtin_presets() -> Vec<Preset> {
     let base = Processing::default();
     vec![
-        Preset { name: "Balanced".into(), processing: base.clone() },
+        Preset {
+            name: "Balanced".into(),
+            processing: base.clone(),
+        },
         Preset {
             name: "Mechanical keyboard".into(),
-            processing: Processing { voice_threshold: 0.75, highpass_hz: 100.0, ..base.clone() },
+            processing: Processing {
+                voice_threshold: 0.75,
+                highpass_hz: 100.0,
+                ..base.clone()
+            },
         },
         Preset {
             name: "Quiet room".into(),
-            processing: Processing { strength: 0.7, voice_gate: false, ..base.clone() },
+            processing: Processing {
+                strength: 0.7,
+                voice_gate: false,
+                ..base.clone()
+            },
         },
         Preset {
             name: "Noisy room".into(),
@@ -306,7 +352,10 @@ pub fn builtin_presets() -> Vec<Preset> {
         },
         Preset {
             name: "Low CPU".into(),
-            processing: Processing { model: Model::Rnnoise, ..base },
+            processing: Processing {
+                model: Model::Rnnoise,
+                ..base
+            },
         },
     ]
 }
@@ -346,15 +395,27 @@ impl Settings {
     /// use or save: serde_json would otherwise silently write them as null.
     fn validate(&self) -> Result<()> {
         self.processing().validate()?;
-        validate_finite(&[("monitor_volume", self.monitor_volume), ("sound_volume", self.sound_volume)])?;
+        validate_finite(&[
+            ("monitor_volume", self.monitor_volume),
+            ("sound_volume", self.sound_volume),
+        ])?;
         for pad in &self.sounds {
-            validate_finite(&[("volume", pad.volume), ("start", pad.start), ("end", pad.end.unwrap_or_default())])
-                .with_context(|| format!("soundboard pad '{}'", pad.display_name()))?;
+            validate_finite(&[
+                ("volume", pad.volume),
+                ("start", pad.start),
+                ("end", pad.end.unwrap_or_default()),
+            ])
+            .with_context(|| format!("soundboard pad '{}'", pad.display_name()))?;
         }
         for preset in &self.presets {
-            preset.processing.validate().with_context(|| format!("preset '{}'", preset.name))?;
+            preset
+                .processing
+                .validate()
+                .with_context(|| format!("preset '{}'", preset.name))?;
         }
-        if let Some(width) = self.strip_width { validate_finite(&[("strip_width", width)])?; }
+        if let Some(width) = self.strip_width {
+            validate_finite(&[("strip_width", width)])?;
+        }
         if let Some([width, height]) = self.window_size {
             validate_finite(&[("window width", width), ("window height", height)])?;
         }
@@ -372,24 +433,35 @@ impl Settings {
     fn retry_from(&self, path: &Path) -> Self {
         // Retry the failed source, not unrelated older copies. Moving the bad
         // file aside must allow a fresh start instead of reviving stale settings.
-        let sources: Vec<_> = self.load_error.iter().map(|error| error.path.clone()).collect();
+        let sources: Vec<_> = self
+            .load_error
+            .iter()
+            .map(|error| error.path.clone())
+            .collect();
         Self::load_from(path, &sources)
     }
 
     fn load_from(path: &Path, legacy: &[PathBuf]) -> Self {
         for source in std::iter::once(path).chain(legacy.iter().map(PathBuf::as_path)) {
             let result = match fs::read(source) {
-                Ok(bytes) => serde_json::from_slice::<Self>(&bytes).context("Parse settings").and_then(|settings| {
-                    settings.validate().context("Validate settings")?;
-                    Ok(settings)
-                }),
+                Ok(bytes) => serde_json::from_slice::<Self>(&bytes)
+                    .context("Parse settings")
+                    .and_then(|settings| {
+                        settings.validate().context("Validate settings")?;
+                        Ok(settings)
+                    }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => Err(anyhow::Error::new(error).context("Read settings")),
             };
             match result {
                 Ok(settings) => {
-                    if source != path && let Err(error) = settings.save_to(path) {
-                        crate::logfile::warn(format_args!("could not migrate settings to {}: {error:#}", path.display()));
+                    if source != path
+                        && let Err(error) = settings.save_to(path)
+                    {
+                        crate::logfile::warn(format_args!(
+                            "could not migrate settings to {}: {error:#}",
+                            path.display()
+                        ));
                     }
                     return settings;
                 }
@@ -397,11 +469,17 @@ impl Settings {
                     // Legacy sources can be a bare filename. Keep their full
                     // location so the recovery screen can open the right folder.
                     let source = std::path::absolute(source).unwrap_or_else(|_| source.to_owned());
-                    crate::logfile::error(format_args!("settings not loaded from {}: {error:#}", source.display()));
+                    crate::logfile::error(format_args!(
+                        "settings not loaded from {}: {error:#}",
+                        source.display()
+                    ));
                     // Do not replace an unreadable file with defaults or an older
                     // legacy copy. This guard also blocks shutdown/autosave writes.
                     return Self {
-                        load_error: Some(SettingsLoadError { path: source, message: format!("{error:#}") }),
+                        load_error: Some(SettingsLoadError {
+                            path: source,
+                            message: format!("{error:#}"),
+                        }),
                         ..Self::default()
                     };
                 }
@@ -416,17 +494,27 @@ impl Settings {
 
     fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(error) = &self.load_error {
-            anyhow::bail!("Settings were not loaded from {}; retry loading before saving", error.path.display());
+            anyhow::bail!(
+                "Settings were not loaded from {}; retry loading before saving",
+                error.path.display()
+            );
         }
         self.validate().context("Validate settings")?;
         let text = serde_json::to_string_pretty(self).context("serialize settings")?;
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         fs::create_dir_all(parent).context("create OpenMic settings directory")?;
         // Write beside the destination so replacement is atomic. A failed
         // write must leave the previous settings (and saved mic defaults) intact.
-        let mut file = tempfile::NamedTempFile::new_in(parent).context("create settings temporary file")?;
-        file.write_all(text.as_bytes()).context("write settings temporary file")?;
-        file.as_file().sync_all().context("flush settings temporary file")?;
+        let mut file =
+            tempfile::NamedTempFile::new_in(parent).context("create settings temporary file")?;
+        file.write_all(text.as_bytes())
+            .context("write settings temporary file")?;
+        file.as_file()
+            .sync_all()
+            .context("flush settings temporary file")?;
         file.persist(path)
             .map_err(|e| e.error)
             .with_context(|| format!("replace {}", path.display()))?;
@@ -443,14 +531,21 @@ thread_local! {
 pub(crate) fn use_settings_path_for_test(path: &Path) -> impl Drop {
     struct Restore(Option<PathBuf>, std::marker::PhantomData<std::rc::Rc<()>>);
     impl Drop for Restore {
-        fn drop(&mut self) { SETTINGS_PATH_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take()); }
+        fn drop(&mut self) {
+            SETTINGS_PATH_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
     }
-    Restore(SETTINGS_PATH_FOR_TEST.with(|slot| slot.replace(Some(path.to_owned()))), std::marker::PhantomData)
+    Restore(
+        SETTINGS_PATH_FOR_TEST.with(|slot| slot.replace(Some(path.to_owned()))),
+        std::marker::PhantomData,
+    )
 }
 
 pub fn settings_path() -> PathBuf {
     #[cfg(test)]
-    if let Some(path) = SETTINGS_PATH_FOR_TEST.with(|slot| slot.borrow().clone()) { return path; }
+    if let Some(path) = SETTINGS_PATH_FOR_TEST.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
     // Tests exercise code that saves settings; keep them off the real file.
     if cfg!(test) {
         return std::env::temp_dir()
@@ -490,7 +585,9 @@ fn isolated_settings_paths_restore_nested_scopes_and_do_not_cross_threads() {
         }
         assert_eq!(settings_path(), outer);
         let expected = original.clone();
-        std::thread::spawn(move || assert_eq!(settings_path(), expected)).join().unwrap();
+        std::thread::spawn(move || assert_eq!(settings_path(), expected))
+            .join()
+            .unwrap();
         assert_eq!(settings_path(), outer);
     }
     assert_eq!(settings_path(), original);
@@ -508,7 +605,7 @@ const LEGACY_STARTUP_NAME: &str = "Discord Denoiser";
 
 #[cfg(windows)]
 pub fn startup_enabled() -> bool {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
     let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(RUN_KEY) else {
         return false;
@@ -519,7 +616,10 @@ pub fn startup_enabled() -> bool {
 
 #[cfg(windows)]
 pub fn set_startup(enabled: bool) -> Result<()> {
-    use winreg::{enums::{HKEY_CURRENT_USER, KEY_SET_VALUE}, RegKey};
+    use winreg::{
+        RegKey,
+        enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+    };
 
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
         .create_subkey_with_flags(RUN_KEY, KEY_SET_VALUE)
@@ -534,8 +634,11 @@ pub fn set_startup(enabled: bool) -> Result<()> {
     if enabled {
         let exe = std::env::current_exe().context("locate OpenMic executable")?;
         // Replace in place so a failed registration keeps the old entry.
-        key.set_value(STARTUP_NAME, &format!("\"{}\" {MINIMIZED_ARG}", exe.display()))
-            .context("register OpenMic startup")?;
+        key.set_value(
+            STARTUP_NAME,
+            &format!("\"{}\" {MINIMIZED_ARG}", exe.display()),
+        )
+        .context("register OpenMic startup")?;
     } else {
         remove(STARTUP_NAME)?;
     }
@@ -545,7 +648,8 @@ pub fn set_startup(enabled: bool) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn startup_file() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("autostart").join("openmic.desktop"))
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.config_dir().join("autostart").join("openmic.desktop"))
 }
 
 #[cfg(target_os = "linux")]
@@ -581,7 +685,9 @@ fn autostart_entry_enabled(text: &str) -> bool {
         if !in_entry {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let value = value.split_whitespace().next().unwrap_or("");
         match key.trim() {
             "Hidden" => hidden = value.eq_ignore_ascii_case("true"),
@@ -649,12 +755,16 @@ fn set_startup_at(path: &Path, enabled: bool, exe: &Path) -> Result<()> {
             .with_context(|| format!("create a temporary file beside {}", path.display()))?;
         file.write_all(entry.as_bytes())
             .with_context(|| format!("write {}", path.display()))?;
-        file.as_file().sync_all().with_context(|| format!("write {}", path.display()))?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("write {}", path.display()))?;
         use std::os::unix::fs::PermissionsExt;
         file.as_file()
             .set_permissions(fs::Permissions::from_mode(0o644))
             .with_context(|| format!("write {}", path.display()))?;
-        file.persist(path).map_err(|error| error.error).with_context(|| format!("write {}", path.display()))?;
+        file.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("write {}", path.display()))?;
         Ok(())
     } else {
         match fs::remove_file(path) {
@@ -686,18 +796,32 @@ fn xdg_autostart_entry_round_trips() {
     assert!(startup_enabled_at(&path));
     let text = fs::read_to_string(&path).unwrap();
     assert!(text.starts_with("[Desktop Entry]\n"));
-    assert!(!text.contains(MINIMIZED_ARG), "login opens the window you left; {text}");
+    assert!(
+        !text.contains(MINIMIZED_ARG),
+        "login opens the window you left; {text}"
+    );
     assert_eq!(decoded_exec(&text), vec![exe.display().to_string()]);
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
-    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "replacement leaves no temporary file");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1,
+        "replacement leaves no temporary file"
+    );
 
     let folder = path.parent().unwrap();
     let mode = fs::metadata(folder).unwrap().permissions();
     fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
     set_startup_at(&path, true, exe).unwrap();
     fs::set_permissions(folder, mode).unwrap();
-    assert_eq!(fs::read_to_string(&path).unwrap(), text, "an entry that already launches this binary is left untouched");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        text,
+        "an entry that already launches this binary is left untouched"
+    );
 
     set_startup_at(&path, false, exe).unwrap();
     assert!(!startup_enabled_at(&path));
@@ -733,7 +857,9 @@ Exec=/usr/bin/openmic
 X-GNOME-Autostart-enabled=true
 ";
     assert!(autostart_entry_enabled(enabled));
-    assert!(autostart_entry_enabled("[Desktop Entry]\nType=Application\n# Hidden=true\n"));
+    assert!(autostart_entry_enabled(
+        "[Desktop Entry]\nType=Application\n# Hidden=true\n"
+    ));
     assert!(autostart_entry_enabled(
         "[Desktop Entry]\nType=Application\n\n[Desktop Action]\nHidden=true\n"
     ));
@@ -759,12 +885,18 @@ X-GNOME-Autostart-enabled=true
     let path = dir.path().join("openmic.desktop");
     let disabled = "[Desktop Entry]\nHidden=true\nX-GNOME-Autostart-Delay=20\nExec=/old/openmic\n";
     fs::write(&path, disabled).unwrap();
-    assert!(!startup_enabled_at(&path), "a disabled file must not be refreshed back on");
+    assert!(
+        !startup_enabled_at(&path),
+        "a disabled file must not be refreshed back on"
+    );
     set_startup_at(&path, true, Path::new("/opt/OpenMic/openmic")).unwrap();
     let text = fs::read_to_string(&path).unwrap();
     assert!(startup_enabled_at(&path));
     assert!(!text.contains("Hidden"), "{text}");
-    assert_eq!(decoded_exec(&text), vec!["/opt/OpenMic/openmic".to_string()]);
+    assert_eq!(
+        decoded_exec(&text),
+        vec!["/opt/OpenMic/openmic".to_string()]
+    );
 }
 
 /// Undo the desktop-file and shell escaping [`desktop_exec`] applies.
@@ -795,7 +927,11 @@ fn decoded_exec(entry: &str) -> Vec<String> {
     let mut chars = unescaped.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
-            assert_eq!(chars.next(), Some('%'), "a literal percent must be %% before field codes: {unescaped}");
+            assert_eq!(
+                chars.next(),
+                Some('%'),
+                "a literal percent must be %% before field codes: {unescaped}"
+            );
             expanded.push('%');
         } else {
             expanded.push(c);
@@ -818,7 +954,11 @@ fn decoded_exec(entry: &str) -> Vec<String> {
             }
             '\\' => {
                 in_arg = true;
-                current.push(chars.next().unwrap_or_else(|| panic!("truncated shell escape in {expanded}")));
+                current.push(
+                    chars
+                        .next()
+                        .unwrap_or_else(|| panic!("truncated shell escape in {expanded}")),
+                );
             }
             ' ' | '\t' | '\n' => {
                 if in_arg {
@@ -860,7 +1000,10 @@ mod tests {
         assert_eq!(settings.model, Model::DeepFilter);
         assert!(settings.highpass && settings.voice_gate);
         assert_eq!(settings.voice_threshold, VOICE_THRESHOLD);
-        assert!(settings.always_show_strip, "older settings keep the strip visible by default");
+        assert!(
+            settings.always_show_strip,
+            "older settings keep the strip visible by default"
+        );
     }
 
     #[test]
@@ -902,21 +1045,37 @@ mod tests {
         assert!(fresh.load_error.is_none() && fresh.auto_start && fresh.sounds.is_empty());
         assert!(!path.exists(), "a missing file is not a failed load");
 
-        let mut previous = Settings { mute: true, microphone: "USB mic".into(), ..Default::default() };
+        let mut previous = Settings {
+            mute: true,
+            microphone: "USB mic".into(),
+            ..Default::default()
+        };
         previous.sounds.push(Pad::new("applause.wav".into()));
         previous.hotkeys.mute = Some("Ctrl+Alt+M".into());
-        previous.saved_default_mic = Some(SavedDefaults { console: "before-console".into(), communications: "before-chat".into() });
+        previous.saved_default_mic = Some(SavedDefaults {
+            console: "before-console".into(),
+            communications: "before-chat".into(),
+        });
         previous.save_to(&legacy).unwrap();
         let original = fs::read(&legacy).unwrap();
         let loaded = Settings::load_from(&path, std::slice::from_ref(&legacy));
         assert!(loaded.load_error.is_none());
-        assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&previous).unwrap());
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&previous).unwrap()
+        );
         assert_eq!(fs::read(&legacy).unwrap(), original);
         let migrated: Settings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(serde_json::to_value(migrated).unwrap(), serde_json::to_value(&previous).unwrap());
+        assert_eq!(
+            serde_json::to_value(migrated).unwrap(),
+            serde_json::to_value(&previous).unwrap()
+        );
 
         Settings::default().save_to(&legacy).unwrap();
-        assert!(Settings::load_from(&path, &[legacy]).mute, "an existing current file takes precedence over old copies");
+        assert!(
+            Settings::load_from(&path, &[legacy]).mute,
+            "an existing current file takes precedence over old copies"
+        );
     }
 
     #[test]
@@ -925,20 +1084,34 @@ mod tests {
         let path = dir.path().join("settings.json");
         let legacy = dir.path().join("legacy.json");
         Settings::default().save_to(&legacy).unwrap();
-        for bytes in [b"{\"sounds\":[".as_slice(), b"\xff\xfe\x00", b"{\"model\":\"unknown-model\"}"] {
+        for bytes in [
+            b"{\"sounds\":[".as_slice(),
+            b"\xff\xfe\x00",
+            b"{\"model\":\"unknown-model\"}",
+        ] {
             fs::write(&path, bytes).unwrap();
             let mut loaded = Settings::load_from(&path, std::slice::from_ref(&legacy));
             let error = loaded.load_error.as_ref().unwrap();
             assert_eq!(error.path, path);
             assert!(error.message.starts_with("Parse settings:"));
             loaded.mute = true;
-            assert!(loaded.save_to(&path).is_err(), "later changes cannot overwrite an unreadable source");
+            assert!(
+                loaded.save_to(&path).is_err(),
+                "later changes cannot overwrite an unreadable source"
+            );
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
 
         let failed = Settings::load_from(&path, &[legacy]);
-        fs::write(&path, br#"{"mute":true,"sounds":["clap.wav"],"highpass_hz":120.0}"#).unwrap();
-        assert!(failed.save_to(&path).is_err(), "even a repaired file is protected until it has actually been reloaded");
+        fs::write(
+            &path,
+            br#"{"mute":true,"sounds":["clap.wav"],"highpass_hz":120.0}"#,
+        )
+        .unwrap();
+        assert!(
+            failed.save_to(&path).is_err(),
+            "even a repaired file is protected until it has actually been reloaded"
+        );
         let mut restored = failed.retry_from(&path);
         assert!(restored.load_error.is_none() && restored.mute);
         assert_eq!(restored.sounds, [Pad::new("clap.wav".into())]);
@@ -955,7 +1128,12 @@ mod tests {
         let path = dir.path().join("current/settings.json");
         let legacy = dir.path().join("legacy.json");
         let older = dir.path().join("older.json");
-        Settings { mute: true, ..Default::default() }.save_to(&older).unwrap();
+        Settings {
+            mute: true,
+            ..Default::default()
+        }
+        .save_to(&older)
+        .unwrap();
         let bytes = b"{ unfinished settings";
         fs::write(&legacy, bytes).unwrap();
         let failed = Settings::load_from(&path, &[legacy.clone(), older]);
@@ -964,7 +1142,12 @@ mod tests {
         assert_eq!(fs::read(&legacy).unwrap(), bytes);
         assert!(!path.exists());
 
-        Settings { sound_volume: 0.3, ..Default::default() }.save_to(&legacy).unwrap();
+        Settings {
+            sound_volume: 0.3,
+            ..Default::default()
+        }
+        .save_to(&legacy)
+        .unwrap();
         let repaired = failed.retry_from(&path);
         assert!(repaired.load_error.is_none());
         assert_eq!(repaired.sound_volume, 0.3);
@@ -976,7 +1159,11 @@ mod tests {
         fs::rename(&path, &backup).unwrap();
         let fresh = failed.retry_from(&path);
         assert!(fresh.load_error.is_none());
-        assert_eq!(fresh.sound_volume, Settings::default().sound_volume, "moving the failed file aside allows a fresh start");
+        assert_eq!(
+            fresh.sound_volume,
+            Settings::default().sound_volume,
+            "moving the failed file aside allows a fresh start"
+        );
         assert_eq!(fs::read(backup).unwrap(), bytes);
     }
 
@@ -996,9 +1183,21 @@ mod tests {
         ] {
             fs::write(&path, json).unwrap();
             let loaded = Settings::load_from(&path, &[]);
-            assert!(loaded.load_error.as_ref().unwrap().message.contains("finite number"), "{json}");
+            assert!(
+                loaded
+                    .load_error
+                    .as_ref()
+                    .unwrap()
+                    .message
+                    .contains("finite number"),
+                "{json}"
+            );
             assert!(loaded.save_to(&path).is_err());
-            assert_eq!(fs::read_to_string(&path).unwrap(), json, "preserve the source instead of saving null");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                json,
+                "preserve the source instead of saving null"
+            );
             fs::write(&path, br#"{"input_gain_db":6.0}"#).unwrap();
             let repaired = loaded.retry_from(&path);
             assert!(repaired.load_error.is_none());
@@ -1011,26 +1210,53 @@ mod tests {
     fn nonfinite_runtime_values_never_replace_valid_settings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        Settings { mute: true, ..Default::default() }.save_to(&path).unwrap();
+        Settings {
+            mute: true,
+            ..Default::default()
+        }
+        .save_to(&path)
+        .unwrap();
         let before = fs::read(&path).unwrap();
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            for field in ["voice", "monitor", "soundboard", "preset", "pad trim", "strip", "window"] {
+            for field in [
+                "voice",
+                "monitor",
+                "soundboard",
+                "preset",
+                "pad trim",
+                "strip",
+                "window",
+            ] {
                 let mut settings = Settings::default();
                 match field {
                     "voice" => settings.gate_threshold_db = value,
                     "monitor" => settings.monitor_volume = value,
                     "soundboard" => settings.sound_volume = value,
                     "preset" => settings.presets.push(Preset {
-                        name: "Broken".into(), processing: Processing { strength: value, ..Default::default() },
+                        name: "Broken".into(),
+                        processing: Processing {
+                            strength: value,
+                            ..Default::default()
+                        },
                     }),
-                    "pad trim" => settings.sounds.push(Pad { end: Some(value), ..Pad::new("clip.wav".into()) }),
+                    "pad trim" => settings.sounds.push(Pad {
+                        end: Some(value),
+                        ..Pad::new("clip.wav".into())
+                    }),
                     "strip" => settings.strip_width = Some(value),
                     _ => settings.window_size = Some([value, 420.0]),
                 }
                 let error = settings.save_to(&path).unwrap_err();
-                assert!(format!("{error:#}").contains("finite number"), "{field}: {error:#}");
+                assert!(
+                    format!("{error:#}").contains("finite number"),
+                    "{field}: {error:#}"
+                );
                 assert_eq!(fs::read(&path).unwrap(), before);
-                assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "validation happens before creating a temporary file");
+                assert_eq!(
+                    fs::read_dir(dir.path()).unwrap().count(),
+                    1,
+                    "validation happens before creating a temporary file"
+                );
             }
         }
     }
@@ -1053,7 +1279,11 @@ mod tests {
             let error = failed.load_error.as_ref().unwrap();
             assert!(error.path.is_absolute());
             assert_eq!(error.path, file.path());
-            assert_eq!(error.path.parent(), Some(current_dir.as_path()), "Open settings folder must not receive an empty path");
+            assert_eq!(
+                error.path.parent(),
+                Some(current_dir.as_path()),
+                "Open settings folder must not receive an empty path"
+            );
             assert!(failed.save_to(primary).is_err());
         }
 
@@ -1062,7 +1292,10 @@ mod tests {
         let recovered = failed.retry_from(&path);
         assert!(recovered.load_error.is_none() && recovered.mute);
         assert_eq!(recovered.sounds, [Pad::new("clap.wav".into())]);
-        assert!(path.exists(), "a repaired relative legacy source can still migrate");
+        assert!(
+            path.exists(),
+            "a repaired relative legacy source can still migrate"
+        );
     }
 
     #[cfg(windows)]
@@ -1073,15 +1306,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let legacy = dir.path().join("legacy.json");
-        Settings { mute: true, ..Default::default() }.save_to(&path).unwrap();
+        Settings {
+            mute: true,
+            ..Default::default()
+        }
+        .save_to(&path)
+        .unwrap();
         Settings::default().save_to(&legacy).unwrap();
         let before = fs::read(&path).unwrap();
-        let held = fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
         let failed = Settings::load_from(&path, &[legacy]);
-        assert!(failed.load_error.as_ref().unwrap().message.starts_with("Read settings:"));
+        assert!(
+            failed
+                .load_error
+                .as_ref()
+                .unwrap()
+                .message
+                .starts_with("Read settings:")
+        );
         assert!(failed.save_to(&path).is_err());
         drop(held);
-        assert!(failed.save_to(&path).is_err(), "releasing a lock does not authorize defaults to replace the original");
+        assert!(
+            failed.save_to(&path).is_err(),
+            "releasing a lock does not authorize defaults to replace the original"
+        );
         assert_eq!(fs::read(&path).unwrap(), before);
         let loaded = failed.retry_from(&path);
         assert!(loaded.load_error.is_none() && loaded.mute);
@@ -1114,7 +1366,11 @@ mod tests {
         settings.save_to(&path).unwrap();
         let before = fs::read(&path).unwrap();
         // Another process permits reading but refuses replacement.
-        let held = fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
         settings.mute = true;
         assert!(settings.save_to(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);

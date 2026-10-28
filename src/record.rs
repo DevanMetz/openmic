@@ -34,59 +34,152 @@ pub enum Source {
     Computer,
 }
 
-/// The monitor source that carries an output's audio.
+/// PulseAudio's English description of a sink's monitor. Desktops translate
+/// it ("Monitor von …", "Moniteur de …"), so it is only a fallback.
 #[cfg(not(windows))]
 fn monitor_name(output: &str) -> String {
     format!("Monitor of {output}")
 }
 
+/// A display name that is obviously a monitor: the English description, or
+/// a raw PulseAudio source name ending in `.monitor`.
 #[cfg(not(windows))]
 pub(crate) fn is_monitor_source(name: &str) -> bool {
-    name.starts_with("Monitor of ")
+    name.contains("Monitor of ") || name.to_ascii_lowercase().ends_with(".monitor")
+}
+
+/// PulseAudio and PipeWire name a sink's monitor source `{sink}.monitor`.
+/// That id is not translated.
+#[cfg(not(windows))]
+fn is_backend_monitor(id: &str) -> bool {
+    matches!(id.strip_suffix(".monitor"), Some(sink) if !sink.is_empty())
 }
 
 #[cfg(not(windows))]
-fn is_openmic_monitor(name: &str) -> bool {
-    name == "Monitor of OpenMic Virtual Cable"
+pub(crate) fn is_monitor_endpoint(name: &str, id: &str) -> bool {
+    is_monitor_source(name) || is_backend_monitor(id)
 }
 
-/// Prefer the selected output's monitor, then any other output's monitor.
+/// The OpenMic cable's monitor is our own processed output. It is the right
+/// source only when that cable was the output the user asked to record.
 #[cfg(not(windows))]
-fn choose_monitor_source<'a>(output: &str, sources: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let preferred = monitor_name(output);
-    let mut fallback = None;
-    for source in sources {
-        if source == preferred {
+fn is_openmic_monitor(name: &str, id: &str) -> bool {
+    id == "openmic_cable.monitor"
+        || name == "Monitor of OpenMic Virtual Cable"
+        || name == "openmic_cable.monitor"
+}
+
+#[cfg(not(windows))]
+struct Endpoint<'a> {
+    name: &'a str,
+    id: &'a str,
+}
+
+/// Prefer `{output id}.monitor`, then the English "Monitor of {name}", then
+/// any other monitor that is not the OpenMic cable.
+#[cfg(not(windows))]
+fn choose_monitor<'a>(
+    output_name: &str,
+    output_id: &str,
+    sources: &'a [Endpoint<'a>],
+) -> Option<&'a Endpoint<'a>> {
+    if !output_id.is_empty() {
+        let want = format!("{output_id}.monitor");
+        if let Some(source) = sources.iter().find(|source| source.id == want) {
             return Some(source);
         }
-        if fallback.is_none() && is_monitor_source(source) && !is_openmic_monitor(source) {
+    }
+    let preferred = monitor_name(output_name);
+    let mut fallback = None;
+    for source in sources {
+        if source.name == preferred {
+            return Some(source);
+        }
+        if fallback.is_none()
+            && is_monitor_endpoint(source.name, source.id)
+            && !is_openmic_monitor(source.name, source.id)
+        {
             fallback = Some(source);
         }
     }
     fallback
 }
 
+#[cfg(not(windows))]
+fn backend_id(device: &cpal::Device) -> String {
+    device.id().map(|id| id.id().to_owned()).unwrap_or_default()
+}
+
 /// Open an output's monitor source as an input stream.
 #[cfg(not(windows))]
 fn monitor_input(host: &cpal::Host, output: &str) -> Result<cpal::Device> {
-    let output = if output.is_empty() {
-        host.default_output_device().context("no default playback device")?.to_string()
+    let output_device = if output.is_empty() {
+        host.default_output_device()
+            .context("no default playback device")?
     } else {
-        output.to_owned()
+        host.output_devices()
+            .context("list playback devices")?
+            .find(|device| device.to_string() == output)
+            .with_context(|| format!("playback device '{output}' is not connected"))?
     };
-    let sources: Vec<String> = host
+    let output_name = output_device.to_string();
+    let output_id = backend_id(&output_device);
+    let inputs: Vec<cpal::Device> = host
         .input_devices()
         .context("list monitor sources")?
-        .map(|device| device.to_string())
         .collect();
-    let Some(name) = choose_monitor_source(&output, sources.iter().map(String::as_str)) else {
-        bail!("no monitor source for '{output}'");
+    let (chosen_name, chosen_id) = {
+        let described: Vec<(String, String)> = inputs
+            .iter()
+            .map(|device| (device.to_string(), backend_id(device)))
+            .collect();
+        let endpoints: Vec<Endpoint> = described
+            .iter()
+            .map(|(name, id)| Endpoint { name, id })
+            .collect();
+        let Some(chosen) = choose_monitor(&output_name, &output_id, &endpoints) else {
+            bail!("no monitor source for '{output_name}'");
+        };
+        (chosen.name.to_owned(), chosen.id.to_owned())
     };
-    let name = name.to_owned();
-    host.input_devices()
-        .context("list monitor sources")?
-        .find(|device| device.to_string() == name)
-        .with_context(|| format!("monitor source '{name}' is not connected"))
+    inputs
+        .into_iter()
+        .find(|device| {
+            if chosen_id.is_empty() {
+                device.to_string() == chosen_name
+            } else {
+                backend_id(device) == chosen_id
+            }
+        })
+        .with_context(|| format!("monitor source '{chosen_name}' is not connected"))
+}
+
+/// Deduped input names, plus every display name that belongs to a monitor
+/// source. A repeated name counts when any of its devices is a monitor.
+pub(crate) fn index_inputs(devices: &[crate::engine::ListedDevice]) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    for device in devices {
+        if !names.contains(&device.name) {
+            names.push(device.name.clone());
+        }
+    }
+    (names, monitor_names(devices))
+}
+
+#[cfg(windows)]
+fn monitor_names(_devices: &[crate::engine::ListedDevice]) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn monitor_names(devices: &[crate::engine::ListedDevice]) -> Vec<String> {
+    let mut monitors = Vec::new();
+    for device in devices {
+        if is_monitor_endpoint(&device.name, &device.id) && !monitors.contains(&device.name) {
+            monitors.push(device.name.clone());
+        }
+    }
+    monitors
 }
 
 /// A recording in progress. Audio goes from the device callback through a
@@ -177,11 +270,20 @@ impl Recorder {
         let mut peaks = PeakTracker::new(48_000, 2);
         peaks.push(samples);
         Self {
-            stream: None, writer: None, path: Some(path),
+            stream: None,
+            writer: None,
+            path: Some(path),
             device_name: "Test recording device".into(),
-            stop: Arc::default(), peaks: Arc::new(Mutex::new(peaks)), bytes: Arc::new(AtomicU64::new(data_bytes)),
-            sample_rate: 48_000, channels: 2, started: Instant::now(),
-            full: Arc::default(), skipped: Arc::default(), skipped_reported: false, error: Arc::default(),
+            stop: Arc::default(),
+            peaks: Arc::new(Mutex::new(peaks)),
+            bytes: Arc::new(AtomicU64::new(data_bytes)),
+            sample_rate: 48_000,
+            channels: 2,
+            started: Instant::now(),
+            full: Arc::default(),
+            skipped: Arc::default(),
+            skipped_reported: false,
+            error: Arc::default(),
         }
     }
 
@@ -203,7 +305,9 @@ impl Recorder {
 
     /// Simulate a writer still draining after capture stops.
     #[cfg(test)]
-    pub(crate) fn delayed_writer_for_test(samples: &[f32]) -> (Self, crossbeam_channel::Sender<()>) {
+    pub(crate) fn delayed_writer_for_test(
+        samples: &[f32],
+    ) -> (Self, crossbeam_channel::Sender<()>) {
         let mut recorder = Self::from_samples_for_test(samples);
         let bytes = recorder.bytes();
         let (release, wait) = crossbeam_channel::bounded(1);
@@ -301,9 +405,11 @@ impl Recorder {
                 let queue = Arc::clone(&queue);
                 let skipped = Arc::clone(&recorder.skipped);
                 let error = Arc::clone(&recorder.error);
+                let sample_rate = $config.sample_rate;
                 device.build_input_stream(
                     $config,
                     move |data: &[$sample], _: &cpal::InputCallbackInfo| {
+                        crate::rt::request_audio_thread(sample_rate, "recording");
                         // Whole callbacks only, so channels never shift.
                         if queue.capacity() - queue.len() < data.len() {
                             skipped.store(true, Ordering::Relaxed);
@@ -346,7 +452,8 @@ impl Recorder {
             }
         };
         // On failure, dropping `recorder` stops the writer and deletes the file.
-        let stream = open_stream_with_fallback(&mut config, build).context("open recording stream")?;
+        let stream =
+            open_stream_with_fallback(&mut config, build).context("open recording stream")?;
         stream.play().context("start recording stream")?;
         recorder.stream = Some(stream);
         recorder.started = Instant::now();
@@ -383,15 +490,21 @@ impl Recorder {
 
     /// Once true, finish can collect the writer's result without waiting for it.
     pub fn ready_to_finish(&self) -> bool {
-        self.writer.as_ref().is_none_or(|writer| writer.is_finished())
+        self.writer
+            .as_ref()
+            .is_none_or(|writer| writer.is_finished())
     }
 
     /// A capture failure. Keep it until finish so a recovered take carries
     /// its warning even after the UI has noticed and stopped the recording.
     pub fn error(&self) -> Option<String> {
         self.error.lock().clone().or_else(|| {
-            (!self.is_stopping() && self.writer.as_ref().is_some_and(|writer| writer.is_finished()))
-                .then(|| "Recording writer stopped unexpectedly".into())
+            (!self.is_stopping()
+                && self
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.is_finished()))
+            .then(|| "Recording writer stopped unexpectedly".into())
         })
     }
 
@@ -432,7 +545,9 @@ impl Recorder {
             peaks: self.peaks.lock().recent(usize::MAX),
             warning,
         };
-        if take.frames == 0 && let Some(warning) = take.warning() {
+        if take.frames == 0
+            && let Some(warning) = take.warning()
+        {
             bail!("Recording stopped: {warning}");
         }
         Ok((take.frames > 0).then_some(take)) // an empty take deletes itself
@@ -446,9 +561,14 @@ impl Recorder {
             Some(writer) => match writer.join() {
                 Ok(result) => result,
                 Err(_) => {
-                    self.error.lock().get_or_insert_with(|| "Recording writer stopped unexpectedly".into());
+                    self.error
+                        .lock()
+                        .get_or_insert_with(|| "Recording writer stopped unexpectedly".into());
                     let path = self.path.as_deref().context("recording already finished")?;
-                    let file = OpenOptions::new().read(true).write(true).open(path)
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
                         .context("open recording after writer failure")?;
                     recover_recording(file, self.channels)
                 }
@@ -561,7 +681,11 @@ impl WavWriter {
         out.write_all(&16u16.to_le_bytes())?;
         out.write_all(b"data")?;
         out.write_all(&0u32.to_le_bytes())?; // patched in finish()
-        Ok(Self { out, channels, data_bytes: 0 })
+        Ok(Self {
+            out,
+            channels,
+            data_bytes: 0,
+        })
     }
 
     /// Append interleaved samples, stopping at the size limit on a frame
@@ -576,11 +700,17 @@ impl WavWriter {
         let mut bytes = [0u8; 8192];
         for chunk in samples[..count].chunks(4096) {
             for (i, &sample) in chunk.iter().enumerate() {
-                let sample = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
+                let sample = if sample.is_finite() {
+                    sample.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
                 let pcm = (sample * i16::MAX as f32).round() as i16;
                 bytes[i * 2..i * 2 + 2].copy_from_slice(&pcm.to_le_bytes());
             }
-            self.out.write_all(&bytes[..chunk.len() * 2]).context("write recording")?;
+            self.out
+                .write_all(&bytes[..chunk.len() * 2])
+                .context("write recording")?;
         }
         self.data_bytes += count as u64 * 2;
         Ok(count)
@@ -614,11 +744,13 @@ fn recover_recording(mut file: File, channels: u16) -> Result<u64> {
     if data_bytes == 0 {
         bail!("recording could not be saved: no complete audio frames reached disk");
     }
-    file.set_len(44 + data_bytes).context("trim incomplete recording frame")?;
+    file.set_len(44 + data_bytes)
+        .context("trim incomplete recording frame")?;
     file.seek(SeekFrom::Start(4))?;
     file.write_all(&(36 + data_bytes as u32).to_le_bytes())?;
     file.seek(SeekFrom::Start(40))?;
-    file.write_all(&(data_bytes as u32).to_le_bytes()).context("repair recording header")?;
+    file.write_all(&(data_bytes as u32).to_le_bytes())
+        .context("repair recording header")?;
     Ok(data_bytes)
 }
 
@@ -647,8 +779,12 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
 /// Stage cross-drive copies beside the destination so a failed copy leaves
 /// both the original take and any previously saved recording intact.
 fn copy_recording(source: &mut impl Read, to: &Path) -> Result<()> {
-    let parent = to.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let mut file = tempfile::NamedTempFile::new_in(parent).context("create recording temporary file")?;
+    let parent = to
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut file =
+        tempfile::NamedTempFile::new_in(parent).context("create recording temporary file")?;
     std::io::copy(source, &mut file).context("copy recording")?;
     file.as_file().sync_all().context("flush recording")?;
     file.persist(to)
@@ -743,9 +879,36 @@ pub fn safe_stem(name: &str) -> String {
     let stem = if stem.is_empty() { "Recording" } else { stem };
     // Windows also reserves superscript 1, 2 and 3 as COM/LPT device-number digits.
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
-        "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-        "COM\u{00b9}", "COM\u{00b2}", "COM\u{00b3}", "LPT\u{00b9}", "LPT\u{00b2}", "LPT\u{00b3}",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+        "COM\u{00b9}",
+        "COM\u{00b2}",
+        "COM\u{00b3}",
+        "LPT\u{00b9}",
+        "LPT\u{00b2}",
+        "LPT\u{00b3}",
     ];
     // Ignore spaces before an extension to keep names usable on Windows 10 too.
     if reserved.contains(
@@ -768,14 +931,18 @@ mod tests {
     use super::*;
 
     fn written_take(samples: &[f32]) -> Take {
-        Recorder::from_samples_for_test(samples).finish().unwrap().unwrap()
+        Recorder::from_samples_for_test(samples)
+            .finish()
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
     fn streamed_wav_round_trips_stereo_as_soundboard_audio() {
         let take = written_take(&[0.25, 0.75, -0.5, 0.5, 0.0, 0.0]);
         assert_eq!(take.frames, 3);
-        let path = std::env::temp_dir().join(format!("openmic-record-test-{}.wav", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("openmic-record-test-{}.wav", std::process::id()));
         take.save_wav(&path).unwrap();
         assert!(!take.path.exists(), "saving moves the take");
         let decoded = crate::decode::load_clip(&path).unwrap();
@@ -800,10 +967,15 @@ mod tests {
         let path = recorder.path.clone().unwrap();
         let wav = WavWriter::create(&path, 48_000, 2).unwrap();
         let queue = ArrayQueue::new(8);
-        for sample in [0.5; 8] { queue.push(sample).unwrap(); }
+        for sample in [0.5; 8] {
+            queue.push(sample).unwrap();
+        }
         let (stop, peaks, bytes, full, error) = (
-            Arc::clone(&recorder.stop), Arc::clone(&recorder.peaks), Arc::clone(&recorder.bytes),
-            Arc::clone(&recorder.full), Arc::clone(&recorder.error),
+            Arc::clone(&recorder.stop),
+            Arc::clone(&recorder.peaks),
+            Arc::clone(&recorder.bytes),
+            Arc::clone(&recorder.full),
+            Arc::clone(&recorder.error),
         );
         let stopped = Arc::clone(&stop);
         let (release, wait) = crossbeam_channel::bounded(1);
@@ -816,13 +988,25 @@ mod tests {
         }));
 
         drop(recorder);
-        assert!(stopped.load(Ordering::Relaxed), "discard must stop capture and wake the writer");
-        assert_eq!(finished.try_recv(), Err(crossbeam_channel::TryRecvError::Empty),
-            "discard must return before the stalled writer finishes");
+        assert!(
+            stopped.load(Ordering::Relaxed),
+            "discard must stop capture and wake the writer"
+        );
+        assert_eq!(
+            finished.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty),
+            "discard must return before the stalled writer finishes"
+        );
         release.send(()).unwrap();
-        assert_eq!(finished.recv_timeout(Duration::from_secs(3)).unwrap(), (true, true),
-            "the existing writer must be able to finish after its file is discarded");
-        assert!(!path.exists(), "the abandoned WAV must not remain after its last handle closes");
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(3)).unwrap(),
+            (true, true),
+            "the existing writer must be able to finish after its file is discarded"
+        );
+        assert!(
+            !path.exists(),
+            "the abandoned WAV must not remain after its last handle closes"
+        );
     }
 
     #[test]
@@ -840,7 +1024,10 @@ mod tests {
             assert!(Instant::now() < deadline, "writer did not finish");
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(recorder.error().is_none(), "a requested stop is not an unexpected writer exit");
+        assert!(
+            recorder.error().is_none(),
+            "a requested stop is not an unexpected writer exit"
+        );
         let take = recorder.finish().unwrap().unwrap();
         assert_eq!(take.samples().unwrap().len(), 240);
         assert!(take.warning().is_none());
@@ -872,8 +1059,15 @@ mod tests {
             } else {
                 assert!(!path.exists(), "a failed save leaves no partial WAV");
             }
-            assert_eq!(fs::read(&take.path).unwrap(), expected, "the take stays available for retry");
-            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), usize::from(existing));
+            assert_eq!(
+                fs::read(&take.path).unwrap(),
+                expected,
+                "the take stays available for retry"
+            );
+            assert_eq!(
+                fs::read_dir(directory.path()).unwrap().count(),
+                usize::from(existing)
+            );
         }
 
         copy_recording(&mut expected.as_slice(), &path).unwrap();
@@ -907,10 +1101,23 @@ mod tests {
     fn peaks_cover_each_ten_milliseconds() {
         // 1 kHz stereo: 20 interleaved samples per 10 ms block.
         let mut peaks = PeakTracker::new(1_000, 2);
-        let loud_then_quiet: Vec<f32> =
-            (0..30).map(|i| if i == 3 { -0.8 } else if i < 20 { 0.5 } else { 0.1 }).collect();
+        let loud_then_quiet: Vec<f32> = (0..30)
+            .map(|i| {
+                if i == 3 {
+                    -0.8
+                } else if i < 20 {
+                    0.5
+                } else {
+                    0.1
+                }
+            })
+            .collect();
         peaks.push(&loud_then_quiet);
-        assert_eq!(peaks.recent(usize::MAX), vec![0.8, 0.1], "a full block and a partial one");
+        assert_eq!(
+            peaks.recent(usize::MAX),
+            vec![0.8, 0.1],
+            "a full block and a partial one"
+        );
         peaks.push(&[0.2; 30]);
         assert_eq!(peaks.recent(usize::MAX), vec![0.8, 0.2, 0.2]);
         assert_eq!(peaks.recent(2), vec![0.2, 0.2], "the newest blocks");
@@ -929,7 +1136,10 @@ mod tests {
             wav.data_bytes = aligned_limit - 10_000 * frame_bytes;
             let chunk = [0.25; 8192];
             while wav.write(&chunk).unwrap() == chunk.len() {}
-            assert_eq!(wav.data_bytes, aligned_limit, "{channels} channels must end on a complete frame");
+            assert_eq!(
+                wav.data_bytes, aligned_limit,
+                "{channels} channels must end on a complete frame"
+            );
             assert_eq!(wav.write(&chunk).unwrap(), 0);
             drop(wav);
             fs::remove_file(path).unwrap();
@@ -995,13 +1205,18 @@ mod tests {
             file.seek(SeekFrom::End(0)).unwrap();
             file.write_all(&[0]).unwrap(); // incomplete frame must be dropped
             drop(file);
-            recorder.writer = Some(thread::spawn(|| panic!("simulated recording writer failure")));
+            recorder.writer = Some(thread::spawn(|| {
+                panic!("simulated recording writer failure")
+            }));
             let deadline = Instant::now() + Duration::from_secs(3);
             while !recorder.writer.as_ref().unwrap().is_finished() {
                 assert!(Instant::now() < deadline, "writer did not exit");
                 thread::sleep(Duration::from_millis(1));
             }
-            assert_eq!(recorder.error().as_deref(), Some("Recording writer stopped unexpectedly"));
+            assert_eq!(
+                recorder.error().as_deref(),
+                Some("Recording writer stopped unexpectedly")
+            );
 
             let result = recorder.finish();
             if count == 0 {
@@ -1009,7 +1224,10 @@ mod tests {
                 assert!(!path.exists());
             } else {
                 let take = result.unwrap().expect("recover complete audio frames");
-                assert_eq!(take.warning(), Some("Recording writer stopped unexpectedly"));
+                assert_eq!(
+                    take.warning(),
+                    Some("Recording writer stopped unexpectedly")
+                );
                 assert_eq!(take.frames, 4);
                 assert_eq!(fs::metadata(&path).unwrap().len(), 44 + 16);
                 let samples = take.samples().unwrap();
@@ -1073,8 +1291,12 @@ mod tests {
     #[test]
     fn empty_recordings_report_failures_and_remove_their_temporary_files() {
         for (capture_failed, skipped, during_shutdown) in [
-            (false, false, false), (true, false, false), (false, true, false),
-            (true, true, false), (true, false, true), (true, true, true),
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+            (true, true, true),
         ] {
             let mut recorder = Recorder::from_samples_for_test(&[]);
             let path = recorder.path.clone().unwrap();
@@ -1082,23 +1304,36 @@ mod tests {
                 let stop = Arc::clone(&recorder.stop);
                 let error = Arc::clone(&recorder.error);
                 recorder.writer = Some(thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) { thread::yield_now(); }
+                    while !stop.load(Ordering::Relaxed) {
+                        thread::yield_now();
+                    }
                     *error.lock() = Some("Microphone disconnected".into());
                     Ok(0)
                 }));
             } else if capture_failed {
                 recorder.report_error_for_test("Microphone disconnected");
             }
-            if skipped { recorder.report_skipped_for_test(); }
+            if skipped {
+                recorder.report_skipped_for_test();
+            }
 
             let result = recorder.finish();
-            assert!(!path.exists(), "empty takes must remove their temporary file on success or failure");
+            assert!(
+                !path.exists(),
+                "empty takes must remove their temporary file on success or failure"
+            );
             if capture_failed || skipped {
-                let message = result.err().expect("an empty failed recording must report its failure").to_string();
+                let message = result
+                    .err()
+                    .expect("an empty failed recording must report its failure")
+                    .to_string();
                 assert_eq!(message.contains("Microphone disconnected"), capture_failed);
                 assert_eq!(message.contains("audio was skipped"), skipped);
             } else {
-                assert!(result.unwrap().is_none(), "a normal empty take is not a capture failure");
+                assert!(
+                    result.unwrap().is_none(),
+                    "a normal empty take is not a capture failure"
+                );
             }
         }
     }
@@ -1111,11 +1346,18 @@ mod tests {
             recorder.report_skipped_for_test();
             if report_during_capture {
                 assert!(recorder.take_skipped());
-                assert!(!recorder.take_skipped(), "report the active warning once per take");
+                assert!(
+                    !recorder.take_skipped(),
+                    "report the active warning once per take"
+                );
             }
             let take = recorder.finish().unwrap().unwrap();
             assert!(take.warning().unwrap().contains("audio was skipped"));
-            assert_eq!(take.samples().unwrap().len(), 240, "keep all captured samples");
+            assert_eq!(
+                take.samples().unwrap().len(),
+                240,
+                "keep all captured samples"
+            );
         }
     }
 
@@ -1147,14 +1389,27 @@ mod tests {
                     for extension in ["", ".mix", ".archive.wav"] {
                         let name = format!("{prefix}{digit}{extension}");
                         for input in [name.clone(), format!("  .{name}.  ")] {
-                            assert_eq!(safe_stem(&input), format!("Recording {name}"), "reserved filename: {input}");
+                            assert_eq!(
+                                safe_stem(&input),
+                                format!("Recording {name}"),
+                                "reserved filename: {input}"
+                            );
                         }
                     }
                 }
             }
         }
-        for name in ["COM0", "LPT0", "COM10", "LPT10", "COM\u{2074}", "LPT\u{2074}",
-            "COM\u{00b9} tone", "LPT\u{00b2}0", "Com\u{00b3}beat.mix"] {
+        for name in [
+            "COM0",
+            "LPT0",
+            "COM10",
+            "LPT10",
+            "COM\u{2074}",
+            "LPT\u{2074}",
+            "COM\u{00b9} tone",
+            "LPT\u{00b2}0",
+            "Com\u{00b3}beat.mix",
+        ] {
             assert_eq!(safe_stem(name), name, "ordinary names keep their text");
         }
     }
@@ -1162,7 +1417,9 @@ mod tests {
     #[test]
     fn recording_names_cover_spaced_and_console_device_aliases() {
         let mut aliases: Vec<String> = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
-            .into_iter().map(str::to_owned).collect();
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         for family in ["COM", "LPT"] {
             for digit in "123456789\u{00b9}\u{00b2}\u{00b3}".chars() {
                 aliases.push(format!("{family}{digit}"));
@@ -1185,9 +1442,20 @@ mod tests {
                 }
             }
         }
-        for name in ["CONCERT .mix", "CON IN$.mix", "CONIN$ tone.mix", "COM10 .mix",
-            "LPT10 .mix", "COM\u{00b9} tone.mix", "LPT\u{00b2}0 .mix", "COM\u{2074} .mix",
-            "NUL\u{00a0}.mix", "NUL- .mix", "COM1 - .mix", "LPT9track.archive.wav"] {
+        for name in [
+            "CONCERT .mix",
+            "CON IN$.mix",
+            "CONIN$ tone.mix",
+            "COM10 .mix",
+            "LPT10 .mix",
+            "COM\u{00b9} tone.mix",
+            "LPT\u{00b2}0 .mix",
+            "COM\u{2074} .mix",
+            "NUL\u{00a0}.mix",
+            "NUL- .mix",
+            "COM1 - .mix",
+            "LPT9track.archive.wav",
+        ] {
             assert_eq!(safe_stem(name), name, "ordinary names keep their text");
         }
     }
@@ -1203,9 +1471,26 @@ mod tests {
                 }
             }
         }
-        names.extend(["CON .mix", "PRN   .archive", "AUX .mix", "NUL .mix", "COM1 .mix",
-            "COM9 .mix", "LPT1 .mix", "LPT9 .mix", "CONIN$", "CONIN$.mix", "CONIN$ .mix",
-            "CONOUT$", "CONOUT$.mix", "CONOUT$ .mix"].into_iter().map(str::to_owned));
+        names.extend(
+            [
+                "CON .mix",
+                "PRN   .archive",
+                "AUX .mix",
+                "NUL .mix",
+                "COM1 .mix",
+                "COM9 .mix",
+                "LPT1 .mix",
+                "LPT9 .mix",
+                "CONIN$",
+                "CONIN$.mix",
+                "CONIN$ .mix",
+                "CONOUT$",
+                "CONOUT$.mix",
+                "CONOUT$ .mix",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
         for name in names {
             let stem = safe_stem(&name);
             assert_eq!(stem, format!("Recording {name}"));
@@ -1234,33 +1519,159 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    fn chosen(output: &str, output_id: &str, sources: &[(&str, &str)]) -> Option<String> {
+        let endpoints: Vec<Endpoint> = sources
+            .iter()
+            .map(|(name, id)| Endpoint { name, id })
+            .collect();
+        choose_monitor(output, output_id, &endpoints).map(|source| source.name.to_owned())
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn monitor_sources_match_their_output_and_skip_the_openmic_cable() {
         let sources = [
-            "Monitor of OpenMic Virtual Cable",
-            "Monitor of Speakers",
-            "Monitor of Headphones",
-            "USB microphone",
+            ("Monitor of OpenMic Virtual Cable", ""),
+            ("Monitor of Speakers", ""),
+            ("Monitor of Headphones", ""),
+            ("USB microphone", ""),
         ];
         assert_eq!(monitor_name("Headphones"), "Monitor of Headphones");
         assert!(is_monitor_source("Monitor of Speakers"));
         assert!(!is_monitor_source("Speakers"));
-        assert!(is_openmic_monitor("Monitor of OpenMic Virtual Cable"));
-        assert!(!is_openmic_monitor("Monitor of Speakers"));
+        assert!(!is_monitor_source("Studio Monitor"));
+        assert!(is_openmic_monitor("Monitor of OpenMic Virtual Cable", ""));
+        assert!(!is_openmic_monitor("Monitor of Speakers", ""));
         assert_eq!(
-            choose_monitor_source("Headphones", sources.iter().copied()),
+            chosen("Headphones", "", &sources).as_deref(),
             Some("Monitor of Headphones"),
             "the selected output's monitor wins"
         );
         assert_eq!(
-            choose_monitor_source("Missing output", sources.iter().copied()),
+            chosen("Missing output", "", &sources).as_deref(),
             Some("Monitor of Speakers"),
             "fall back to the first monitor that isn't the OpenMic cable"
         );
         assert_eq!(
-            choose_monitor_source("Missing output", ["Monitor of OpenMic Virtual Cable", "USB microphone"].into_iter()),
+            chosen(
+                "Missing output",
+                "",
+                &[
+                    ("Monitor of OpenMic Virtual Cable", ""),
+                    ("USB microphone", "")
+                ]
+            )
+            .as_deref(),
             None,
             "the virtual cable monitor and plain microphones are not computer audio"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn translated_monitor_names_still_follow_the_sink_id() {
+        let sources = [
+            ("Monitor von OpenMic Virtual Cable", "openmic_cable.monitor"),
+            (
+                "Monitor von Lautsprecher",
+                "alsa_output.pci.analog-stereo.monitor",
+            ),
+            ("Monitor von Kopfhörer", "alsa_output.usb-headset.monitor"),
+            ("USB-Mikrofon", "alsa_input.usb-mic"),
+        ];
+        assert!(
+            !is_monitor_source("Monitor von Lautsprecher"),
+            "a translated description is not the English label"
+        );
+        assert!(is_backend_monitor("alsa_output.pci.analog-stereo.monitor"));
+        assert!(!is_backend_monitor("alsa_input.usb-mic"));
+        assert!(!is_backend_monitor(".monitor"));
+        assert!(is_openmic_monitor(
+            "Monitor von OpenMic Virtual Cable",
+            "openmic_cable.monitor"
+        ));
+        assert_eq!(
+            chosen("Lautsprecher", "alsa_output.pci.analog-stereo", &sources).as_deref(),
+            Some("Monitor von Lautsprecher"),
+            "the sink id picks the monitor even when the description is translated"
+        );
+        assert_eq!(
+            chosen("Kopfhörer", "alsa_output.usb-headset", &sources).as_deref(),
+            Some("Monitor von Kopfhörer"),
+            "a different sink does not take the first monitor in the list"
+        );
+        assert_eq!(
+            chosen("OpenMic Virtual Cable", "openmic_cable", &sources).as_deref(),
+            Some("Monitor von OpenMic Virtual Cable"),
+            "recording the virtual cable uses its own monitor"
+        );
+        assert_eq!(
+            chosen("Missing output", "", &sources).as_deref(),
+            Some("Monitor von Lautsprecher"),
+            "a missing output still avoids the OpenMic cable"
+        );
+        assert_eq!(
+            chosen(
+                "Other",
+                "not-speakers",
+                &[("Monitor von Lautsprecher", "alsa_output.speakers.monitor")]
+            )
+            .as_deref(),
+            Some("Monitor von Lautsprecher"),
+            "an unmatched sink id falls back to another real monitor"
+        );
+        assert_eq!(
+            chosen(
+                "speakers",
+                "speakers",
+                &[
+                    ("Wrong", "not-speakers.monitor"),
+                    ("Right", "speakers.monitor")
+                ]
+            )
+            .as_deref(),
+            Some("Right"),
+            "the sink id must match exactly, not as a suffix of another source"
+        );
+    }
+
+    fn listed(name: &str, id: &str) -> crate::engine::ListedDevice {
+        crate::engine::ListedDevice {
+            name: name.into(),
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn input_names_keep_the_first_device_when_a_display_name_repeats() {
+        let devices = [listed("Mic", "a"), listed("Mic", "b"), listed("Other", "c")];
+        let (names, monitors) = index_inputs(&devices);
+        assert_eq!(names, ["Mic", "Other"]);
+        assert!(monitors.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_translated_monitor_is_indexed_from_its_backend_id() {
+        let devices = [
+            listed(
+                "Monitor von Lautsprecher",
+                "alsa_output.pci.analog-stereo.monitor",
+            ),
+            listed("USB-Mikrofon", "alsa_input.usb"),
+            listed("Monitor von Lautsprecher", "ignored-duplicate"),
+        ];
+        let (names, monitors) = index_inputs(&devices);
+        assert_eq!(names, ["Monitor von Lautsprecher", "USB-Mikrofon"]);
+        assert_eq!(monitors, ["Monitor von Lautsprecher"]);
+
+        let english = [listed("Monitor of Speakers", "")];
+        let (names, monitors) = index_inputs(&english);
+        assert_eq!(names, ["Monitor of Speakers"]);
+        assert_eq!(
+            monitors,
+            ["Monitor of Speakers"],
+            "an English label still counts when the host has no id"
         );
     }
 

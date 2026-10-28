@@ -78,6 +78,10 @@ mod tests {
         assert_eq!(at(0, 0)[3], 0, "corners are transparent");
         assert_eq!(at(16, 12), [18, 18, 18, 255], "capsule");
         assert_eq!(at(4, 16), [0x38, 0xbd, 0xf8, 255], "badge");
-        assert_eq!(rgba(size, true)[((16 * size + 4) * 4) as usize], 0xf8, "muted is red");
+        assert_eq!(
+            rgba(size, true)[((16 * size + 4) * 4) as usize],
+            0xf8,
+            "muted is red"
+        );
     }
 }

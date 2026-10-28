@@ -4,9 +4,9 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -23,10 +23,22 @@ pub fn duration(path: &Path) -> Option<f32> {
     }
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .ok()?;
-    let track = probed.format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
-    let (frames, rate) = (track.codec_params.n_frames?, track.codec_params.sample_rate?);
+    let track = probed
+        .format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
+    let (frames, rate) = (
+        track.codec_params.n_frames?,
+        track.codec_params.sample_rate?,
+    );
     (rate > 0).then(|| frames as f32 / rate as f32)
 }
 
@@ -53,7 +65,12 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
     }
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .context("probe audio format")?;
     let mut format = probed.format;
     let track = format
@@ -72,10 +89,8 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
         check_cancelled(cancel)?;
         let packet = match format.next_packet() {
             Ok(p) => p,
-            Err(SymphoniaError::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
             }
             Err(e) => return Err(e).context("read audio packet"),
         };
@@ -114,12 +129,17 @@ fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) -> Result<()> {
     // decoded frames. Size the buffer using the decoder's actual output.
     let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
     buf.copy_interleaved_ref(decoded);
-    mono.try_reserve(buf.samples().len() / channels).context("not enough memory to load this clip")?;
+    mono.try_reserve(buf.samples().len() / channels)
+        .context("not enough memory to load this clip")?;
     mono.extend(buf.samples().chunks_exact(channels).map(|frame| {
         // Float WAVs can contain non-finite or over-range samples. Silence
         // invalid channels before interpolation spreads them, and accumulate
         // in f64 so finite channels cannot overflow while being downmixed.
-        let sum: f64 = frame.iter().filter(|s| s.is_finite()).map(|&s| f64::from(s)).sum();
+        let sum: f64 = frame
+            .iter()
+            .filter(|s| s.is_finite())
+            .map(|&s| f64::from(s))
+            .sum();
         (sum / channels as f64).clamp(-1.0, 1.0) as f32
     }));
     Ok(())
@@ -139,7 +159,9 @@ fn resample_linear(input: Vec<f32>, from: u32, to: u32, cancel: &AtomicBool) -> 
     let ratio = f64::from(from) / f64::from(to);
     let last = input.len() - 1;
     let mut output = Vec::new();
-    output.try_reserve_exact(n).context("not enough memory to resample this clip")?;
+    output
+        .try_reserve_exact(n)
+        .context("not enough memory to resample this clip")?;
     for start in (0..n).step_by(4096) {
         check_cancelled(cancel)?;
         output.extend((start..n.min(start.saturating_add(4096))).map(|i| {
@@ -167,7 +189,11 @@ mod tests {
         decoded.chan_mut(0).copy_from_slice(&[0.25, -0.5, 0.75]);
         decoded.chan_mut(1).copy_from_slice(&[0.75, 0.5, 0.25]);
         let mut mono = Vec::new();
-        append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded))).unwrap();
+        append_mono(
+            &mut mono,
+            AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded)),
+        )
+        .unwrap();
         assert_eq!(mono, vec![0.5, 0.0, 0.5]);
     }
 
@@ -175,7 +201,11 @@ mod tests {
     fn an_audio_buffer_without_channels_is_refused_instead_of_dividing_by_zero() {
         let decoded = AudioBuffer::<f32>::unused();
         let mut mono = Vec::new();
-        let error = append_mono(&mut mono, AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded))).unwrap_err();
+        let error = append_mono(
+            &mut mono,
+            AudioBufferRef::F32(std::borrow::Cow::Borrowed(&decoded)),
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), "audio track has no channels");
         assert!(mono.is_empty());
     }
@@ -216,15 +246,29 @@ mod tests {
             std::fs::write(&path, bytes).unwrap();
 
             let samples = load_clip(&path).unwrap();
-            assert!(samples.iter().all(|s| s.is_finite() && (-1.0..=1.0).contains(s)), "{rate} Hz: {samples:?}");
+            assert!(
+                samples
+                    .iter()
+                    .all(|s| s.is_finite() && (-1.0..=1.0).contains(s)),
+                "{rate} Hz: {samples:?}"
+            );
             if rate == crate::dsp::SR {
-                assert_eq!(samples, [0.25, 0.25, -0.25, 1.0, -1.0, 1.0, -1.0, 0.0, 0.375]);
+                assert_eq!(
+                    samples,
+                    [0.25, 0.25, -0.25, 1.0, -1.0, 1.0, -1.0, 0.0, 0.375]
+                );
             }
             let mut mixer = crate::dsp::Mixer::default();
             let mut voice = vec![0.125; samples.len()];
-            mixer.play(crate::dsp::Clip::new(1, std::sync::Arc::new(samples), 1.0), false);
+            mixer.play(
+                crate::dsp::Clip::new(1, std::sync::Arc::new(samples), 1.0),
+                false,
+            );
             mixer.mix(&mut voice, 0.0);
-            assert!(voice.iter().all(|s| *s == 0.125), "a silent pad must never corrupt the microphone");
+            assert!(
+                voice.iter().all(|s| *s == 0.125),
+                "a silent pad must never corrupt the microphone"
+            );
         }
     }
 
@@ -240,7 +284,8 @@ mod tests {
         f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM format
         f.write_all(&channels.to_le_bytes()).unwrap();
         f.write_all(&(rate as u32).to_le_bytes()).unwrap();
-        f.write_all(&((rate as u32) * (channels as u32) * 2).to_le_bytes()).unwrap();
+        f.write_all(&((rate as u32) * (channels as u32) * 2).to_le_bytes())
+            .unwrap();
         f.write_all(&(channels * 2).to_le_bytes()).unwrap();
         f.write_all(&16u16.to_le_bytes()).unwrap();
         f.write_all(b"data").unwrap();
@@ -294,7 +339,8 @@ mod tests {
     #[test]
     fn cancellation_after_decoding_never_returns_partial_resampled_audio() {
         for rate in [24_000, 48_000, 96_000] {
-            let result = resample_linear(vec![0.5; 100], rate, crate::dsp::SR, &AtomicBool::new(true));
+            let result =
+                resample_linear(vec![0.5; 100], rate, crate::dsp::SR, &AtomicBool::new(true));
             assert_eq!(result.unwrap_err().to_string(), "clip import cancelled");
         }
     }
