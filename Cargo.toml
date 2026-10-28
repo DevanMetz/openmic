@@ -51,7 +51,10 @@ tract-pulse = "=0.21.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 # cpal's pure-Rust PulseAudio client (also works with PipeWire's pipewire-pulse).
 # default_host() prefers it and falls back to ALSA when no server is running.
-cpal = { version = "0.18.2", features = ["realtime", "pulseaudio"] }
+# realtime-dbus makes cpal's ALSA (and the shared audio_thread_priority crate)
+# ask RealtimeKit. Without that feature the call succeeds and does nothing.
+cpal = { version = "0.18.2", features = ["realtime", "realtime-dbus", "pulseaudio"] }
+audio_thread_priority = { version = "0.35", default-features = false, features = ["with_dbus"] }
 # X11 dictation and monitor placement share this connection.
 x11rb = { version = "0.13.2", features = ["xtest", "randr", "resource_manager"] }
 xkeysym = "0.2.1"

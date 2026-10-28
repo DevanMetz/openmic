@@ -19,7 +19,7 @@ mod linux {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
 
     pub const SINK_NAME: &str = "openmic_cable";
     pub const SOURCE_NAME: &str = "openmic_mic";
@@ -109,7 +109,9 @@ mod linux {
         };
         for id in ids.into_iter().rev() {
             if let Err(e) = unload(&id) {
-                crate::logfile::warn(format_args!("virtual microphone module {id} not removed: {e:#}"));
+                crate::logfile::warn(format_args!(
+                    "virtual microphone module {id} not removed: {e:#}"
+                ));
             }
         }
     }

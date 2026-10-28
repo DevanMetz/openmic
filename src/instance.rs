@@ -5,13 +5,15 @@
 pub struct AlreadyRunning;
 
 #[cfg(windows)]
-pub use windows_instance::{acquire, Instance};
+pub use windows_instance::{Instance, acquire};
 
 #[cfg(windows)]
 mod windows_instance {
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        CreateEventW, INFINITE, SetEvent, WaitForSingleObject,
+    };
     use windows::core::w;
-    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject, INFINITE};
 
     use super::AlreadyRunning;
 

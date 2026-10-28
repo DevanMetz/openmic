@@ -94,7 +94,9 @@ impl Hotkeys {
     /// Whether the last registration attempted this exact binding but
     /// could not activate it. An edit not yet passed to `set` is pending.
     pub fn was_refused(&self, shortcut: &str, command: &Command) -> bool {
-        self.bindings.iter().any(|(text, action)| text == shortcut && action == command)
+        self.bindings
+            .iter()
+            .any(|(text, action)| text == shortcut && action == command)
             && match shortcut.parse::<HotKey>() {
                 Ok(key) => self.actions.lock().bindings.get(&key.id()) != Some(command),
                 Err(_) => true,
@@ -114,12 +116,19 @@ pub fn combo(key: egui::Key, mods: egui::Modifiers) -> Result<String, &'static s
         "CloseBracket" => "BracketRight",
         name => name,
     };
-    let spare = matches!(name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()), Some(13..=24));
+    let spare = matches!(
+        name.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()),
+        Some(13..=24)
+    );
     if !spare && !mods.ctrl && !mods.alt {
         return Err("Hold Ctrl or Alt with the key (F13-F24 work alone)");
     }
     let mut text = String::new();
-    for (held, label) in [(mods.ctrl, "Ctrl+"), (mods.alt, "Alt+"), (mods.shift, "Shift+")] {
+    for (held, label) in [
+        (mods.ctrl, "Ctrl+"),
+        (mods.alt, "Alt+"),
+        (mods.shift, "Shift+"),
+    ] {
         if held {
             text.push_str(label);
         }
@@ -154,8 +163,14 @@ mod tests {
     #[test]
     fn combos_read_naturally_and_parse() {
         assert_eq!(combo(egui::Key::Num1, CTRL_ALT).unwrap(), "Ctrl+Alt+1");
-        assert_eq!(combo(egui::Key::M, egui::Modifiers::CTRL | egui::Modifiers::SHIFT).unwrap(), "Ctrl+Shift+M");
-        assert_eq!(combo(egui::Key::Equals, egui::Modifiers::ALT).unwrap(), "Alt+Equal");
+        assert_eq!(
+            combo(egui::Key::M, egui::Modifiers::CTRL | egui::Modifiers::SHIFT).unwrap(),
+            "Ctrl+Shift+M"
+        );
+        assert_eq!(
+            combo(egui::Key::Equals, egui::Modifiers::ALT).unwrap(),
+            "Alt+Equal"
+        );
         assert_eq!(combo(egui::Key::F13, egui::Modifiers::NONE).unwrap(), "F13");
     }
 
@@ -164,7 +179,10 @@ mod tests {
         assert!(combo(egui::Key::M, egui::Modifiers::NONE).is_err());
         assert!(combo(egui::Key::M, egui::Modifiers::SHIFT).is_err());
         assert!(combo(egui::Key::F5, egui::Modifiers::NONE).is_err());
-        assert!(combo(egui::Key::F30, CTRL_ALT).is_err(), "Windows has no F30 shortcut");
+        assert!(
+            combo(egui::Key::F30, CTRL_ALT).is_err(),
+            "Windows has no F30 shortcut"
+        );
     }
 
     #[test]
@@ -177,22 +195,38 @@ mod tests {
     fn held_dictation_releases_after_shortcuts_are_cleared_or_reassigned() {
         let mut actions = Actions::default();
         actions.bindings.insert(1, Command::Dictate);
-        assert_eq!(actions.event(1, HotKeyState::Pressed), Some(Command::Dictate));
+        assert_eq!(
+            actions.event(1, HotKeyState::Pressed),
+            Some(Command::Dictate)
+        );
         actions.bindings.clear();
-        assert_eq!(actions.event(1, HotKeyState::Released), Some(Command::DictateReleased));
+        assert_eq!(
+            actions.event(1, HotKeyState::Released),
+            Some(Command::DictateReleased)
+        );
 
         actions.bindings.insert(1, Command::Dictate);
         actions.event(1, HotKeyState::Pressed);
         actions.bindings.insert(1, Command::ToggleMute);
-        assert_eq!(actions.event(1, HotKeyState::Released), Some(Command::DictateReleased));
-        assert_eq!(actions.event(1, HotKeyState::Released), None, "a release is handled only once");
+        assert_eq!(
+            actions.event(1, HotKeyState::Released),
+            Some(Command::DictateReleased)
+        );
+        assert_eq!(
+            actions.event(1, HotKeyState::Released),
+            None,
+            "a release is handled only once"
+        );
     }
 
     #[test]
     fn rebinding_a_held_key_does_not_release_the_new_action() {
         let mut actions = Actions::default();
         actions.bindings.insert(1, Command::ToggleMute);
-        assert_eq!(actions.event(1, HotKeyState::Pressed), Some(Command::ToggleMute));
+        assert_eq!(
+            actions.event(1, HotKeyState::Pressed),
+            Some(Command::ToggleMute)
+        );
         actions.bindings.insert(1, Command::Dictate);
         assert_eq!(actions.event(1, HotKeyState::Released), None);
     }

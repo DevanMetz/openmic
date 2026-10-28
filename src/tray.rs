@@ -12,7 +12,9 @@ mod windows_tray {
     use crossbeam_channel::Sender;
     use eframe::egui;
     use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-    use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use tray_icon::{
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    };
 
     use crate::gui::Command;
     use crate::icon;
@@ -87,11 +89,25 @@ mod windows_tray {
                 .with_icon(tray_icon(false)?)
                 .build()
                 .context("create tray icon")?;
-            Ok(Self { icon, mute, bypass, running, meter, shown: None })
+            Ok(Self {
+                icon,
+                mute,
+                bypass,
+                running,
+                meter,
+                shown: None,
+            })
         }
 
         /// `listening`: dictation is recording speech to type.
-        pub fn sync(&mut self, muted: bool, bypassed: bool, running: bool, listening: bool, collapsed: bool) {
+        pub fn sync(
+            &mut self,
+            muted: bool,
+            bypassed: bool,
+            running: bool,
+            listening: bool,
+            collapsed: bool,
+        ) {
             let state = (muted, bypassed, running, listening, collapsed);
             if self.shown == Some(state) {
                 return;
@@ -100,15 +116,25 @@ mod windows_tray {
             self.mute.set_checked(muted);
             self.bypass.set_checked(bypassed);
             self.meter.set_checked(collapsed);
-            self.running.set_text(if running { "Stop OpenMic" } else { "Start OpenMic" });
-            let icon = if listening { listening_icon() } else { tray_icon(muted) };
+            self.running.set_text(if running {
+                "Stop OpenMic"
+            } else {
+                "Start OpenMic"
+            });
+            let icon = if listening {
+                listening_icon()
+            } else {
+                tray_icon(muted)
+            };
             let _ = self.icon.set_icon(icon.ok());
-            let _ = self.icon.set_tooltip(Some(match (listening, running, muted) {
-                (true, _, _) => "OpenMic · listening for dictation",
-                (false, false, _) => "OpenMic · stopped",
-                (false, true, true) => "OpenMic · mic muted",
-                (false, true, false) => "OpenMic · running",
-            }));
+            let _ = self
+                .icon
+                .set_tooltip(Some(match (listening, running, muted) {
+                    (true, _, _) => "OpenMic · listening for dictation",
+                    (false, false, _) => "OpenMic · stopped",
+                    (false, true, true) => "OpenMic · mic muted",
+                    (false, true, false) => "OpenMic · running",
+                }));
         }
     }
 
@@ -139,6 +165,14 @@ mod fallback {
             anyhow::bail!("no notification area on this platform")
         }
 
-        pub fn sync(&mut self, _muted: bool, _bypassed: bool, _running: bool, _listening: bool, _collapsed: bool) {}
+        pub fn sync(
+            &mut self,
+            _muted: bool,
+            _bypassed: bool,
+            _running: bool,
+            _listening: bool,
+            _collapsed: bool,
+        ) {
+        }
     }
 }

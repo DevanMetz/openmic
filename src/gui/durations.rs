@@ -25,7 +25,10 @@ impl Durations {
         if let Some(duration) = self.known.get(path) {
             return *duration;
         }
-        let running = self.job.as_ref().is_some_and(|job| job.path.as_deref() == Some(path));
+        let running = self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.path.as_deref() == Some(path));
         if !running && !self.queued.iter().any(|queued| queued == path) {
             self.queued.push_back(path.to_owned());
         }
@@ -35,34 +38,51 @@ impl Durations {
     pub(super) fn forget(&mut self, path: &Path) {
         self.known.remove(path);
         self.queued.retain(|queued| queued != path);
-        if let Some(job) = &mut self.job && job.path.as_deref() == Some(path) {
+        if let Some(job) = &mut self.job
+            && job.path.as_deref() == Some(path)
+        {
             job.path = None;
         }
     }
 
     pub(super) fn poll(&mut self, ctx: &egui::Context) {
-        let finished = self.job.as_ref().and_then(|job| match job.result.try_recv() {
-            Ok(duration) => Some(duration),
-            Err(TryRecvError::Disconnected) => Some(None),
-            Err(TryRecvError::Empty) => None,
-        });
+        let finished = self
+            .job
+            .as_ref()
+            .and_then(|job| match job.result.try_recv() {
+                Ok(duration) => Some(duration),
+                Err(TryRecvError::Disconnected) => Some(None),
+                Err(TryRecvError::Empty) => None,
+            });
         if let Some(duration) = finished {
             let job = self.job.take().expect("checked above");
             if let Some(path) = job.path {
                 self.known.insert(path, duration);
             }
         }
-        while self.job.is_none() && let Some(path) = self.queued.pop_front() {
+        while self.job.is_none()
+            && let Some(path) = self.queued.pop_front()
+        {
             let (done, result) = crossbeam_channel::bounded(1);
             let (source, wake) = (path.clone(), ctx.clone());
-            let spawned = std::thread::Builder::new().name("openmic-clip-duration".into()).spawn(move || {
-                let _ = done.send(crate::decode::duration(&source));
-                wake.request_repaint();
-            });
+            let spawned = std::thread::Builder::new()
+                .name("openmic-clip-duration".into())
+                .spawn(move || {
+                    let _ = done.send(crate::decode::duration(&source));
+                    wake.request_repaint();
+                });
             match spawned {
-                Ok(_) => self.job = Some(Job { path: Some(path), result }),
+                Ok(_) => {
+                    self.job = Some(Job {
+                        path: Some(path),
+                        result,
+                    })
+                }
                 Err(error) => {
-                    crate::logfile::warn(format_args!("could not read duration for {}: {error}", path.display()));
+                    crate::logfile::warn(format_args!(
+                        "could not read duration for {}: {error}",
+                        path.display()
+                    ));
                     self.known.insert(path, None);
                 }
             }
@@ -74,7 +94,10 @@ impl Durations {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while self.job.is_some() || !self.queued.is_empty() {
             self.poll(ctx);
-            assert!(std::time::Instant::now() < deadline, "duration reads did not finish");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "duration reads did not finish"
+            );
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -86,7 +109,16 @@ mod tests {
 
     fn delayed(path: PathBuf) -> (Durations, crossbeam_channel::Sender<Option<f32>>) {
         let (done, result) = crossbeam_channel::bounded(1);
-        (Durations { job: Some(Job { path: Some(path), result }), ..Default::default() }, done)
+        (
+            Durations {
+                job: Some(Job {
+                    path: Some(path),
+                    result,
+                }),
+                ..Default::default()
+            },
+            done,
+        )
     }
 
     #[test]
@@ -107,8 +139,14 @@ mod tests {
         durations.finish(&ctx);
         assert_eq!(durations.get(&first), Some(1.25));
         assert_eq!(durations.get(&second), None);
-        assert!(durations.known.contains_key(&second), "an unreadable header is cached as unknown");
-        assert!(durations.queued.is_empty(), "unknown lengths must not be retried on every frame");
+        assert!(
+            durations.known.contains_key(&second),
+            "an unreadable header is cached as unknown"
+        );
+        assert!(
+            durations.queued.is_empty(),
+            "unknown lengths must not be retried on every frame"
+        );
     }
 
     #[test]
@@ -122,13 +160,24 @@ mod tests {
         durations.forget(&removed);
         durations.forget(&path);
         assert!(durations.queued.is_empty());
-        assert!(durations.job.as_ref().unwrap().path.is_none(), "track the worker but discard its answer");
+        assert!(
+            durations.job.as_ref().unwrap().path.is_none(),
+            "track the worker but discard its answer"
+        );
         durations.get(&path);
         durations.poll(&ctx);
-        assert_eq!(durations.queued.len(), 1, "a replacement must wait for the old read to finish");
+        assert_eq!(
+            durations.queued.len(),
+            1,
+            "a replacement must wait for the old read to finish"
+        );
         done.send(Some(99.0)).unwrap();
         durations.finish(&ctx);
-        assert_eq!(durations.get(&path), None, "the stale duration cannot reappear after invalidation");
+        assert_eq!(
+            durations.get(&path),
+            None,
+            "the stale duration cannot reappear after invalidation"
+        );
         assert!(!durations.known.contains_key(&removed));
     }
 

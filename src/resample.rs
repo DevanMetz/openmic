@@ -98,7 +98,9 @@ impl Resampler {
             n += 1;
         }
         // Release consumed samples, keeping one behind the read position.
-        let keep_from = (self.pos.floor() as usize).saturating_sub(1).min(self.buf.len());
+        let keep_from = (self.pos.floor() as usize)
+            .saturating_sub(1)
+            .min(self.buf.len());
         if keep_from > 4096 {
             self.buf.drain(..keep_from);
             self.pos -= keep_from as f64;
@@ -220,7 +222,10 @@ mod tests {
         };
         let (slow, even, fast) = (count(0.99), count(1.0), count(1.01));
         assert!((47_990..=48_000).contains(&even), "{even}");
-        assert!(slow > even + 400 && fast < even - 400, "{slow} {even} {fast}");
+        assert!(
+            slow > even + 400 && fast < even - 400,
+            "{slow} {even} {fast}"
+        );
     }
 
     #[test]
@@ -232,7 +237,10 @@ mod tests {
             let mut out = [0.0f32; 480];
             assert_eq!(r.pull(&mut out), 480, "{trim}");
             assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "{trim}");
-            assert!(r.pull(&mut out) > 0, "a second pull must still make progress at trim {trim}");
+            assert!(
+                r.pull(&mut out) > 0,
+                "a second pull must still make progress at trim {trim}"
+            );
         }
     }
 
