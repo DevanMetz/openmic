@@ -6,15 +6,17 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, ErrorKind, FromSample, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
+use cpal::{
+    Device, ErrorKind, FromSample, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
+};
 use crossbeam_queue::ArrayQueue;
 use parking_lot::Mutex;
 
 use crate::denoise::{Cleaner, ModelState};
-use crate::dsp::{Clip, ClipProgress, Mixer, Params, FRAME, SR};
+use crate::dsp::{Clip, ClipProgress, FRAME, Mixer, Params, SR};
 use crate::resample::Resampler;
 
 /// How much processing history the GUI scope shows: 3 s of 10 ms frames.
@@ -86,11 +88,18 @@ pub struct ListedDevice {
 /// Every device in a direction, including duplicate display names.
 pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
     let mut listed = Vec::new();
-    let iter = if output { host.output_devices() } else { host.input_devices() };
+    let iter = if output {
+        host.output_devices()
+    } else {
+        host.input_devices()
+    };
     if let Ok(devices) = iter {
         for device in devices {
             let id = device.id().map(|id| id.id().to_owned()).unwrap_or_default();
-            listed.push(ListedDevice { name: device.to_string(), id });
+            listed.push(ListedDevice {
+                name: device.to_string(),
+                id,
+            });
         }
     }
     listed
@@ -112,7 +121,11 @@ fn device_names(devices: impl IntoIterator<Item = ListedDevice>) -> Vec<String> 
 }
 
 fn find_device(host: &Host, name: &str, output: bool) -> Result<Device> {
-    let iter = if output { host.output_devices() } else { host.input_devices() };
+    let iter = if output {
+        host.output_devices()
+    } else {
+        host.input_devices()
+    };
     iter.with_context(|| format!("enumerate audio devices looking for '{name}'"))?
         .find(|d| d.to_string() == name)
         .with_context(|| format!("audio device '{name}' not found"))
@@ -140,10 +153,17 @@ struct Reports {
 }
 
 impl Reports {
-    fn stream_error(self: &Arc<Self>, what: &'static str) -> impl FnMut(cpal::Error) + Send + 'static {
+    fn stream_error(
+        self: &Arc<Self>,
+        what: &'static str,
+    ) -> impl FnMut(cpal::Error) + Send + 'static {
         let reports = Arc::clone(self);
         move |e: cpal::Error| {
-            let slot = if is_transient(&e) { &reports.warn } else { &reports.lost };
+            let slot = if is_transient(&e) {
+                &reports.warn
+            } else {
+                &reports.lost
+            };
             slot.lock().get_or_insert_with(|| format!("{what}: {e}"));
         }
     }
@@ -173,7 +193,8 @@ impl OutQueue {
     fn target(&self) -> usize {
         // Large device callbacks must not leave priming waiting for more
         // samples than this queue can ever hold.
-        self.base_target.max(self.period.load(Ordering::Relaxed).saturating_mul(2))
+        self.base_target
+            .max(self.period.load(Ordering::Relaxed).saturating_mul(2))
             .min(self.samples.capacity())
     }
 
@@ -185,7 +206,8 @@ impl OutQueue {
 
     /// Output callback: our mono signal on every channel; silence while priming.
     fn fill<T: Sample + FromSample<f32>>(&self, data: &mut [T], channels: usize) {
-        self.period.fetch_max(data.len() / channels, Ordering::Relaxed);
+        self.period
+            .fetch_max(data.len() / channels, Ordering::Relaxed);
         if !self.primed.load(Ordering::Relaxed) {
             if self.samples.len() < self.target() {
                 data.fill(T::EQUILIBRIUM);
@@ -282,7 +304,10 @@ impl Output {
 /// Windows keeps the driver's default buffer. PulseAudio's default asks for
 /// around two seconds, so Linux uses 10 ms, clamped to what the device allows.
 #[cfg(windows)]
-pub(crate) fn stream_buffer(_rate: u32, _supported: &cpal::SupportedBufferSize) -> cpal::BufferSize {
+pub(crate) fn stream_buffer(
+    _rate: u32,
+    _supported: &cpal::SupportedBufferSize,
+) -> cpal::BufferSize {
     cpal::BufferSize::Default
 }
 
@@ -358,24 +383,38 @@ where
 {
     Ok(device.build_input_stream(
         *config,
-        input_callback::<T>(usize::from(config.channels), Arc::clone(queue), Arc::clone(waker)),
+        input_callback::<T>(
+            usize::from(config.channels),
+            config.sample_rate,
+            Arc::clone(queue),
+            Arc::clone(waker),
+        ),
         on_error,
         None,
     )?)
 }
 
-fn input_callback<T>(channels: usize, queue: Arc<ArrayQueue<f32>>, waker: Arc<OnceLock<Thread>>)
-    -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
+fn input_callback<T>(
+    channels: usize,
+    sample_rate: u32,
+    queue: Arc<ArrayQueue<f32>>,
+    waker: Arc<OnceLock<Thread>>,
+) -> impl FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     move |data, _| {
+        crate::rt::request_audio_thread(sample_rate, "microphone");
         for frame in data.chunks(channels) {
             // Invalid device samples must not poison the resampler or the
             // persistent filter state. Sum in f64 before clipping the mix.
-            let sum: f64 = frame.iter().map(|&s| s.to_sample::<f32>())
-                .filter(|s| s.is_finite()).map(f64::from).sum();
+            let sum: f64 = frame
+                .iter()
+                .map(|&s| s.to_sample::<f32>())
+                .filter(|s| s.is_finite())
+                .map(f64::from)
+                .sum();
             let mono = (sum / channels as f64).clamp(-1.0, 1.0) as f32;
             while queue.push(mono).is_err() {
                 queue.pop();
@@ -392,15 +431,20 @@ fn output_stream<T>(
     config: &StreamConfig,
     queue: &Arc<OutQueue>,
     on_error: impl FnMut(cpal::Error) + Send + 'static,
+    what: &'static str,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = usize::from(config.channels);
+    let rate = config.sample_rate;
     let queue = Arc::clone(queue);
     Ok(device.build_output_stream(
         *config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| queue.fill(data, channels),
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            crate::rt::request_audio_thread(rate, what);
+            queue.fill(data, channels);
+        },
         on_error,
         None,
     )?)
@@ -413,7 +457,12 @@ struct OpenOutput {
     rate: u32,
 }
 
-fn open_output(host: &Host, name: &str, what: &'static str, reports: &Arc<Reports>) -> Result<OpenOutput> {
+fn open_output(
+    host: &Host,
+    name: &str,
+    what: &'static str,
+    reports: &Arc<Reports>,
+) -> Result<OpenOutput> {
     let device = find_device(host, name, true)?;
     let supported = device
         .default_output_config()
@@ -427,11 +476,15 @@ fn open_output(host: &Host, name: &str, what: &'static str, reports: &Arc<Report
     let stream = open_stream_with_fallback(&mut config, |config| {
         for_format!(
             supported.sample_format(),
-            output_stream(&device, config, &queue, reports.stream_error(what))
+            output_stream(&device, config, &queue, reports.stream_error(what), what)
         )
     })
     .with_context(|| format!("open {what} '{name}'"))?;
-    Ok(OpenOutput { stream, queue, rate: config.sample_rate })
+    Ok(OpenOutput {
+        stream,
+        queue,
+        rate: config.sample_rate,
+    })
 }
 
 /// Handle to a running engine. Drop or call [`Engine::stop`] to shut down.
@@ -451,9 +504,14 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self {
-            streams: Vec::new(), worker: None, stop: Arc::default(),
+            streams: Vec::new(),
+            worker: None,
+            stop: Arc::default(),
             params: Arc::new(ArcSwap::from_pointee(Params::default())),
-            mixer: Arc::default(), stats: Arc::default(), reports: Arc::default(), has_monitor: false,
+            mixer: Arc::default(),
+            stats: Arc::default(),
+            reports: Arc::default(),
+            has_monitor: false,
         }
     }
 
@@ -483,7 +541,13 @@ impl Engine {
         let input = open_stream_with_fallback(&mut mic_stream_cfg, |config| {
             for_format!(
                 mic_cfg.sample_format(),
-                input_stream(&mic_dev, config, &mic_q, &waker, reports.stream_error("microphone"))
+                input_stream(
+                    &mic_dev,
+                    config,
+                    &mic_q,
+                    &waker,
+                    reports.stream_error("microphone")
+                )
             )
         })
         .with_context(|| format!("open microphone '{mic}'"))?;
@@ -506,18 +570,33 @@ impl Engine {
             let reports = Arc::clone(&reports);
             let mic_rate = mic_stream_cfg.sample_rate;
             let out = Output::new(Arc::clone(&output.queue), output.rate);
-            let mon = monitor.as_ref().map(|m| Output::new(Arc::clone(&m.queue), m.rate));
+            let mon = monitor
+                .as_ref()
+                .map(|m| Output::new(Arc::clone(&m.queue), m.rate));
             thread::Builder::new()
                 .name("openmic-dsp".into())
                 .spawn(move || {
                     let _ = waker.set(thread::current());
-                    // Pro Audio scheduling class (MMCSS): fewer dropouts
-                    // while a game or browser keeps the CPU busy.
-                    let priority =
-                        audio_thread_priority::promote_current_thread_to_real_time(FRAME as u32, SR);
-                    if priority.is_err() {
-                        reports.warn.lock().get_or_insert_with(|| {
-                            "processing thread: real-time priority refused".into()
+                    // Fewer dropouts while a game or browser keeps the CPU busy.
+                    // Windows joins the Pro Audio class here. Linux asks
+                    // RealtimeKit from a helper so this thread can start at once.
+                    #[cfg(not(target_os = "linux"))]
+                    let _priority = match audio_thread_priority::promote_current_thread_to_real_time(FRAME as u32, SR) {
+                        Ok(handle) => Some(handle),
+                        Err(_) => {
+                            reports.warn.lock().get_or_insert_with(|| {
+                                "processing thread: real-time priority refused".into()
+                            });
+                            None
+                        }
+                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        let reports = Arc::clone(&reports);
+                        crate::rt::request_current_thread(SR, move |error| {
+                            reports.warn.lock().get_or_insert_with(|| {
+                                format!("processing thread: real-time priority refused: {error}")
+                            });
                         });
                     }
                     if let Err(e) = process_loop(
@@ -621,7 +700,11 @@ impl Engine {
 
     /// Pop a fatal processing error, including an unexpectedly exited worker.
     pub fn take_error(&mut self) -> Option<String> {
-        let exited = if self.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+        let exited = if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
             // Join only a finished worker, so polling never waits for DSP.
             let worker = self.worker.take().unwrap();
             let _ = worker.join();
@@ -732,7 +815,9 @@ fn process_loop(
         }
         mixer.lock().mix(&mut z, p.sound_gain);
         set_f32(&stats.prob, prob);
-        stats.model.store(cleaner.state(&p) as u32, Ordering::Relaxed);
+        stats
+            .model
+            .store(cleaner.state(&p) as u32, Ordering::Relaxed);
         set_f32(&stats.out_peak, peak(&z));
 
         out.send(&z, &mut scratch);
@@ -774,20 +859,30 @@ mod tests {
     #[test]
     fn invalid_device_samples_do_not_poison_later_microphone_audio() {
         let queue = Arc::new(ArrayQueue::new(1024));
-        let mut callback = input_callback::<f32>(2, Arc::clone(&queue), Arc::default());
+        let mut callback = input_callback::<f32>(2, 48_000, Arc::clone(&queue), Arc::default());
         let info = cpal::InputCallbackInfo::new(cpal::InputStreamTimestamp {
             callback: cpal::StreamInstant::ZERO,
             capture: cpal::StreamInstant::ZERO,
         });
-        callback(&[
-            f32::NAN, 0.5,
-            f32::INFINITY, 0.5,
-            f32::NEG_INFINITY, -0.5,
-            f32::MAX, f32::MAX,
-            -f32::MAX, -f32::MAX,
-            f32::MAX, -f32::MAX,
-            0.5, 0.25,
-        ], &info);
+        callback(
+            &[
+                f32::NAN,
+                0.5,
+                f32::INFINITY,
+                0.5,
+                f32::NEG_INFINITY,
+                -0.5,
+                f32::MAX,
+                f32::MAX,
+                -f32::MAX,
+                -f32::MAX,
+                f32::MAX,
+                -f32::MAX,
+                0.5,
+                0.25,
+            ],
+            &info,
+        );
         let captured: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
         assert_eq!(captured, [0.25, 0.25, -0.25, 1.0, -1.0, 0.0, 0.375]);
 
@@ -802,7 +897,10 @@ mod tests {
             let mut frame = [0.0; FRAME];
             assert_eq!(resampler.pull(&mut frame), FRAME);
             filter.process(&mut frame);
-            assert!(frame.iter().all(|s| s.is_finite()), "later audio must survive a bad device sample");
+            assert!(
+                frame.iter().all(|s| s.is_finite()),
+                "later audio must survive a bad device sample"
+            );
         }
     }
 
@@ -839,7 +937,9 @@ mod tests {
     fn polling_a_live_worker_does_not_wait_for_its_exit() {
         let mut engine = Engine::for_test();
         let (release, wait) = crossbeam_channel::bounded::<()>(0);
-        engine.worker = Some(thread::spawn(move || { let _ = wait.recv_timeout(Duration::from_secs(3)); }));
+        engine.worker = Some(thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+        }));
         assert!(engine.take_error().is_none());
         assert!(engine.worker.is_some(), "keep the active worker");
         drop(release);
@@ -865,13 +965,27 @@ mod tests {
         for i in 0..24_000 {
             mic_q.push((i as f32 * 0.05).sin() * 0.1).unwrap(); // 500 ms at 48 kHz
         }
-        let (stop, stats, warn) = (Arc::new(AtomicBool::new(false)), Arc::new(Stats::default()), Arc::new(Mutex::new(None)));
+        let (stop, stats, warn) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Stats::default()),
+            Arc::new(Mutex::new(None)),
+        );
         let worker = {
-            let (mic_q, stop, stats, warn) = (Arc::clone(&mic_q), Arc::clone(&stop), Arc::clone(&stats), Arc::clone(&warn));
+            let (mic_q, stop, stats, warn) = (
+                Arc::clone(&mic_q),
+                Arc::clone(&stop),
+                Arc::clone(&stats),
+                Arc::clone(&warn),
+            );
             thread::spawn(move || {
                 let out = Output::new(Arc::new(OutQueue::new(48_000)), 48_000);
-                let (mixer, params) = (Mutex::new(Mixer::default()), ArcSwap::from_pointee(Params::default()));
-                process_loop(&stop, &mic_q, 48_000, out, None, &stats, &mixer, &params, &warn)
+                let (mixer, params) = (
+                    Mutex::new(Mixer::default()),
+                    ArcSwap::from_pointee(Params::default()),
+                );
+                process_loop(
+                    &stop, &mic_q, 48_000, out, None, &stats, &mixer, &params, &warn,
+                )
             })
         };
         let started = std::time::Instant::now();
@@ -884,7 +998,10 @@ mod tests {
         worker.join().unwrap().unwrap();
 
         let processed = stats.history.lock().len();
-        assert!(processed <= 3, "processed {processed} frames of stale audio (at most ~20 ms expected)");
+        assert!(
+            processed <= 3,
+            "processed {processed} frames of stale audio (at most ~20 ms expected)"
+        );
         let warning = warn.lock().clone().expect("the skip is reported");
         assert!(warning.contains("skipped 480 ms"), "{warning}");
     }
@@ -959,12 +1076,21 @@ mod tests {
         assert_eq!(stream_buffer(48_000, &range), cpal::BufferSize::Fixed(480));
         assert_eq!(stream_buffer(44_100, &range), cpal::BufferSize::Fixed(441));
         assert_eq!(
-            stream_buffer(8_000, &cpal::SupportedBufferSize::Range { min: 512, max: 1024 }),
+            stream_buffer(
+                8_000,
+                &cpal::SupportedBufferSize::Range {
+                    min: 512,
+                    max: 1024
+                }
+            ),
             cpal::BufferSize::Fixed(512),
             "a low rate is raised to the minimum"
         );
         assert_eq!(
-            stream_buffer(48_000, &cpal::SupportedBufferSize::Range { min: 64, max: 256 }),
+            stream_buffer(
+                48_000,
+                &cpal::SupportedBufferSize::Range { min: 64, max: 256 }
+            ),
             cpal::BufferSize::Fixed(256),
             "a small maximum caps the request"
         );
@@ -999,18 +1125,31 @@ mod tests {
         for extra in [0, 128] {
             let queue = OutQueue::new(48_000);
             let capacity = queue.samples.capacity();
-            let frames = if extra == 0 { capacity / 2 + 1 } else { capacity + extra };
+            let frames = if extra == 0 {
+                capacity / 2 + 1
+            } else {
+                capacity + extra
+            };
             let mut output = vec![1.0f32; frames * 2];
             for _ in 0..capacity {
                 queue.push(0.25);
             }
             queue.fill(&mut output, 2);
 
-            assert_eq!(queue.target(), capacity, "the priming target must be reachable");
+            assert_eq!(
+                queue.target(),
+                capacity,
+                "the priming target must be reachable"
+            );
             let played = frames.min(capacity);
-            assert!(output[..played * 2].iter().all(|sample| *sample == 0.25),
-                "a full queue must play, even when two device periods would not fit");
-            assert!(output[played * 2..].iter().all(|sample| *sample == 0.0), "pad an oversized callback with silence");
+            assert!(
+                output[..played * 2].iter().all(|sample| *sample == 0.25),
+                "a full queue must play, even when two device periods would not fit"
+            );
+            assert!(
+                output[played * 2..].iter().all(|sample| *sample == 0.0),
+                "pad an oversized callback with silence"
+            );
             assert_eq!(queue.samples.len(), capacity - played);
             assert_eq!(queue.primed.load(Ordering::Relaxed), frames <= capacity);
         }
@@ -1024,7 +1163,10 @@ mod tests {
             queue.push(0.5);
         }
         queue.fill(&mut data, 1);
-        assert!(data.iter().all(|&s| s == 0.0), "600 < 1200-sample target: still priming");
+        assert!(
+            data.iter().all(|&s| s == 0.0),
+            "600 < 1200-sample target: still priming"
+        );
         for _ in 0..600 {
             queue.push(0.5);
         }
