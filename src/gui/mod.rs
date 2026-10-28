@@ -290,12 +290,12 @@ impl App {
         let mut app = Self::stopped(settings);
         app.updated_at = just_updated.then(Instant::now);
         {
-            // Development builds never replace themselves on their own, and
-            // releases only ship an updater for Windows.
+            // Development builds never replace themselves on their own.
             let ctx = ctx.clone();
-            app.updater = Updater::new(!cfg!(debug_assertions) && cfg!(windows), move || {
-                ctx.request_repaint()
-            });
+            app.updater = Updater::new(
+                !cfg!(debug_assertions) && crate::update::updates_supported(),
+                move || ctx.request_repaint(),
+            );
         }
         match Tray::new(ctx, app.commands.0.clone()) {
             Ok(tray) => app.tray = Some(tray),

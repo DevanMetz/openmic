@@ -3807,6 +3807,7 @@ dependencies = [
  "directories",
  "ed25519-dalek",
  "eframe",
+ "flate2",
  "global-hotkey",
  "glutin",
  "glutin-winit",
