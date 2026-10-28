@@ -34,64 +34,152 @@ pub enum Source {
     Computer,
 }
 
-/// The monitor source that carries an output's audio.
+/// PulseAudio's English description of a sink's monitor. Desktops translate
+/// it ("Monitor von …", "Moniteur de …"), so it is only a fallback.
 #[cfg(not(windows))]
 fn monitor_name(output: &str) -> String {
     format!("Monitor of {output}")
 }
 
+/// A display name that is obviously a monitor: the English description, or
+/// a raw PulseAudio source name ending in `.monitor`.
 #[cfg(not(windows))]
 pub(crate) fn is_monitor_source(name: &str) -> bool {
-    name.starts_with("Monitor of ")
+    name.contains("Monitor of ") || name.to_ascii_lowercase().ends_with(".monitor")
+}
+
+/// PulseAudio and PipeWire name a sink's monitor source `{sink}.monitor`.
+/// That id is not translated.
+#[cfg(not(windows))]
+fn is_backend_monitor(id: &str) -> bool {
+    matches!(id.strip_suffix(".monitor"), Some(sink) if !sink.is_empty())
 }
 
 #[cfg(not(windows))]
-fn is_openmic_monitor(name: &str) -> bool {
-    name == "Monitor of OpenMic Virtual Cable"
+pub(crate) fn is_monitor_endpoint(name: &str, id: &str) -> bool {
+    is_monitor_source(name) || is_backend_monitor(id)
 }
 
-/// Prefer the selected output's monitor, then any other output's monitor.
+/// The OpenMic cable's monitor is our own processed output. It is the right
+/// source only when that cable was the output the user asked to record.
 #[cfg(not(windows))]
-fn choose_monitor_source<'a>(
-    output: &str,
-    sources: impl Iterator<Item = &'a str>,
-) -> Option<&'a str> {
-    let preferred = monitor_name(output);
-    let mut fallback = None;
-    for source in sources {
-        if source == preferred {
+fn is_openmic_monitor(name: &str, id: &str) -> bool {
+    id == "openmic_cable.monitor"
+        || name == "Monitor of OpenMic Virtual Cable"
+        || name == "openmic_cable.monitor"
+}
+
+#[cfg(not(windows))]
+struct Endpoint<'a> {
+    name: &'a str,
+    id: &'a str,
+}
+
+/// Prefer `{output id}.monitor`, then the English "Monitor of {name}", then
+/// any other monitor that is not the OpenMic cable.
+#[cfg(not(windows))]
+fn choose_monitor<'a>(
+    output_name: &str,
+    output_id: &str,
+    sources: &'a [Endpoint<'a>],
+) -> Option<&'a Endpoint<'a>> {
+    if !output_id.is_empty() {
+        let want = format!("{output_id}.monitor");
+        if let Some(source) = sources.iter().find(|source| source.id == want) {
             return Some(source);
         }
-        if fallback.is_none() && is_monitor_source(source) && !is_openmic_monitor(source) {
+    }
+    let preferred = monitor_name(output_name);
+    let mut fallback = None;
+    for source in sources {
+        if source.name == preferred {
+            return Some(source);
+        }
+        if fallback.is_none()
+            && is_monitor_endpoint(source.name, source.id)
+            && !is_openmic_monitor(source.name, source.id)
+        {
             fallback = Some(source);
         }
     }
     fallback
 }
 
+#[cfg(not(windows))]
+fn backend_id(device: &cpal::Device) -> String {
+    device.id().map(|id| id.id().to_owned()).unwrap_or_default()
+}
+
 /// Open an output's monitor source as an input stream.
 #[cfg(not(windows))]
 fn monitor_input(host: &cpal::Host, output: &str) -> Result<cpal::Device> {
-    let output = if output.is_empty() {
+    let output_device = if output.is_empty() {
         host.default_output_device()
             .context("no default playback device")?
-            .to_string()
     } else {
-        output.to_owned()
+        host.output_devices()
+            .context("list playback devices")?
+            .find(|device| device.to_string() == output)
+            .with_context(|| format!("playback device '{output}' is not connected"))?
     };
-    let sources: Vec<String> = host
+    let output_name = output_device.to_string();
+    let output_id = backend_id(&output_device);
+    let inputs: Vec<cpal::Device> = host
         .input_devices()
         .context("list monitor sources")?
-        .map(|device| device.to_string())
         .collect();
-    let Some(name) = choose_monitor_source(&output, sources.iter().map(String::as_str)) else {
-        bail!("no monitor source for '{output}'");
+    let (chosen_name, chosen_id) = {
+        let described: Vec<(String, String)> = inputs
+            .iter()
+            .map(|device| (device.to_string(), backend_id(device)))
+            .collect();
+        let endpoints: Vec<Endpoint> = described
+            .iter()
+            .map(|(name, id)| Endpoint { name, id })
+            .collect();
+        let Some(chosen) = choose_monitor(&output_name, &output_id, &endpoints) else {
+            bail!("no monitor source for '{output_name}'");
+        };
+        (chosen.name.to_owned(), chosen.id.to_owned())
     };
-    let name = name.to_owned();
-    host.input_devices()
-        .context("list monitor sources")?
-        .find(|device| device.to_string() == name)
-        .with_context(|| format!("monitor source '{name}' is not connected"))
+    inputs
+        .into_iter()
+        .find(|device| {
+            if chosen_id.is_empty() {
+                device.to_string() == chosen_name
+            } else {
+                backend_id(device) == chosen_id
+            }
+        })
+        .with_context(|| format!("monitor source '{chosen_name}' is not connected"))
+}
+
+/// Deduped input names, plus every display name that belongs to a monitor
+/// source. A repeated name counts when any of its devices is a monitor.
+pub(crate) fn index_inputs(devices: &[crate::engine::ListedDevice]) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    for device in devices {
+        if !names.contains(&device.name) {
+            names.push(device.name.clone());
+        }
+    }
+    (names, monitor_names(devices))
+}
+
+#[cfg(windows)]
+fn monitor_names(_devices: &[crate::engine::ListedDevice]) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn monitor_names(devices: &[crate::engine::ListedDevice]) -> Vec<String> {
+    let mut monitors = Vec::new();
+    for device in devices {
+        if is_monitor_endpoint(&device.name, &device.id) && !monitors.contains(&device.name) {
+            monitors.push(device.name.clone());
+        }
+    }
+    monitors
 }
 
 /// A recording in progress. Audio goes from the device callback through a
@@ -1431,36 +1519,159 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    fn chosen(output: &str, output_id: &str, sources: &[(&str, &str)]) -> Option<String> {
+        let endpoints: Vec<Endpoint> = sources
+            .iter()
+            .map(|(name, id)| Endpoint { name, id })
+            .collect();
+        choose_monitor(output, output_id, &endpoints).map(|source| source.name.to_owned())
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn monitor_sources_match_their_output_and_skip_the_openmic_cable() {
         let sources = [
-            "Monitor of OpenMic Virtual Cable",
-            "Monitor of Speakers",
-            "Monitor of Headphones",
-            "USB microphone",
+            ("Monitor of OpenMic Virtual Cable", ""),
+            ("Monitor of Speakers", ""),
+            ("Monitor of Headphones", ""),
+            ("USB microphone", ""),
         ];
         assert_eq!(monitor_name("Headphones"), "Monitor of Headphones");
         assert!(is_monitor_source("Monitor of Speakers"));
         assert!(!is_monitor_source("Speakers"));
-        assert!(is_openmic_monitor("Monitor of OpenMic Virtual Cable"));
-        assert!(!is_openmic_monitor("Monitor of Speakers"));
+        assert!(!is_monitor_source("Studio Monitor"));
+        assert!(is_openmic_monitor("Monitor of OpenMic Virtual Cable", ""));
+        assert!(!is_openmic_monitor("Monitor of Speakers", ""));
         assert_eq!(
-            choose_monitor_source("Headphones", sources.iter().copied()),
+            chosen("Headphones", "", &sources).as_deref(),
             Some("Monitor of Headphones"),
             "the selected output's monitor wins"
         );
         assert_eq!(
-            choose_monitor_source("Missing output", sources.iter().copied()),
+            chosen("Missing output", "", &sources).as_deref(),
             Some("Monitor of Speakers"),
             "fall back to the first monitor that isn't the OpenMic cable"
         );
         assert_eq!(
-            choose_monitor_source(
+            chosen(
                 "Missing output",
-                ["Monitor of OpenMic Virtual Cable", "USB microphone"].into_iter()
-            ),
+                "",
+                &[
+                    ("Monitor of OpenMic Virtual Cable", ""),
+                    ("USB microphone", "")
+                ]
+            )
+            .as_deref(),
             None,
             "the virtual cable monitor and plain microphones are not computer audio"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn translated_monitor_names_still_follow_the_sink_id() {
+        let sources = [
+            ("Monitor von OpenMic Virtual Cable", "openmic_cable.monitor"),
+            (
+                "Monitor von Lautsprecher",
+                "alsa_output.pci.analog-stereo.monitor",
+            ),
+            ("Monitor von Kopfhörer", "alsa_output.usb-headset.monitor"),
+            ("USB-Mikrofon", "alsa_input.usb-mic"),
+        ];
+        assert!(
+            !is_monitor_source("Monitor von Lautsprecher"),
+            "a translated description is not the English label"
+        );
+        assert!(is_backend_monitor("alsa_output.pci.analog-stereo.monitor"));
+        assert!(!is_backend_monitor("alsa_input.usb-mic"));
+        assert!(!is_backend_monitor(".monitor"));
+        assert!(is_openmic_monitor(
+            "Monitor von OpenMic Virtual Cable",
+            "openmic_cable.monitor"
+        ));
+        assert_eq!(
+            chosen("Lautsprecher", "alsa_output.pci.analog-stereo", &sources).as_deref(),
+            Some("Monitor von Lautsprecher"),
+            "the sink id picks the monitor even when the description is translated"
+        );
+        assert_eq!(
+            chosen("Kopfhörer", "alsa_output.usb-headset", &sources).as_deref(),
+            Some("Monitor von Kopfhörer"),
+            "a different sink does not take the first monitor in the list"
+        );
+        assert_eq!(
+            chosen("OpenMic Virtual Cable", "openmic_cable", &sources).as_deref(),
+            Some("Monitor von OpenMic Virtual Cable"),
+            "recording the virtual cable uses its own monitor"
+        );
+        assert_eq!(
+            chosen("Missing output", "", &sources).as_deref(),
+            Some("Monitor von Lautsprecher"),
+            "a missing output still avoids the OpenMic cable"
+        );
+        assert_eq!(
+            chosen(
+                "Other",
+                "not-speakers",
+                &[("Monitor von Lautsprecher", "alsa_output.speakers.monitor")]
+            )
+            .as_deref(),
+            Some("Monitor von Lautsprecher"),
+            "an unmatched sink id falls back to another real monitor"
+        );
+        assert_eq!(
+            chosen(
+                "speakers",
+                "speakers",
+                &[
+                    ("Wrong", "not-speakers.monitor"),
+                    ("Right", "speakers.monitor")
+                ]
+            )
+            .as_deref(),
+            Some("Right"),
+            "the sink id must match exactly, not as a suffix of another source"
+        );
+    }
+
+    fn listed(name: &str, id: &str) -> crate::engine::ListedDevice {
+        crate::engine::ListedDevice {
+            name: name.into(),
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn input_names_keep_the_first_device_when_a_display_name_repeats() {
+        let devices = [listed("Mic", "a"), listed("Mic", "b"), listed("Other", "c")];
+        let (names, monitors) = index_inputs(&devices);
+        assert_eq!(names, ["Mic", "Other"]);
+        assert!(monitors.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_translated_monitor_is_indexed_from_its_backend_id() {
+        let devices = [
+            listed(
+                "Monitor von Lautsprecher",
+                "alsa_output.pci.analog-stereo.monitor",
+            ),
+            listed("USB-Mikrofon", "alsa_input.usb"),
+            listed("Monitor von Lautsprecher", "ignored-duplicate"),
+        ];
+        let (names, monitors) = index_inputs(&devices);
+        assert_eq!(names, ["Monitor von Lautsprecher", "USB-Mikrofon"]);
+        assert_eq!(monitors, ["Monitor von Lautsprecher"]);
+
+        let english = [listed("Monitor of Speakers", "")];
+        let (names, monitors) = index_inputs(&english);
+        assert_eq!(names, ["Monitor of Speakers"]);
+        assert_eq!(
+            monitors,
+            ["Monitor of Speakers"],
+            "an English label still counts when the host has no id"
         );
     }
 

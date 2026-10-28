@@ -30,7 +30,7 @@ use crate::config::{self, Settings};
 use crate::default_mic;
 use crate::dictation::{self, Dictation};
 use crate::dsp::{self, Params};
-use crate::engine::{Engine, list_devices};
+use crate::engine::{Engine, ListedDevice, list_device_details, list_devices};
 use crate::hotkeys::{self, Hotkeys};
 use crate::logfile;
 use crate::record::{Recorder, Source, Take};
@@ -38,7 +38,7 @@ use crate::tray::Tray;
 use crate::update::Updater;
 use crate::viz;
 use crate::widgets;
-use routes::{cable_input, choose_routes};
+use routes::{cable_input, choose_routes_with_monitors};
 
 pub(crate) const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
 pub(crate) const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
@@ -166,6 +166,8 @@ struct DictationRecording {
 pub struct App {
     settings: Settings,
     inputs: Vec<String>,
+    /// Monitor-source display names, including ones recognized by backend id.
+    monitor_inputs: Vec<String>,
     outputs: Vec<String>,
     page: Page,
     engine: Option<Engine>,
@@ -330,13 +332,11 @@ impl App {
             // registered it without the start-hidden flag.
             let _ = config::set_startup(true);
         }
-        let host = cpal_host();
-        self.inputs = list_devices(&host, false);
-        self.outputs = list_devices(&host, true);
+        let (inputs, outputs) = host_devices();
         // Keep saved devices even if absent: a USB mic can appear after a
         // Windows-startup launch, and must not be silently swapped out. The
         // processed output goes back to VB-Cable on every launch.
-        choose_routes(&mut self.settings, &self.inputs, &self.outputs, true, false);
+        self.apply_devices(inputs, outputs, true, false);
 
         if self.settings.auto_start {
             self.start_engine();
@@ -348,6 +348,7 @@ impl App {
         Self {
             settings,
             inputs: Vec::new(),
+            monitor_inputs: Vec::new(),
             outputs: Vec::new(),
             page: Page::Voice,
             engine: None,
@@ -628,43 +629,62 @@ impl App {
     fn refresh_devices(&mut self, replace_missing: bool) {
         #[cfg(test)]
         if let Some((inputs, outputs)) = &self.devices_for_test {
-            self.update_devices(inputs.clone(), outputs.clone(), replace_missing);
+            self.update_devices(
+                named_inputs(inputs.clone()),
+                outputs.clone(),
+                replace_missing,
+            );
             return;
         }
-        let host = cpal_host();
-        self.update_devices(
-            list_devices(&host, false),
-            list_devices(&host, true),
-            replace_missing,
-        );
+        let (inputs, outputs) = host_devices();
+        self.update_devices(inputs, outputs, replace_missing);
     }
 
-    fn update_devices(&mut self, inputs: Vec<String>, outputs: Vec<String>, replace_missing: bool) {
+    fn apply_devices(
+        &mut self,
+        inputs: Vec<ListedDevice>,
+        outputs: Vec<String>,
+        prefer_cable: bool,
+        replace_missing: bool,
+    ) -> bool {
         let before = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
-        let had_cable = cable_input(&self.outputs).is_some();
-        self.inputs = inputs;
+        let (names, monitors) = crate::record::index_inputs(&inputs);
+        self.inputs = names;
         self.outputs = outputs;
-        let cable_appeared = !had_cable && cable_input(&self.outputs).is_some();
-        choose_routes(
+        self.monitor_inputs = monitors;
+        choose_routes_with_monitors(
             &mut self.settings,
             &self.inputs,
             &self.outputs,
-            cable_appeared,
+            prefer_cable,
             replace_missing,
+            &self.monitor_inputs,
         );
         let after = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
-        if before != after {
+        before != after
+    }
+
+    fn update_devices(
+        &mut self,
+        inputs: Vec<ListedDevice>,
+        outputs: Vec<String>,
+        replace_missing: bool,
+    ) {
+        let had_cable = cable_input(&self.outputs).is_some();
+        let cable_appeared = !had_cable && cable_input(&outputs).is_some();
+        let changed = self.apply_devices(inputs, outputs, cable_appeared, replace_missing);
+        if changed {
             self.touch();
         }
-        if self.engine.is_some() && before != after {
+        if self.engine.is_some() && changed {
             self.restart_engine();
         } else if self.waiting_for_device && self.engine.is_none() {
             // Retry even when the saved names did not change. Stop cancels
@@ -1903,6 +1923,23 @@ impl App {
 
 fn cpal_host() -> cpal::Host {
     cpal::default_host()
+}
+
+fn host_devices() -> (Vec<ListedDevice>, Vec<String>) {
+    let host = cpal_host();
+    (list_device_details(&host, false), list_devices(&host, true))
+}
+
+/// Inputs known only by display name. Their monitor status comes from the label.
+#[cfg(test)]
+fn named_inputs(names: impl IntoIterator<Item = String>) -> Vec<ListedDevice> {
+    names
+        .into_iter()
+        .map(|name| ListedDevice {
+            name,
+            id: String::new(),
+        })
+        .collect()
 }
 
 fn short(msg: &str) -> String {
@@ -3324,11 +3361,43 @@ mod tests {
         app.start_engine();
         assert_eq!(app.status.0, "Waiting for USB mic to connect");
 
-        app.update_devices(names(&["USB mic"]), names(&["CABLE Input"]), false);
+        app.update_devices(
+            super::named_inputs(names(&["USB mic"])),
+            names(&["CABLE Input"]),
+            false,
+        );
         assert!(app.waiting_for_device);
         assert_eq!(app.settings.microphone, "USB mic");
         assert_eq!(app.settings.monitor_output, "Headphones");
         assert_eq!(app.status.0, "Waiting for Headphones to connect");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_translated_monitor_source_is_not_selected_as_the_microphone() {
+        let mut app = App::stopped(Settings::default());
+        let speakers = "Monitor von Lautsprecher";
+        app.update_devices(
+            vec![
+                ListedDevice {
+                    name: speakers.into(),
+                    id: "alsa_output.pci.analog-stereo.monitor".into(),
+                },
+                ListedDevice {
+                    name: "USB-Mikrofon".into(),
+                    id: "alsa_input.usb".into(),
+                },
+            ],
+            names(&["Lautsprecher", "OpenMic Virtual Cable"]),
+            true,
+        );
+        assert_eq!(app.settings.microphone, "USB-Mikrofon");
+        assert_eq!(app.settings.output, "OpenMic Virtual Cable");
+        assert_eq!(app.monitor_inputs, [speakers]);
+        assert!(
+            app.inputs.iter().any(|name| name == speakers),
+            "the monitor stays available to choose"
+        );
     }
 
     #[test]
