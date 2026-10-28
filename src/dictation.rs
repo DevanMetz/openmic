@@ -18,11 +18,25 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self as m, Config, model::Whisper};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport};
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+};
 
 use crate::config;
 use crate::dsp;
 use crate::record::Take;
+
+/// The Dictation page's one-line description of where the words go.
+///
+/// Wayland cannot take the keystrokes; the status line says so when a take
+/// finishes, and the transcript stays on the page to copy.
+pub fn entry_hint() -> &'static str {
+    if cfg!(any(windows, target_os = "linux")) {
+        "Your words are typed into the app you're using. Set your Shortcut above."
+    } else {
+        "Your words appear below to copy into the app you're using. Set your Shortcut above."
+    }
+}
 
 /// A Whisper checkpoint from Hugging Face, pinned to a revision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,20 +59,37 @@ pub(crate) fn use_model_directory_for_test(path: &Path) -> impl Drop {
     struct Restore(Option<PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            MODEL_DIRECTORY_FOR_TEST.with(|directory| { directory.replace(self.0.take()); });
+            MODEL_DIRECTORY_FOR_TEST.with(|directory| {
+                directory.replace(self.0.take());
+            });
         }
     }
     Restore(MODEL_DIRECTORY_FOR_TEST.with(|directory| directory.replace(Some(path.to_owned()))))
 }
 
 impl SpeechModel {
-    pub const ALL: [SpeechModel; 5] = [Self::TinyEn, Self::BaseEn, Self::SmallEn, Self::Base, Self::Small];
+    pub const ALL: [SpeechModel; 5] = [
+        Self::TinyEn,
+        Self::BaseEn,
+        Self::SmallEn,
+        Self::Base,
+        Self::Small,
+    ];
 
     fn repo(self) -> (&'static str, &'static str) {
         match self {
-            Self::TinyEn => ("whisper-tiny.en", "87c7102498dcde7456f24cfd30239ca606ed9063"),
-            Self::BaseEn => ("whisper-base.en", "911407f4214e0e1d82085af863093ec0b66f9cd6"),
-            Self::SmallEn => ("whisper-small.en", "e8727524f962ee844a7319d92be39ac1bd25655a"),
+            Self::TinyEn => (
+                "whisper-tiny.en",
+                "87c7102498dcde7456f24cfd30239ca606ed9063",
+            ),
+            Self::BaseEn => (
+                "whisper-base.en",
+                "911407f4214e0e1d82085af863093ec0b66f9cd6",
+            ),
+            Self::SmallEn => (
+                "whisper-small.en",
+                "e8727524f962ee844a7319d92be39ac1bd25655a",
+            ),
             Self::Base => ("whisper-base", "e37978b90ca9030d5170a5c07aadb050351a65bb"),
             Self::Small => ("whisper-small", "973afd24965f72e36ca33b3055d56a652f456b4d"),
         }
@@ -89,7 +120,9 @@ impl SpeechModel {
 
     fn dir(self) -> PathBuf {
         #[cfg(test)]
-        if let Some(directory) = MODEL_DIRECTORY_FOR_TEST.with(|directory| directory.borrow().clone()) {
+        if let Some(directory) =
+            MODEL_DIRECTORY_FOR_TEST.with(|directory| directory.borrow().clone())
+        {
             return directory.join(self.repo().0);
         }
         config::settings_path()
@@ -102,7 +135,9 @@ impl SpeechModel {
 
     /// All of the model's files are on disk.
     pub fn is_downloaded(self) -> bool {
-        MODEL_FILES.iter().all(|name| self.dir().join(name).is_file())
+        MODEL_FILES
+            .iter()
+            .all(|name| self.dir().join(name).is_file())
     }
 
     /// Delete the downloaded files.
@@ -111,7 +146,9 @@ impl SpeechModel {
     }
 
     #[cfg(test)]
-    pub(crate) fn directory_for_test(self) -> PathBuf { self.dir() }
+    pub(crate) fn directory_for_test(self) -> PathBuf {
+        self.dir()
+    }
 }
 
 fn remove_model_files(dir: &Path) -> Result<()> {
@@ -138,7 +175,10 @@ pub enum Event {
     DownloadCancelled,
     DownloadFailed(String),
     /// Keep recognized words available to copy even if Windows refuses typing.
-    Transcribed { text: String, typing_error: Option<String> },
+    Transcribed {
+        text: String,
+        typing_error: Option<String>,
+    },
     TranscriptionCancelled,
     /// The take held no speech.
     Nothing,
@@ -198,7 +238,11 @@ impl Dictation {
         if let Ok(event) = self.events.1.try_recv() {
             return Some(event);
         }
-        if !self.download.as_ref().is_some_and(|download| download.thread.is_finished()) {
+        if !self
+            .download
+            .as_ref()
+            .is_some_and(|download| download.thread.is_finished())
+        {
             return None;
         }
         let download = self.download.take().unwrap();
@@ -206,7 +250,9 @@ impl Dictation {
             Ok(Ok(())) => Event::Downloaded(download.model),
             Ok(Err(_)) if download.cancel.load(Ordering::Relaxed) => Event::DownloadCancelled,
             Ok(Err(error)) => Event::DownloadFailed(format!("{error:#}")),
-            Err(_) => Event::DownloadFailed("Speech model download stopped; try downloading again".into()),
+            Err(_) => {
+                Event::DownloadFailed("Speech model download stopped; try downloading again".into())
+            }
         })
     }
 
@@ -244,7 +290,11 @@ impl Dictation {
     /// The model being downloaded, with (bytes done, bytes expected).
     pub fn download_progress(&self) -> Option<(SpeechModel, u64, u64)> {
         let d = self.download.as_ref()?;
-        Some((d.model, d.done.load(Ordering::Relaxed), d.total.load(Ordering::Relaxed)))
+        Some((
+            d.model,
+            d.done.load(Ordering::Relaxed),
+            d.total.load(Ordering::Relaxed),
+        ))
     }
 
     pub fn start_download(&mut self, model: SpeechModel) {
@@ -260,24 +310,43 @@ impl Dictation {
             AtomicU64::store(&total, *expected, Ordering::Relaxed);
         }
         let spawned = {
-            let (done, total, cancel) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
+            let (done, total, cancel) =
+                (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
             let wake = Arc::clone(&self.wake);
-            thread::Builder::new().name("openmic-model-download".into()).spawn(move || {
-                #[cfg(test)]
-                let result = if let Some((completion, _, _)) = test_download {
-                    completion.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("Model download fixture closed")))
-                        .and_then(|()| check_download_cancelled(&cancel))
-                } else { download_model(model, &done, &total, &cancel) };
-                #[cfg(not(test))]
-                let result = download_model(model, &done, &total, &cancel);
-                wake();
-                result
-            })
+            thread::Builder::new()
+                .name("openmic-model-download".into())
+                .spawn(move || {
+                    #[cfg(test)]
+                    let result = if let Some((completion, _, _)) = test_download {
+                        completion
+                            .recv()
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!("Model download fixture closed"))
+                            })
+                            .and_then(|()| check_download_cancelled(&cancel))
+                    } else {
+                        download_model(model, &done, &total, &cancel)
+                    };
+                    #[cfg(not(test))]
+                    let result = download_model(model, &done, &total, &cancel);
+                    wake();
+                    result
+                })
         };
         match spawned {
-            Ok(thread) => self.download = Some(Download { model, done, total, cancel, thread }),
+            Ok(thread) => {
+                self.download = Some(Download {
+                    model,
+                    done,
+                    total,
+                    cancel,
+                    thread,
+                })
+            }
             Err(error) => {
-                let _ = self.events.0.send(Event::DownloadFailed(format!("Could not start model download: {error}")));
+                let _ = self.events.0.send(Event::DownloadFailed(format!(
+                    "Could not start model download: {error}"
+                )));
                 (self.wake)();
             }
         }
@@ -285,7 +354,11 @@ impl Dictation {
 
     /// Hold a GUI-initiated download without making a network request.
     #[cfg(test)]
-    pub(crate) fn hold_next_download_for_test(&mut self, done: u64, total: u64) -> Sender<Result<()>> {
+    pub(crate) fn hold_next_download_for_test(
+        &mut self,
+        done: u64,
+        total: u64,
+    ) -> Sender<Result<()>> {
         let (completion, wait) = crossbeam_channel::bounded(1);
         self.next_download = Some((wait, done, total));
         completion
@@ -298,7 +371,9 @@ impl Dictation {
     }
 
     pub fn download_cancelling(&self) -> bool {
-        self.download.as_ref().is_some_and(|download| download.cancel.load(Ordering::Relaxed))
+        self.download
+            .as_ref()
+            .is_some_and(|download| download.cancel.load(Ordering::Relaxed))
     }
 
     /// Transcribe `take` and type the words into the focused app.
@@ -309,15 +384,20 @@ impl Dictation {
         }
         if self.worker.is_none() {
             let (jobs, queue) = crossbeam_channel::unbounded();
-            let (events, wake, pending) =
-                (self.events.0.clone(), Arc::clone(&self.wake), Arc::clone(&self.pending));
+            let (events, wake, pending) = (
+                self.events.0.clone(),
+                Arc::clone(&self.wake),
+                Arc::clone(&self.pending),
+            );
             let spawned = thread::Builder::new()
                 .name("openmic-dictation".into())
                 .spawn(move || transcribe_loop(&queue, &events, &*wake, &pending));
             match spawned {
                 Ok(thread) => self.worker = Some(TranscriptionWorker { jobs, thread }),
                 Err(error) => {
-                    let _ = self.events.0.send(Event::Failed(format!("Could not start speech-to-text: {error}")));
+                    let _ = self.events.0.send(Event::Failed(format!(
+                        "Could not start speech-to-text: {error}"
+                    )));
                     (self.wake)();
                     return;
                 }
@@ -325,14 +405,29 @@ impl Dictation {
         }
         self.pending.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::clone(&self.transcription_cancel);
-        if self.worker.as_ref().unwrap().jobs.send(Job { model, take, cancel }).is_err() {
+        if self
+            .worker
+            .as_ref()
+            .unwrap()
+            .jobs
+            .send(Job {
+                model,
+                take,
+                cancel,
+            })
+            .is_err()
+        {
             // The receiver is gone, so this worker cannot change pending again.
             self.discard_worker();
         }
     }
 
     fn reap_worker(&mut self) {
-        if self.worker.as_ref().is_some_and(|worker| worker.thread.is_finished()) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.thread.is_finished())
+        {
             self.discard_worker();
         }
     }
@@ -340,7 +435,9 @@ impl Dictation {
     fn discard_worker(&mut self) {
         self.worker = None;
         if self.pending.swap(0, Ordering::Relaxed) > 0 {
-            let _ = self.events.0.send(Event::Failed("Speech-to-text stopped; record again to retry".into()));
+            let _ = self.events.0.send(Event::Failed(
+                "Speech-to-text stopped; record again to retry".into(),
+            ));
             (self.wake)();
         }
     }
@@ -355,9 +452,19 @@ impl Drop for Dictation {
 
 /// Worker thread: keep the last model loaded, since loading it takes longer
 /// than transcribing a phrase.
-fn transcribe_loop(queue: &Receiver<Job>, events: &Sender<Event>, wake: &dyn Fn(), pending: &AtomicU64) {
+fn transcribe_loop(
+    queue: &Receiver<Job>,
+    events: &Sender<Event>,
+    wake: &dyn Fn(),
+    pending: &AtomicU64,
+) {
     let mut loaded: Option<(SpeechModel, Transcriber)> = None;
-    for Job { model, take, cancel } in queue.iter() {
+    for Job {
+        model,
+        take,
+        cancel,
+    } in queue.iter()
+    {
         let result = (|| -> Result<String> {
             check_transcription_cancelled(&cancel)?;
             let samples = take.samples_cancellable(&cancel)?;
@@ -389,7 +496,11 @@ fn check_transcription_cancelled(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-fn transcription_event(result: Result<String>, cancel: &AtomicBool, type_text: impl FnOnce(&str, &AtomicBool) -> Result<()>) -> Event {
+fn transcription_event(
+    result: Result<String>,
+    cancel: &AtomicBool,
+    type_text: impl FnOnce(&str, &AtomicBool) -> Result<()>,
+) -> Event {
     if cancel.load(Ordering::Relaxed) {
         return Event::TranscriptionCancelled;
     }
@@ -418,10 +529,17 @@ struct DownloadConnector(Duration);
 impl Connector for DownloadConnector {
     type Out = DownloadTransport;
 
-    fn connect(&self, details: &ConnectionDetails, chained: Option<()>) -> Result<Option<Self::Out>, ureq::Error> {
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
         Ok(DefaultConnector::default()
             .connect(details, chained)?
-            .map(|inner| DownloadTransport { inner, idle_timeout: self.0 }))
+            .map(|inner| DownloadTransport {
+                inner,
+                idle_timeout: self.0,
+            }))
     }
 }
 
@@ -480,7 +598,11 @@ pub(crate) fn download_agent(idle_timeout: Duration) -> ureq::Agent {
         .max_idle_connections(0)
         .max_idle_connections_per_host(0)
         .build();
-    ureq::Agent::with_parts(config, DownloadConnector(idle_timeout), ureq::unversioned::resolver::DefaultResolver::default())
+    ureq::Agent::with_parts(
+        config,
+        DownloadConnector(idle_timeout),
+        ureq::unversioned::resolver::DefaultResolver::default(),
+    )
 }
 
 pub(crate) fn check_download_cancelled(cancel: &AtomicBool) -> Result<()> {
@@ -490,7 +612,11 @@ pub(crate) fn check_download_cancelled(cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn read_download_chunk(reader: &mut impl Read, buf: &mut [u8], cancel: &AtomicBool) -> Result<usize> {
+pub(crate) fn read_download_chunk(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    cancel: &AtomicBool,
+) -> Result<usize> {
     check_download_cancelled(cancel)?;
     let read = reader.read(buf);
     // Prefer the requested cancellation over the I/O timeout that woke us.
@@ -498,7 +624,12 @@ pub(crate) fn read_download_chunk(reader: &mut impl Read, buf: &mut [u8], cancel
     Ok(read?)
 }
 
-fn download_model(model: SpeechModel, done: &AtomicU64, total: &AtomicU64, cancel: &AtomicBool) -> Result<()> {
+fn download_model(
+    model: SpeechModel,
+    done: &AtomicU64,
+    total: &AtomicU64,
+    cancel: &AtomicBool,
+) -> Result<()> {
     check_download_cancelled(cancel)?;
     let dir = model.dir();
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -522,7 +653,8 @@ fn download_model(model: SpeechModel, done: &AtomicU64, total: &AtomicU64, cance
         }
         let partial = dir.join(format!("{name}.part"));
         let result = (|| -> Result<()> {
-            let mut out = File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
+            let mut out =
+                File::create(&partial).with_context(|| format!("create {}", partial.display()))?;
             let mut reader = body.into_reader();
             let mut buf = vec![0u8; 1 << 16];
             let mut got = 0u64;
@@ -566,7 +698,8 @@ impl Transcriber {
     fn load(which: SpeechModel) -> Result<Self> {
         let dir = which.dir();
         let config: Config = serde_json::from_str(
-            &fs::read_to_string(dir.join("config.json")).context("read the speech model's config")?,
+            &fs::read_to_string(dir.join("config.json"))
+                .context("read the speech model's config")?,
         )
         .context("read the speech model's config")?;
         let tokens = Tokens::load(&dir.join("tokenizer.json"))?;
@@ -581,7 +714,9 @@ impl Transcriber {
         // Only plain text: no timestamps, languages or task tokens.
         let suppress = (0..config.vocab_size as u32)
             .map(|id| {
-                if config.suppress_tokens.contains(&id) || (id > tokens.eot && tokens.special.contains(&id)) {
+                if config.suppress_tokens.contains(&id)
+                    || (id > tokens.eot && tokens.special.contains(&id))
+                {
                     f32::NEG_INFINITY
                 } else {
                     0.0
@@ -621,13 +756,24 @@ impl Transcriber {
         let max_tokens = self.model.config.max_target_positions / 2;
         let mel = m::audio::pcm_to_mel(&self.model.config, audio, &self.mel_filters);
         let frames = mel.len() / n_mels;
-        let mel = Tensor::from_vec(mel, (1, n_mels, frames), &Device::Cpu)?
-            .narrow(2, 0, m::N_FRAMES.min(frames))?;
+        let mel = Tensor::from_vec(mel, (1, n_mels, frames), &Device::Cpu)?.narrow(
+            2,
+            0,
+            m::N_FRAMES.min(frames),
+        )?;
         check_transcription_cancelled(cancel)?;
         let features = self.model.encoder.forward(&mel, true)?;
         check_transcription_cancelled(cancel)?;
 
-        let Tokens { sot, eot, transcribe, no_timestamps, no_speech, space, .. } = self.tokens;
+        let Tokens {
+            sot,
+            eot,
+            transcribe,
+            no_timestamps,
+            no_speech,
+            space,
+            ..
+        } = self.tokens;
         let mut tokens = vec![sot];
         if self.multilingual {
             let language = self.detect_language(&features)?;
@@ -669,7 +815,10 @@ impl Transcriber {
     }
 
     fn logits(&self, ys: &Tensor, position: usize) -> Result<Vec<f32>> {
-        let logits = self.model.decoder.final_linear(&ys.i((..1, position..position + 1))?)?;
+        let logits = self
+            .model
+            .decoder
+            .final_linear(&ys.i((..1, position..position + 1))?)?;
         Ok(logits.i(0)?.i(0)?.to_dtype(DType::F32)?.to_vec1()?)
     }
 
@@ -697,7 +846,9 @@ fn argmax(values: &[f32]) -> u32 {
 fn softmax_at(logits: &[f32], index: u32) -> f32 {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
-    logits.get(index as usize).map_or(0.0, |l| (l - max).exp() / sum)
+    logits
+        .get(index as usize)
+        .map_or(0.0, |l| (l - max).exp() / sum)
 }
 
 /// Whisper's byte-level BPE vocabulary: enough to decode its output.
@@ -729,22 +880,38 @@ impl Tokens {
         struct Model {
             vocab: HashMap<String, u32>,
         }
-        let file: File = serde_json::from_str(&fs::read_to_string(path).context("read the speech tokenizer")?)
-            .context("read the speech tokenizer")?;
-        let mut text: HashMap<u32, String> = file.model.vocab.into_iter().map(|(t, id)| (id, t)).collect();
+        let file: File =
+            serde_json::from_str(&fs::read_to_string(path).context("read the speech tokenizer")?)
+                .context("read the speech tokenizer")?;
+        let mut text: HashMap<u32, String> = file
+            .model
+            .vocab
+            .into_iter()
+            .map(|(t, id)| (id, t))
+            .collect();
         let mut special = HashSet::new();
         let mut named = HashMap::new();
         let mut languages = Vec::new();
         for token in file.added_tokens {
             special.insert(token.id);
-            let inner = token.content.strip_prefix("<|").and_then(|s| s.strip_suffix("|>"));
-            if inner.is_some_and(|s| (2..=3).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase())) {
+            let inner = token
+                .content
+                .strip_prefix("<|")
+                .and_then(|s| s.strip_suffix("|>"));
+            if inner.is_some_and(|s| {
+                (2..=3).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase())
+            }) {
                 languages.push(token.id);
             }
             named.insert(token.content.clone(), token.id);
             text.insert(token.id, token.content);
         }
-        let id = |name: &str| named.get(name).copied().with_context(|| format!("the speech tokenizer has no {name}"));
+        let id = |name: &str| {
+            named
+                .get(name)
+                .copied()
+                .with_context(|| format!("the speech tokenizer has no {name}"))
+        };
         Ok(Self {
             sot: id(m::SOT_TOKEN)?,
             eot: id(m::EOT_TOKEN)?,
@@ -754,7 +921,10 @@ impl Tokens {
                 .iter()
                 .find_map(|name| named.get(*name).copied())
                 .context("the speech tokenizer has no no-speech token")?,
-            space: text.iter().find(|(_, t)| *t == "Ġ").map_or(220, |(id, _)| *id),
+            space: text
+                .iter()
+                .find(|(_, t)| *t == "Ġ")
+                .map_or(220, |(id, _)| *id),
             text,
             special,
             languages,
@@ -782,7 +952,10 @@ fn unicode_to_byte(ch: char) -> Option<u8> {
         return Some(c as u8);
     }
     let shifted = c.checked_sub(256)?;
-    (0..=255u32).filter(|&b| !printable(b)).nth(shifted as usize).map(|b| b as u8)
+    (0..=255u32)
+        .filter(|&b| !printable(b))
+        .nth(shifted as usize)
+        .map(|b| b as u8)
 }
 
 /// Whisper's mel filterbank (librosa's Slaney scale and normalisation),
@@ -814,7 +987,9 @@ fn mel_filters(n_mels: usize) -> Vec<f32> {
         let norm = 2.0 / (hi - lo);
         for k in 0..bins {
             let hz = sr / 2.0 * k as f64 / (bins - 1) as f64;
-            let weight = ((hz - lo) / (mid - lo)).min((hi - hz) / (hi - mid)).max(0.0);
+            let weight = ((hz - lo) / (mid - lo))
+                .min((hi - hz) / (hi - mid))
+                .max(0.0);
             filters[i * bins + k] = (weight * norm) as f32;
         }
     }
@@ -836,7 +1011,8 @@ fn decimate(samples: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
             } else {
                 (2.0 * std::f64::consts::PI * cutoff * n).sin() / (std::f64::consts::PI * n)
             };
-            let blackman = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (TAPS - 1) as f64).cos()
+            let blackman = 0.42
+                - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (TAPS - 1) as f64).cos()
                 + 0.08 * (4.0 * std::f64::consts::PI * i as f64 / (TAPS - 1) as f64).cos();
             (sinc * blackman) as f32
         })
@@ -855,7 +1031,10 @@ fn decimate(samples: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
                 .enumerate()
                 .filter_map(|(i, k)| {
                     let at = center as isize + i as isize - half;
-                    usize::try_from(at).ok().and_then(|at| samples.get(at)).map(|s| s * k)
+                    usize::try_from(at)
+                        .ok()
+                        .and_then(|at| samples.get(at))
+                        .map(|s| s * k)
                 })
                 .sum())
         })
@@ -869,8 +1048,8 @@ fn decimate(samples: &[f32], cancel: &AtomicBool) -> Result<Vec<f32>> {
 fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
     use std::time::Instant;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-        SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
 
     // Characters typed while the shortcut's Ctrl or Alt is still held
@@ -893,14 +1072,21 @@ fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
             ki: KEYBDINPUT {
                 wVk: VIRTUAL_KEY(0),
                 wScan: unit,
-                dwFlags: if up { KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } else { KEYEVENTF_UNICODE },
+                dwFlags: if up {
+                    KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                } else {
+                    KEYEVENTF_UNICODE
+                },
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     };
     let text = text.replace(['\r', '\n'], " ");
-    let inputs: Vec<INPUT> = text.encode_utf16().flat_map(|unit| [key(unit, false), key(unit, true)]).collect();
+    let inputs: Vec<INPUT> = text
+        .encode_utf16()
+        .flat_map(|unit| [key(unit, false), key(unit, true)])
+        .collect();
     check_transcription_cancelled(cancel)?;
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if (sent as usize) < inputs.len() {
@@ -909,10 +1095,17 @@ fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
+    crate::x11_type::type_text(text, cancel)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn type_text(_text: &str, cancel: &AtomicBool) -> Result<()> {
     check_transcription_cancelled(cancel)?;
-    bail!("typing into other apps isn't available on Linux; the transcript is shown to copy")
+    bail!(
+        "typing into other apps isn't available on this platform; the transcript is shown to copy"
+    )
 }
 
 #[cfg(test)]
@@ -939,10 +1132,17 @@ mod tests {
         fs::create_dir(&model).unwrap();
         let weights = model.join("model.safetensors");
         fs::write(&weights, b"test model").unwrap();
-        let held = File::options().read(true).share_mode(1).open(&weights).unwrap();
+        let held = File::options()
+            .read(true)
+            .share_mode(1)
+            .open(&weights)
+            .unwrap();
         let error = remove_model_files(&model).unwrap_err();
         assert!(error.to_string().contains(&model.display().to_string()));
-        assert!(error.downcast_ref::<std::io::Error>().is_some(), "preserve the cause for the UI");
+        assert!(
+            error.downcast_ref::<std::io::Error>().is_some(),
+            "preserve the cause for the UI"
+        );
         assert_eq!(fs::read(&weights).unwrap(), b"test model");
         drop(held);
         remove_model_files(&model).unwrap();
@@ -951,7 +1151,10 @@ mod tests {
 
     fn short_take() -> Take {
         // Too short to load a speech model or type into the focused app.
-        crate::record::Recorder::from_samples_for_test(&[0.2; 96]).finish().unwrap().unwrap()
+        crate::record::Recorder::from_samples_for_test(&[0.2; 96])
+            .finish()
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -963,7 +1166,11 @@ mod tests {
             let cancelled = Arc::clone(&dictation.transcription_cancel);
             dictation.cancel_transcription();
             assert!(dictation.busy() && dictation.transcription_cancelling());
-            assert_eq!(dictation.pending.load(Ordering::Relaxed), 2, "keep tracking the worker until it stops");
+            assert_eq!(
+                dictation.pending.load(Ordering::Relaxed),
+                2,
+                "keep tracking the worker until it stops"
+            );
             if queue_before_completion {
                 dictation.transcribe(SpeechModel::TinyEn, short_take());
                 assert!(!dictation.transcription_cancelling());
@@ -971,16 +1178,27 @@ mod tests {
             }
             release.send(()).unwrap();
             for _ in 0..2 {
-                assert!(matches!(dictation.events.1.recv_timeout(Duration::from_secs(3)), Ok(Event::TranscriptionCancelled)));
+                assert!(matches!(
+                    dictation.events.1.recv_timeout(Duration::from_secs(3)),
+                    Ok(Event::TranscriptionCancelled)
+                ));
             }
             if !queue_before_completion {
                 assert!(!dictation.busy());
                 dictation.cancel_transcription(); // an idle click must not cancel the next take
                 dictation.transcribe(SpeechModel::TinyEn, short_take());
             }
-            assert!(matches!(dictation.events.1.recv_timeout(Duration::from_secs(3)), Ok(Event::Nothing)),
-                "a fresh take must survive an earlier cancellation");
-            assert!(cancelled.load(Ordering::Relaxed), "cancelled jobs must keep their original flag");
+            assert!(
+                matches!(
+                    dictation.events.1.recv_timeout(Duration::from_secs(3)),
+                    Ok(Event::Nothing)
+                ),
+                "a fresh take must survive an earlier cancellation"
+            );
+            assert!(
+                cancelled.load(Ordering::Relaxed),
+                "cancelled jobs must keep their original flag"
+            );
             assert!(!dictation.busy() && !dictation.transcription_cancelling());
             assert!(dictation.poll().is_none());
             let worker = dictation.worker.take().unwrap();
@@ -1000,8 +1218,13 @@ mod tests {
         drop(dictation);
         release.send(()).unwrap();
         for _ in 0..2 {
-            assert!(matches!(events.recv_timeout(Duration::from_secs(3)), Ok(Event::TranscriptionCancelled)),
-                "discarded owners must not let queued audio reach typing");
+            assert!(
+                matches!(
+                    events.recv_timeout(Duration::from_secs(3)),
+                    Ok(Event::TranscriptionCancelled)
+                ),
+                "discarded owners must not let queued audio reach typing"
+            );
         }
         assert_eq!(pending.load(Ordering::Relaxed), 0);
         drop(worker.jobs);
@@ -1020,7 +1243,10 @@ mod tests {
             done.send(flag.load(Ordering::Relaxed)).unwrap();
             check_download_cancelled(&flag)
         });
-        dictation.download = Some(Download { cancel: Arc::clone(&cancel), ..test_download(thread) });
+        dictation.download = Some(Download {
+            cancel: Arc::clone(&cancel),
+            ..test_download(thread)
+        });
         assert!(!dictation.download.as_ref().unwrap().thread.is_finished());
         drop(dictation);
         assert!(cancel.load(Ordering::Relaxed));
@@ -1031,7 +1257,10 @@ mod tests {
     fn wait_for_thread<T>(worker: &thread::JoinHandle<T>) {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !worker.is_finished() {
-            assert!(std::time::Instant::now() < deadline, "background worker did not exit");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background worker did not exit"
+            );
             thread::sleep(Duration::from_millis(1));
         }
     }
@@ -1041,7 +1270,9 @@ mod tests {
         for poll_before_retry in [true, false] {
             let wakes = Arc::new(AtomicU64::new(0));
             let wake_count = Arc::clone(&wakes);
-            let mut dictation = Dictation::new(move || { wake_count.fetch_add(1, Ordering::Relaxed); });
+            let mut dictation = Dictation::new(move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            });
             let (jobs, queue) = crossbeam_channel::unbounded();
             let (release, stop) = crossbeam_channel::bounded::<()>(0);
             let thread = thread::spawn(move || {
@@ -1057,7 +1288,9 @@ mod tests {
             wait_for_thread(&dictation.worker.as_ref().unwrap().thread);
 
             if poll_before_retry {
-                assert!(matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again")));
+                assert!(
+                    matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again"))
+                );
                 assert!(!dictation.busy());
                 assert!(dictation.worker.is_none());
                 assert!(dictation.poll().is_none());
@@ -1065,11 +1298,19 @@ mod tests {
             }
             dictation.transcribe(SpeechModel::TinyEn, short_take());
             if !poll_before_retry {
-                assert!(matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again")));
+                assert!(
+                    matches!(dictation.poll(), Some(Event::Failed(error)) if error.contains("record again"))
+                );
             }
-            assert!(matches!(dictation.events.1.recv_timeout(Duration::from_secs(3)), Ok(Event::Nothing)));
+            assert!(matches!(
+                dictation.events.1.recv_timeout(Duration::from_secs(3)),
+                Ok(Event::Nothing)
+            ));
             assert!(!dictation.busy());
-            assert!(dictation.poll().is_none(), "failure must only be reported once");
+            assert!(
+                dictation.poll().is_none(),
+                "failure must only be reported once"
+            );
             let worker = dictation.worker.take().unwrap();
             drop(worker.jobs);
             worker.thread.join().unwrap();
@@ -1082,7 +1323,9 @@ mod tests {
         let (jobs, queue) = crossbeam_channel::unbounded();
         drop(queue);
         let (release, stop) = crossbeam_channel::bounded::<()>(0);
-        let thread = thread::spawn(move || { let _ = stop.recv(); });
+        let thread = thread::spawn(move || {
+            let _ = stop.recv();
+        });
         dictation.worker = Some(TranscriptionWorker { jobs, thread });
         dictation.pending.store(2, Ordering::Relaxed);
         dictation.transcribe(SpeechModel::TinyEn, short_take());
@@ -1099,9 +1342,18 @@ mod tests {
         let (jobs, queue) = crossbeam_channel::unbounded();
         let thread = thread::spawn(move || drop(queue));
         dictation.worker = Some(TranscriptionWorker { jobs, thread });
-        dictation.events.0.send(Event::Transcribed { text: "Keep these words".into(), typing_error: None }).unwrap();
+        dictation
+            .events
+            .0
+            .send(Event::Transcribed {
+                text: "Keep these words".into(),
+                typing_error: None,
+            })
+            .unwrap();
         wait_for_thread(&dictation.worker.as_ref().unwrap().thread);
-        assert!(matches!(dictation.poll(), Some(Event::Transcribed { text, .. }) if text == "Keep these words"));
+        assert!(
+            matches!(dictation.poll(), Some(Event::Transcribed { text, .. }) if text == "Keep these words")
+        );
         assert!(dictation.worker.is_none());
         assert!(!dictation.busy());
         assert!(dictation.poll().is_none());
@@ -1109,8 +1361,11 @@ mod tests {
 
     fn test_download(thread: thread::JoinHandle<Result<()>>) -> Download {
         Download {
-            model: SpeechModel::TinyEn, done: Arc::default(), total: Arc::default(),
-            cancel: Arc::default(), thread,
+            model: SpeechModel::TinyEn,
+            done: Arc::default(),
+            total: Arc::default(),
+            cancel: Arc::default(),
+            thread,
         }
     }
 
@@ -1119,7 +1374,11 @@ mod tests {
         let mut dictation = Dictation::new(|| {});
         for succeeds in [true, false] {
             let thread = thread::spawn(move || {
-                if succeeds { Ok(()) } else { bail!("connection interrupted") }
+                if succeeds {
+                    Ok(())
+                } else {
+                    bail!("connection interrupted")
+                }
             });
             wait_for_thread(&thread);
             dictation.download = Some(test_download(thread));
@@ -1127,12 +1386,20 @@ mod tests {
             assert!(matches!(dictation.poll(), Some(Event::Nothing)));
             assert!(dictation.download_progress().is_some());
             if succeeds {
-                assert!(matches!(dictation.poll(), Some(Event::Downloaded(SpeechModel::TinyEn))));
+                assert!(matches!(
+                    dictation.poll(),
+                    Some(Event::Downloaded(SpeechModel::TinyEn))
+                ));
             } else {
-                assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "connection interrupted"));
+                assert!(
+                    matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "connection interrupted")
+                );
             }
             assert!(dictation.download_progress().is_none());
-            assert!(dictation.poll().is_none(), "completion must only be reported once");
+            assert!(
+                dictation.poll().is_none(),
+                "completion must only be reported once"
+            );
         }
     }
 
@@ -1143,7 +1410,9 @@ mod tests {
         wait_for_thread(&thread);
         dictation.download = Some(test_download(thread));
         dictation.cancel_download(); // a crash must not be hidden by a late cancellation
-        assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error.contains("try downloading again")));
+        assert!(
+            matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error.contains("try downloading again"))
+        );
         assert!(dictation.download_progress().is_none());
         assert!(dictation.poll().is_none());
     }
@@ -1155,7 +1424,10 @@ mod tests {
         wait_for_thread(&thread);
         dictation.download = Some(test_download(thread));
         dictation.cancel_download();
-        assert!(matches!(dictation.poll(), Some(Event::Downloaded(SpeechModel::TinyEn))));
+        assert!(matches!(
+            dictation.poll(),
+            Some(Event::Downloaded(SpeechModel::TinyEn))
+        ));
         assert!(dictation.download_progress().is_none() && !dictation.download_cancelling());
         assert!(dictation.poll().is_none());
     }
@@ -1170,9 +1442,18 @@ mod tests {
             let _ = stop.recv();
             check_download_cancelled(&cancelled)
         });
-        dictation.download = Some(Download { cancel, ..test_download(thread) });
-        dictation.events.0.send(Event::DownloadFailed("earlier startup failed".into())).unwrap();
-        assert!(matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "earlier startup failed"));
+        dictation.download = Some(Download {
+            cancel,
+            ..test_download(thread)
+        });
+        dictation
+            .events
+            .0
+            .send(Event::DownloadFailed("earlier startup failed".into()))
+            .unwrap();
+        assert!(
+            matches!(dictation.poll(), Some(Event::DownloadFailed(error)) if error == "earlier startup failed")
+        );
         assert!(dictation.download_progress().is_some());
         assert!(!dictation.download_cancelling());
         assert!(dictation.poll().is_none());
@@ -1188,10 +1469,14 @@ mod tests {
 
     #[test]
     fn failed_typing_keeps_the_recognized_words() {
-        let event = transcription_event(Ok("Keep my words.".into()), &AtomicBool::new(false), |text, _| {
-            assert_eq!(text, "Keep my words.");
-            bail!("Windows blocked typing")
-        });
+        let event = transcription_event(
+            Ok("Keep my words.".into()),
+            &AtomicBool::new(false),
+            |text, _| {
+                assert_eq!(text, "Keep my words.");
+                bail!("Windows blocked typing")
+            },
+        );
         match event {
             Event::Transcribed { text, typing_error } => {
                 assert_eq!(text, "Keep my words.");
@@ -1204,33 +1489,52 @@ mod tests {
     #[test]
     fn successful_typing_keeps_the_transcript_without_an_error() {
         let event = transcription_event(Ok("Hello".into()), &AtomicBool::new(false), |_, _| Ok(()));
-        assert!(matches!(event, Event::Transcribed { text, typing_error: None } if text == "Hello"));
+        assert!(
+            matches!(event, Event::Transcribed { text, typing_error: None } if text == "Hello")
+        );
     }
 
     #[test]
     fn silence_and_transcription_errors_never_type() {
         assert!(matches!(
-            transcription_event(Ok(String::new()), &AtomicBool::new(false), |_, _| panic!("silence must not type")),
+            transcription_event(Ok(String::new()), &AtomicBool::new(false), |_, _| panic!(
+                "silence must not type"
+            )),
             Event::Nothing
         ));
-        let event = transcription_event(Err(anyhow::anyhow!("model unavailable")), &AtomicBool::new(false), |_, _| {
-            panic!("failed transcription must not type")
-        });
+        let event = transcription_event(
+            Err(anyhow::anyhow!("model unavailable")),
+            &AtomicBool::new(false),
+            |_, _| panic!("failed transcription must not type"),
+        );
         assert!(matches!(event, Event::Failed(error) if error == "model unavailable"));
     }
 
     #[test]
     fn cancelled_results_never_type_or_replace_the_previous_transcript() {
-        for result in [Ok("Discard these words".into()), Ok(String::new()), Err(anyhow::anyhow!("model unavailable"))] {
-            let event = transcription_event(result, &AtomicBool::new(true), |_, _| panic!("cancelled dictation must never type"));
+        for result in [
+            Ok("Discard these words".into()),
+            Ok(String::new()),
+            Err(anyhow::anyhow!("model unavailable")),
+        ] {
+            let event = transcription_event(result, &AtomicBool::new(true), |_, _| {
+                panic!("cancelled dictation must never type")
+            });
             assert!(matches!(event, Event::TranscriptionCancelled));
         }
         let cancel = AtomicBool::new(false);
-        let event = transcription_event(Ok("Waiting for shortcut modifiers".into()), &cancel, |_, flag| {
-            flag.store(true, Ordering::Relaxed);
-            check_transcription_cancelled(flag)
-        });
-        assert!(matches!(event, Event::TranscriptionCancelled), "cancellation must also stop typing while modifiers are held");
+        let event = transcription_event(
+            Ok("Waiting for shortcut modifiers".into()),
+            &cancel,
+            |_, flag| {
+                flag.store(true, Ordering::Relaxed);
+                check_transcription_cancelled(flag)
+            },
+        );
+        assert!(
+            matches!(event, Event::TranscriptionCancelled),
+            "cancellation must also stop typing while modifiers are held"
+        );
     }
 
     #[test]
@@ -1240,7 +1544,9 @@ mod tests {
             flag.store(true, Ordering::Relaxed);
             Ok(())
         });
-        assert!(matches!(event, Event::Transcribed { text, typing_error: None } if text == "Already typed"));
+        assert!(
+            matches!(event, Event::Transcribed { text, typing_error: None } if text == "Already typed")
+        );
     }
 
     #[test]
@@ -1248,18 +1554,28 @@ mod tests {
         assert!(decimate(&[0.25; 48_000], &AtomicBool::new(true)).is_err());
         let take = short_take();
         assert!(take.samples_cancellable(&AtomicBool::new(true)).is_err());
-        assert_eq!(take.samples().unwrap().len(), 48, "cancelling a read must not damage its source");
+        assert_eq!(
+            take.samples().unwrap().len(),
+            48,
+            "cancelling a read must not damage its source"
+        );
     }
 
     /// A real loopback HTTP response whose body stalls after one byte.
-    fn stalled_response() -> (impl Read, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+    fn stalled_response() -> (
+        impl Read,
+        std::sync::mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/model", listener.local_addr().unwrap());
         let (stop, stopped) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let mut reader = std::io::BufReader::new(&mut stream);
             loop {
                 let mut line = String::new();
@@ -1268,15 +1584,23 @@ mod tests {
                     break;
                 }
             }
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na").unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na")
+                .unwrap();
             let _ = stopped.recv_timeout(Duration::from_secs(3));
         });
         let agent = download_agent(Duration::from_millis(250));
         // Resolution dispatches a worker even for numeric loopback addresses.
         // Allow setup time under parallel load while keeping the 250 ms I/O cap.
-        let reader = agent.get(&url).config()
-            .timeout_resolve(Some(Duration::from_secs(3))).build()
-            .call().unwrap().into_body().into_reader();
+        let reader = agent
+            .get(&url)
+            .config()
+            .timeout_resolve(Some(Duration::from_secs(3)))
+            .build()
+            .call()
+            .unwrap()
+            .into_body()
+            .into_reader();
         (reader, stop, server)
     }
 
@@ -1321,7 +1645,10 @@ mod tests {
                 self.inner.read(buf)
             }
         }
-        let mut reader = GatedRead { inner: reader, gate };
+        let mut reader = GatedRead {
+            inner: reader,
+            gate,
+        };
         let started = std::time::Instant::now();
         let result = read_download_chunk(&mut reader, &mut buf, &cancel);
         let elapsed = started.elapsed();
@@ -1348,7 +1675,11 @@ mod tests {
     #[test]
     fn byte_level_characters_decode_to_bytes() {
         assert_eq!(unicode_to_byte('A'), Some(b'A'));
-        assert_eq!(unicode_to_byte('Ġ'), Some(b' '), "GPT-2 writes a space as Ġ");
+        assert_eq!(
+            unicode_to_byte('Ġ'),
+            Some(b' '),
+            "GPT-2 writes a space as Ġ"
+        );
         assert_eq!(unicode_to_byte('Ċ'), Some(b'\n'));
         assert_eq!(unicode_to_byte('\u{0100}'), Some(0));
     }
@@ -1358,7 +1689,8 @@ mod tests {
     #[test]
     #[ignore]
     fn transcribes_a_recording() {
-        let wav = std::env::var("OPENMIC_SPEECH_WAV").expect("set OPENMIC_SPEECH_WAV to a speech recording");
+        let wav = std::env::var("OPENMIC_SPEECH_WAV")
+            .expect("set OPENMIC_SPEECH_WAV to a speech recording");
         let model = SpeechModel::TinyEn;
         let (done, total, cancel) = (AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false));
         download_model(model, &done, &total, &cancel).unwrap();
@@ -1371,19 +1703,31 @@ mod tests {
         let text = transcriber.transcribe(&audio, &cancel).unwrap();
         println!("{:.2?}: {text}", started.elapsed());
         assert!(!text.is_empty());
-        assert_eq!(transcriber.transcribe(&vec![0.0; 16_000], &cancel).unwrap(), "", "silence types nothing");
+        assert_eq!(
+            transcriber.transcribe(&vec![0.0; 16_000], &cancel).unwrap(),
+            "",
+            "silence types nothing"
+        );
     }
 
     #[test]
     fn decimation_keeps_speech_and_drops_what_whisper_cannot_hear() {
         let tone = |hz: f32| -> Vec<f32> {
-            (0..48_000).map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin()).collect()
+            (0..48_000)
+                .map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin())
+                .collect()
         };
-        let rms = |s: &[f32]| (s[100..s.len() - 100].iter().map(|x| x * x).sum::<f32>() / (s.len() - 200) as f32).sqrt();
+        let rms = |s: &[f32]| {
+            (s[100..s.len() - 100].iter().map(|x| x * x).sum::<f32>() / (s.len() - 200) as f32)
+                .sqrt()
+        };
         let cancel = AtomicBool::new(false);
         let voice = decimate(&tone(1_000.0), &cancel).unwrap();
         assert_eq!(voice.len(), 16_000);
         assert!((rms(&voice) - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01);
-        assert!(rms(&decimate(&tone(12_000.0), &cancel).unwrap()) < 0.01, "would alias to 4 kHz");
+        assert!(
+            rms(&decimate(&tone(12_000.0), &cancel).unwrap()) < 0.01,
+            "would alias to 4 kHz"
+        );
     }
 }
