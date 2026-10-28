@@ -659,7 +659,43 @@ pub fn startup_enabled() -> bool {
 
 #[cfg(target_os = "linux")]
 fn startup_enabled_at(path: &Path) -> bool {
-    path.is_file()
+    fs::read_to_string(path).is_ok_and(|text| autostart_entry_enabled(&text))
+}
+
+/// `Hidden=true` (every desktop) or `X-GNOME-Autostart-enabled=false` means
+/// the session will not launch this file. OpenMic must not treat that as on
+/// and rewrite it, or the next launch would turn login startup back on.
+#[cfg(target_os = "linux")]
+fn autostart_entry_enabled(text: &str) -> bool {
+    let mut in_entry = false;
+    let mut saw_entry = false;
+    let mut hidden = false;
+    let mut gnome_enabled = true;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest.strip_suffix(']').unwrap_or(rest).trim();
+            in_entry = name == "Desktop Entry";
+            saw_entry |= in_entry;
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.split_whitespace().next().unwrap_or("");
+        match key.trim() {
+            "Hidden" => hidden = value.eq_ignore_ascii_case("true"),
+            "X-GNOME-Autostart-enabled" => gnome_enabled = !value.eq_ignore_ascii_case("false"),
+            _ => {}
+        }
+    }
+    saw_entry && !hidden && gnome_enabled
 }
 
 #[cfg(target_os = "linux")]
@@ -669,21 +705,67 @@ pub fn set_startup(enabled: bool) -> Result<()> {
     set_startup_at(&path, enabled, &exe)
 }
 
+/// Login opens OpenMic the way it was left. There is no notification area
+/// to hide in, and `--minimized` would also suppress the strip.
+#[cfg(target_os = "linux")]
+fn autostart_text(exe: &Path) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=OpenMic\nExec={}\nX-GNOME-Autostart-enabled=true\n",
+        desktop_exec(exe)
+    )
+}
+
+/// `Exec` value that survives both desktop-file readers OpenMic meets.
+/// GNOME unescapes `\s \n \t \r \\`, expands `%%` to `%`, then splits the
+/// result like a shell. KDE does the same unescape and then runs `sh -c`.
+#[cfg(target_os = "linux")]
+fn desktop_exec(exe: &Path) -> String {
+    let mut quoted = String::from("'");
+    for c in exe.display().to_string().chars() {
+        match c {
+            '\'' => quoted.push_str("'\\''"),
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    let mut escaped = String::new();
+    for c in quoted.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\t' => escaped.push_str("\\t"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
 #[cfg(target_os = "linux")]
 fn set_startup_at(path: &Path, enabled: bool, exe: &Path) -> Result<()> {
     if enabled {
+        let entry = autostart_text(exe);
+        if fs::read_to_string(path).ok().as_deref() == Some(entry.as_str()) {
+            return Ok(());
+        }
         let parent = path.parent().context("locate the autostart folder")?;
         fs::create_dir_all(parent).context("create the autostart folder")?;
-        let exe = exe
-            .display()
-            .to_string()
-            .replace('%', "%%")
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let entry = format!(
-            "[Desktop Entry]\nType=Application\nName=OpenMic\nExec=\"{exe}\" {MINIMIZED_ARG}\nX-GNOME-Autostart-enabled=true\n"
-        );
-        fs::write(path, entry).with_context(|| format!("write {}", path.display()))
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("create a temporary file beside {}", path.display()))?;
+        file.write_all(entry.as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        file.as_file()
+            .sync_all()
+            .with_context(|| format!("write {}", path.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("write {}", path.display()))?;
+        file.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
     } else {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -713,11 +795,187 @@ fn xdg_autostart_entry_round_trips() {
     set_startup_at(&path, true, exe).unwrap();
     assert!(startup_enabled_at(&path));
     let text = fs::read_to_string(&path).unwrap();
-    assert!(text.starts_with("[Desktop Entry]"));
-    assert!(text.contains("Exec=\"/opt/My App/openmic\" --minimized"));
+    assert!(text.starts_with("[Desktop Entry]\n"));
+    assert!(
+        !text.contains(MINIMIZED_ARG),
+        "login opens the window you left; {text}"
+    );
+    assert_eq!(decoded_exec(&text), vec![exe.display().to_string()]);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1,
+        "replacement leaves no temporary file"
+    );
+
+    let folder = path.parent().unwrap();
+    let mode = fs::metadata(folder).unwrap().permissions();
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o555)).unwrap();
+    set_startup_at(&path, true, exe).unwrap();
+    fs::set_permissions(folder, mode).unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        text,
+        "an entry that already launches this binary is left untouched"
+    );
+
     set_startup_at(&path, false, exe).unwrap();
     assert!(!startup_enabled_at(&path));
     set_startup_at(&path, false, exe).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn xdg_autostart_exec_round_trips_awkward_paths() {
+    for path in [
+        "/opt/My App/openmic",
+        "/home/it's mine/openmic",
+        "/opt/price$100/`release`/openmic",
+        "/opt/100%/openmic",
+        "/opt/a\\b\"c/openmic",
+        "/opt/line\nbreak\ttab/openmic",
+        "/home/üser/ОpenMic/openmic",
+    ] {
+        let text = autostart_text(Path::new(path));
+        assert!(autostart_entry_enabled(&text), "{path}");
+        assert_eq!(decoded_exec(&text), vec![path.to_string()], "{text}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_desktop_disabled_autostart_entry_stays_disabled() {
+    let enabled = "\
+[Desktop Entry]
+Type=Application
+Name=OpenMic
+Exec=/usr/bin/openmic
+X-GNOME-Autostart-enabled=true
+";
+    assert!(autostart_entry_enabled(enabled));
+    assert!(autostart_entry_enabled(
+        "[Desktop Entry]\nType=Application\n# Hidden=true\n"
+    ));
+    assert!(autostart_entry_enabled(
+        "[Desktop Entry]\nType=Application\n\n[Desktop Action]\nHidden=true\n"
+    ));
+    assert!(autostart_entry_enabled(
+        "[Desktop Entry]\nX-GNOME-Autostart-enabled=false\nX-GNOME-Autostart-enabled=true\n"
+    ));
+
+    for text in [
+        "[Desktop Entry]\nHidden=true\nExec=/usr/bin/openmic\n",
+        "[Desktop Entry]\nHidden = TRUE\nType=Application\n",
+        "[Desktop Entry]\nX-GNOME-Autostart-enabled=false\nType=Application\n",
+        "[Desktop Entry]\nHidden=true\nX-GNOME-Autostart-enabled=true\n",
+        "[Desktop Entry]\nX-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-enabled=false\n",
+        "Hidden=false\nExec=/usr/bin/openmic\n",
+        "[Other]\nType=Application\n",
+        "# [Desktop Entry]\nHidden=false\n",
+        "",
+    ] {
+        assert!(!autostart_entry_enabled(text), "{text:?}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("openmic.desktop");
+    let disabled = "[Desktop Entry]\nHidden=true\nX-GNOME-Autostart-Delay=20\nExec=/old/openmic\n";
+    fs::write(&path, disabled).unwrap();
+    assert!(
+        !startup_enabled_at(&path),
+        "a disabled file must not be refreshed back on"
+    );
+    set_startup_at(&path, true, Path::new("/opt/OpenMic/openmic")).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(startup_enabled_at(&path));
+    assert!(!text.contains("Hidden"), "{text}");
+    assert_eq!(
+        decoded_exec(&text),
+        vec!["/opt/OpenMic/openmic".to_string()]
+    );
+}
+
+/// Undo the desktop-file and shell escaping [`desktop_exec`] applies.
+#[cfg(all(target_os = "linux", test))]
+fn decoded_exec(entry: &str) -> Vec<String> {
+    let raw = entry
+        .lines()
+        .find_map(|line| line.strip_prefix("Exec="))
+        .unwrap_or_else(|| panic!("missing Exec in {entry}"));
+    let mut unescaped = String::new();
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            unescaped.push(c);
+            continue;
+        }
+        unescaped.push(match chars.next() {
+            Some('s') => ' ',
+            Some('n') => '\n',
+            Some('t') => '\t',
+            Some('r') => '\r',
+            Some('\\') => '\\',
+            Some(other) => panic!("invalid desktop escape \\{other} in {raw}"),
+            None => panic!("truncated desktop escape in {raw}"),
+        });
+    }
+    let mut expanded = String::new();
+    let mut chars = unescaped.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            assert_eq!(
+                chars.next(),
+                Some('%'),
+                "a literal percent must be %% before field codes: {unescaped}"
+            );
+            expanded.push('%');
+        } else {
+            expanded.push(c);
+        }
+    }
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    let mut chars = expanded.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_arg = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    current.push(c);
+                }
+            }
+            '\\' => {
+                in_arg = true;
+                current.push(
+                    chars
+                        .next()
+                        .unwrap_or_else(|| panic!("truncated shell escape in {expanded}")),
+                );
+            }
+            ' ' | '\t' | '\n' => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            _ => {
+                in_arg = true;
+                current.push(c);
+            }
+        }
+    }
+    if in_arg {
+        args.push(current);
+    }
+    args
 }
 
 #[cfg(test)]

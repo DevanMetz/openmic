@@ -22,11 +22,6 @@ fn startup_hint() -> &'static str {
     "Starts hidden in the notification area"
 }
 
-#[cfg(not(windows))]
-fn startup_hint() -> &'static str {
-    "Starts minimized"
-}
-
 impl App {
     pub(super) fn draw_settings_tab(&mut self, ui: &mut egui::Ui) {
         let hotkeys_ok = self.hotkeys.is_some();
@@ -69,9 +64,9 @@ impl App {
             CYAN,
             |_| {},
             |ui| {
-                let startup = ui
-                    .checkbox(&mut self.settings.start_with_windows, startup_label())
-                    .on_hover_text(startup_hint());
+                let startup = ui.checkbox(&mut self.settings.start_with_windows, startup_label());
+                #[cfg(windows)]
+                let startup = startup.on_hover_text(startup_hint());
                 widgets::scroll_on_focus(&startup);
                 if startup.changed() {
                     self.toggle_startup(self.settings.start_with_windows);
