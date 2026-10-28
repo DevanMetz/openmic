@@ -46,7 +46,68 @@ use std::sync::Arc;
 
 use eframe::egui;
 
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Launch,
+    Help,
+    Version,
+    Error(String),
+}
+
+fn parse_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> CliAction {
+    let mut args = args.into_iter();
+    let mut action = CliAction::Launch;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--help" | "-h") => action = CliAction::Help,
+            Some("--version" | "-V") if action != CliAction::Help => action = CliAction::Version,
+            Some("--version" | "-V" | "--minimized") => {}
+            Some("--after-update") => {
+                if !args
+                    .next()
+                    .is_some_and(|pid| pid.to_str().is_some_and(|pid| pid.parse::<u32>().is_ok()))
+                {
+                    return CliAction::Error("--after-update requires a process ID".into());
+                }
+            }
+            _ => return CliAction::Error(format!("unknown argument: {}", arg.to_string_lossy())),
+        }
+    }
+    action
+}
+
+const USAGE: &str = "Usage: openmic [--minimized]\n\nOptions:\n  -h, --help       Print help\n  -V, --version    Print version\n      --minimized  Start in the notification area when enabled\n";
+
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: attaching to the parent console takes no pointers and is best effort.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> eframe::Result<()> {
+    match parse_args(std::env::args_os().skip(1)) {
+        CliAction::Launch => {}
+        CliAction::Help => {
+            attach_parent_console();
+            print!("{USAGE}");
+            return Ok(());
+        }
+        CliAction::Version => {
+            attach_parent_console();
+            println!("openmic {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        CliAction::Error(error) => {
+            attach_parent_console();
+            eprintln!("error: {error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
+
     // After an update, wait for the old copy to quit before claiming the
     // single-instance lock and the audio devices.
     let updated = update::wait_for_previous_version();
@@ -185,6 +246,28 @@ fn work_area_size() -> Option<[f32; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_actions_and_internal_launch_arguments() {
+        let parse = |args: &[&str]| parse_args(args.iter().map(std::ffi::OsString::from));
+        assert_eq!(parse(&[]), CliAction::Launch);
+        assert_eq!(
+            parse(&["--minimized", "--after-update", "123"]),
+            CliAction::Launch
+        );
+        for flag in ["--help", "-h"] {
+            assert_eq!(parse(&[flag]), CliAction::Help);
+        }
+        for flag in ["--version", "-V"] {
+            assert_eq!(parse(&[flag]), CliAction::Version);
+        }
+        assert!(matches!(parse(&["--unknown"]), CliAction::Error(_)));
+        assert!(matches!(parse(&["--after-update"]), CliAction::Error(_)));
+        assert!(matches!(
+            parse(&["--after-update", "nope"]),
+            CliAction::Error(_)
+        ));
+    }
 
     #[test]
     fn restored_windows_fit_smaller_screens_in_both_directions() {
