@@ -10,12 +10,12 @@ mod mic_test;
 mod overlay;
 mod routes;
 mod settings_tab;
-mod startup;
-#[cfg(test)]
-mod status_controls;
 #[cfg(test)]
 mod snapshot;
 mod sound_tab;
+mod startup;
+#[cfg(test)]
+mod status_controls;
 mod updates;
 
 use std::collections::{HashMap, VecDeque};
@@ -30,15 +30,15 @@ use crate::config::{self, Settings};
 use crate::default_mic;
 use crate::dictation::{self, Dictation};
 use crate::dsp::{self, Params};
-use crate::engine::{list_devices, Engine};
+use crate::engine::{Engine, ListedDevice, list_device_details, list_devices};
 use crate::hotkeys::{self, Hotkeys};
+use crate::logfile;
 use crate::record::{Recorder, Source, Take};
 use crate::tray::Tray;
-use crate::logfile;
 use crate::update::Updater;
 use crate::viz;
 use crate::widgets;
-use routes::{cable_input, choose_routes};
+use routes::{cable_input, choose_routes_with_monitors};
 
 pub(crate) const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);
 pub(crate) const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
@@ -58,7 +58,13 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 5] = [Page::Voice, Page::Soundboard, Page::Record, Page::Dictation, Page::Settings];
+    const ALL: [Page; 5] = [
+        Page::Voice,
+        Page::Soundboard,
+        Page::Record,
+        Page::Dictation,
+        Page::Settings,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -107,7 +113,7 @@ impl DefaultMicSync {
 
 /// Something the tray menu or a global hotkey asked for. Delivered through
 /// a channel so it works while the window is hidden.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))] // tray commands have no Linux source
+#[cfg_attr(not(any(windows, target_os = "linux", test)), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Show,
@@ -160,6 +166,8 @@ struct DictationRecording {
 pub struct App {
     settings: Settings,
     inputs: Vec<String>,
+    /// Monitor-source display names, including ones recognized by backend id.
+    monitor_inputs: Vec<String>,
     outputs: Vec<String>,
     page: Page,
     engine: Option<Engine>,
@@ -282,12 +290,17 @@ impl App {
         let mut app = Self::stopped(settings);
         app.updated_at = just_updated.then(Instant::now);
         {
-            // Development builds never replace themselves on their own, and
-            // releases only ship an updater for Windows.
+            // Development builds never replace themselves on their own.
             let ctx = ctx.clone();
-            app.updater = Updater::new(!cfg!(debug_assertions) && cfg!(windows), move || ctx.request_repaint());
+            app.updater = Updater::new(
+                !cfg!(debug_assertions) && crate::update::updates_supported(),
+                move || ctx.request_repaint(),
+            );
         }
-        app.tray = Tray::new(ctx, app.commands.0.clone()).ok();
+        match Tray::new(ctx, app.commands.0.clone()) {
+            Ok(tray) => app.tray = Some(tray),
+            Err(error) => logfile::warn(format_args!("notification area unavailable: {error:#}")),
+        }
         {
             let (commands, ctx) = (app.commands.0.clone(), ctx.clone());
             instance.on_show(move || {
@@ -312,7 +325,9 @@ impl App {
 
     /// Apply startup side effects only after preferences have loaded successfully.
     fn initialize_settings(&mut self) {
-        if self.settings.load_error.is_some() { return; }
+        if self.settings.load_error.is_some() {
+            return;
+        }
         // Reflect the actual registry state, like the Python app did.
         self.settings.start_with_windows = config::startup_enabled();
         if self.settings.start_with_windows {
@@ -320,13 +335,11 @@ impl App {
             // registered it without the start-hidden flag.
             let _ = config::set_startup(true);
         }
-        let host = cpal_host();
-        self.inputs = list_devices(&host, false);
-        self.outputs = list_devices(&host, true);
+        let (inputs, outputs) = host_devices();
         // Keep saved devices even if absent: a USB mic can appear after a
         // Windows-startup launch, and must not be silently swapped out. The
         // processed output goes back to VB-Cable on every launch.
-        choose_routes(&mut self.settings, &self.inputs, &self.outputs, true, false);
+        self.apply_devices(inputs, outputs, true, false);
 
         if self.settings.auto_start {
             self.start_engine();
@@ -338,6 +351,7 @@ impl App {
         Self {
             settings,
             inputs: Vec::new(),
+            monitor_inputs: Vec::new(),
             outputs: Vec::new(),
             page: Page::Voice,
             engine: None,
@@ -409,14 +423,25 @@ impl App {
         Params {
             model: s.model,
             strength: s.strength.clamp(0.0, 1.0),
-            input_gain: dsp::db_to_gain(s.input_gain_db.clamp(*dsp::INPUT_GAIN_RANGE.start(), *dsp::INPUT_GAIN_RANGE.end())),
-            output_gain: dsp::db_to_gain(s.output_gain_db.clamp(*dsp::OUTPUT_GAIN_RANGE.start(), *dsp::OUTPUT_GAIN_RANGE.end())),
+            input_gain: dsp::db_to_gain(
+                s.input_gain_db
+                    .clamp(*dsp::INPUT_GAIN_RANGE.start(), *dsp::INPUT_GAIN_RANGE.end()),
+            ),
+            output_gain: dsp::db_to_gain(s.output_gain_db.clamp(
+                *dsp::OUTPUT_GAIN_RANGE.start(),
+                *dsp::OUTPUT_GAIN_RANGE.end(),
+            )),
             monitor_gain: s.monitor_volume.clamp(0.0, 1.0),
             sound_gain: s.sound_volume.clamp(0.0, 1.0),
             gate_enabled: s.gate,
-            gate_threshold_db: s.gate_threshold_db.clamp(*dsp::GATE_THRESHOLD_RANGE.start(), *dsp::GATE_THRESHOLD_RANGE.end()),
+            gate_threshold_db: s.gate_threshold_db.clamp(
+                *dsp::GATE_THRESHOLD_RANGE.start(),
+                *dsp::GATE_THRESHOLD_RANGE.end(),
+            ),
             highpass: s.highpass,
-            highpass_hz: s.highpass_hz.clamp(*dsp::HIGHPASS_RANGE.start(), *dsp::HIGHPASS_RANGE.end()),
+            highpass_hz: s
+                .highpass_hz
+                .clamp(*dsp::HIGHPASS_RANGE.start(), *dsp::HIGHPASS_RANGE.end()),
             voice_gate: s.voice_gate,
             voice_threshold: s.voice_threshold.clamp(0.0, 1.0),
             bypass: s.bypass,
@@ -469,7 +494,8 @@ impl App {
                     "Install VB-Cable or choose a processed output"
                 } else {
                     "Create the virtual mic or choose a processed output"
-                }.into(),
+                }
+                .into(),
                 AMBER,
             );
             return;
@@ -477,15 +503,34 @@ impl App {
         let monitor = &self.settings.monitor_output;
         let monitor_present = !monitor.is_empty() && self.outputs.contains(monitor);
         let missing = [
-            (&self.settings.microphone, &self.inputs, "a microphone", true),
-            (&self.settings.output, &self.outputs, "a processed output", true),
+            (
+                &self.settings.microphone,
+                &self.inputs,
+                "a microphone",
+                true,
+            ),
+            (
+                &self.settings.output,
+                &self.outputs,
+                "a processed output",
+                true,
+            ),
             // Only wait for the monitor when it is switched on.
-            (monitor, &self.outputs, "a monitor output", self.settings.monitor),
+            (
+                monitor,
+                &self.outputs,
+                "a monitor output",
+                self.settings.monitor,
+            ),
         ]
         .into_iter()
         .find(|(name, pool, _, needed)| *needed && !pool.contains(name))
         .map(|(name, _, fallback, _)| {
-            if name.is_empty() { fallback } else { name.as_str() }
+            if name.is_empty() {
+                fallback
+            } else {
+                name.as_str()
+            }
         });
         if let Some(name) = missing {
             logfile::info(format_args!("waiting for {name} to connect"));
@@ -502,7 +547,12 @@ impl App {
             self.settings.monitor
         };
         let monitor = (monitor_present && monitor_wanted).then_some(monitor.as_str());
-        match Engine::start(&self.settings.microphone, &self.settings.output, monitor, self.params()) {
+        match Engine::start(
+            &self.settings.microphone,
+            &self.settings.output,
+            monitor,
+            self.params(),
+        ) {
             Ok(engine) => {
                 logfile::info(format_args!(
                     "processing started: mic '{}', output '{}', monitor {}",
@@ -547,7 +597,11 @@ impl App {
 
     /// Live route change: stop old engine, start new, hand the clip playheads over.
     fn restart_engine(&mut self) {
-        let clips = self.engine.as_ref().map(Engine::take_clips).unwrap_or_default();
+        let clips = self
+            .engine
+            .as_ref()
+            .map(Engine::take_clips)
+            .unwrap_or_default();
         let pending = self.clip_loads.take();
         self.stop_engine(false);
         self.status = ("Switching route…".into(), AMBER);
@@ -556,7 +610,9 @@ impl App {
             engine.resume_clips(clips);
         }
         self.clip_loads = pending;
-        if self.engine.is_none() { self.cancel_pending_playback(None); }
+        if self.engine.is_none() {
+            self.cancel_pending_playback(None);
+        }
         self.sync_clip_progress();
     }
 
@@ -576,39 +632,62 @@ impl App {
     fn refresh_devices(&mut self, replace_missing: bool) {
         #[cfg(test)]
         if let Some((inputs, outputs)) = &self.devices_for_test {
-            self.update_devices(inputs.clone(), outputs.clone(), replace_missing);
+            self.update_devices(
+                named_inputs(inputs.clone()),
+                outputs.clone(),
+                replace_missing,
+            );
             return;
         }
-        let host = cpal_host();
-        self.update_devices(list_devices(&host, false), list_devices(&host, true), replace_missing);
+        let (inputs, outputs) = host_devices();
+        self.update_devices(inputs, outputs, replace_missing);
     }
 
-    fn update_devices(&mut self, inputs: Vec<String>, outputs: Vec<String>, replace_missing: bool) {
+    fn apply_devices(
+        &mut self,
+        inputs: Vec<ListedDevice>,
+        outputs: Vec<String>,
+        prefer_cable: bool,
+        replace_missing: bool,
+    ) -> bool {
         let before = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
-        let had_cable = cable_input(&self.outputs).is_some();
-        self.inputs = inputs;
+        let (names, monitors) = crate::record::index_inputs(&inputs);
+        self.inputs = names;
         self.outputs = outputs;
-        let cable_appeared = !had_cable && cable_input(&self.outputs).is_some();
-        choose_routes(
+        self.monitor_inputs = monitors;
+        choose_routes_with_monitors(
             &mut self.settings,
             &self.inputs,
             &self.outputs,
-            cable_appeared,
+            prefer_cable,
             replace_missing,
+            &self.monitor_inputs,
         );
         let after = (
             self.settings.microphone.clone(),
             self.settings.output.clone(),
             self.settings.monitor_output.clone(),
         );
-        if before != after {
+        before != after
+    }
+
+    fn update_devices(
+        &mut self,
+        inputs: Vec<ListedDevice>,
+        outputs: Vec<String>,
+        replace_missing: bool,
+    ) {
+        let had_cable = cable_input(&self.outputs).is_some();
+        let cable_appeared = !had_cable && cable_input(&outputs).is_some();
+        let changed = self.apply_devices(inputs, outputs, cable_appeared, replace_missing);
+        if changed {
             self.touch();
         }
-        if self.engine.is_some() && before != after {
+        if self.engine.is_some() && changed {
             self.restart_engine();
         } else if self.waiting_for_device && self.engine.is_none() {
             // Retry even when the saved names did not change. Stop cancels
@@ -621,7 +700,11 @@ impl App {
         if let Err(e) = config::set_startup(enabled) {
             logfile::error(format_args!(
                 "{} could not be updated: {e:#}",
-                if cfg!(windows) { "Windows startup" } else { "Login startup" }
+                if cfg!(windows) {
+                    "Windows startup"
+                } else {
+                    "Login startup"
+                }
             ));
             // Removing a legacy entry can fail after the main entry changed.
             self.settings.start_with_windows = config::startup_enabled();
@@ -630,7 +713,11 @@ impl App {
             self.status = (
                 format!(
                     "{} {}",
-                    if cfg!(windows) { "Windows startup" } else { "Login startup" },
+                    if cfg!(windows) {
+                        "Windows startup"
+                    } else {
+                        "Login startup"
+                    },
                     if enabled { "enabled" } else { "disabled" }
                 ),
                 GREEN,
@@ -680,11 +767,17 @@ impl App {
     /// it, and put the user's own default back otherwise. Runs only when the
     /// relevant state changes, with throttled retries after a failure.
     fn sync_default_mic(&mut self) {
-        if self.settings.load_error.is_some() { return; }
+        if self.settings.load_error.is_some() {
+            return;
+        }
         // A brief reconnect keeps VB-Cable as the default rather than
         // flipping Discord's input back and forth.
         let running = self.engine.is_some() || self.reconnecting;
-        let key = (running, self.settings.output.clone(), self.settings.default_mic);
+        let key = (
+            running,
+            self.settings.output.clone(),
+            self.settings.default_mic,
+        );
         if !self.default_mic_sync.begin(&key, Instant::now()) {
             return;
         }
@@ -702,7 +795,9 @@ impl App {
         match (self.settings.saved_default_mic.clone(), want) {
             (saved, true) => {
                 if saved.is_none() {
-                    let Ok(before) = default_mic::current() else { return };
+                    let Ok(before) = default_mic::current() else {
+                        return;
+                    };
                     if before.console == cable_mic && before.communications == cable_mic {
                         self.default_mic_sync.complete(key);
                         return; // already the default; nothing to restore later
@@ -718,7 +813,11 @@ impl App {
                     // Keep the snapshot both for Stop and the next retry.
                     logfile::warn(format_args!(
                         "default mic not set to {}: {e:#}",
-                        if cfg!(windows) { "VB-Cable" } else { "OpenMic Microphone" }
+                        if cfg!(windows) {
+                            "VB-Cable"
+                        } else {
+                            "OpenMic Microphone"
+                        }
                     ));
                     self.warn_until = Some((short(&format!("{e:#}")), Instant::now()));
                     return;
@@ -785,12 +884,20 @@ impl App {
             Command::Dictate => {
                 if self.dictating.is_none() {
                     self.start_dictation();
-                } else if self.dictating.as_ref().is_some_and(|recording| !recording.hold_to_talk) {
+                } else if self
+                    .dictating
+                    .as_ref()
+                    .is_some_and(|recording| !recording.hold_to_talk)
+                {
                     self.stop_dictation();
                 }
             }
             Command::DictateReleased => {
-                if self.dictating.as_ref().is_some_and(|recording| recording.hold_to_talk) {
+                if self
+                    .dictating
+                    .as_ref()
+                    .is_some_and(|recording| recording.hold_to_talk)
+                {
                     self.stop_dictation();
                 }
             }
@@ -835,7 +942,11 @@ impl App {
         let saving = self.recording_save.is_some();
         let dialog = egui::Modal::new(egui::Id::new("quit-recording")).show(ctx, |ui| {
             ui.set_width(340.0);
-            ui.heading(if saving { "Saving before quitting…" } else { "Quit without saving?" });
+            ui.heading(if saving {
+                "Saving before quitting…"
+            } else {
+                "Quit without saving?"
+            });
             ui.label(if saving {
                 "Your recording is being saved. OpenMic will close when it finishes."
             } else if finishing {
@@ -847,12 +958,24 @@ impl App {
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button(if saving || finishing { "Keep OpenMic open" } else if active { "Keep recording" } else { "Back to recording" }).clicked() {
+                if ui
+                    .button(if saving || finishing {
+                        "Keep OpenMic open"
+                    } else if active {
+                        "Keep recording"
+                    } else {
+                        "Back to recording"
+                    })
+                    .clicked()
+                {
                     self.confirm_quit = false;
                 }
                 if saving {
                     ui.spinner();
-                } else if ui.button(RichText::new("Discard and quit").color(widgets::text_color(ui, RED))).clicked() {
+                } else if ui
+                    .button(RichText::new("Discard and quit").color(widgets::text_color(ui, RED)))
+                    .clicked()
+                {
                     self.quit(ctx);
                 }
             });
@@ -871,18 +994,27 @@ impl App {
             return;
         }
         let saved = self.settings.window_position.filter(|&px| on_a_monitor(px));
-        let (place, record) = self.window_placement.step(saved, info.outer_rect, info.native_pixels_per_point);
+        let (place, record) =
+            self.window_placement
+                .step(saved, info.outer_rect, info.native_pixels_per_point);
         if let Some(pos) = place {
             ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
         }
-        let (Some(outer), Some(inner), Some(ppp)) = (info.outer_rect, info.inner_rect, info.native_pixels_per_point)
-        else {
+        let (Some(outer), Some(inner), Some(ppp)) = (
+            info.outer_rect,
+            info.inner_rect,
+            info.native_pixels_per_point,
+        ) else {
             return;
         };
         if record {
-            let px = [(outer.min.x * ppp).round() as i32, (outer.min.y * ppp).round() as i32];
+            let px = [
+                (outer.min.x * ppp).round() as i32,
+                (outer.min.y * ppp).round() as i32,
+            ];
             let size = [inner.width().round(), inner.height().round()];
-            if self.settings.window_position != Some(px) || self.settings.window_size != Some(size) {
+            if self.settings.window_position != Some(px) || self.settings.window_size != Some(size)
+            {
                 self.settings.window_position = Some(px);
                 self.settings.window_size = Some(size);
                 self.touch();
@@ -922,7 +1054,11 @@ impl App {
             Some("Wait for the mic test to finish")
         } else if self.dictation.download_progress().is_some() {
             Some("Wait for the speech model download to finish or cancel it")
-        } else if self.clip_import.as_ref().is_some_and(sound_tab::ClipImport::has_pending_files) {
+        } else if self
+            .clip_import
+            .as_ref()
+            .is_some_and(sound_tab::ClipImport::has_pending_files)
+        {
             Some("Wait for clip imports to finish or cancel them")
         } else {
             None
@@ -958,7 +1094,11 @@ impl App {
     fn handle_close(&mut self, ctx: &egui::Context) {
         let close = ctx.input(|i| i.viewport().close_requested());
         if close && !self.quitting {
-            if self.settings.load_error.is_none() && self.settings.close_to_tray && self.tray.is_some() && !self.confirm_quit {
+            if self.settings.load_error.is_none()
+                && self.settings.close_to_tray
+                && self.tray.is_some()
+                && !self.confirm_quit
+            {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
                 self.hidden = true;
@@ -1000,12 +1140,18 @@ impl App {
             self.cancel_capture();
         }
         let bindings = self.hotkey_bindings();
-        let Some(hotkeys) = &mut self.hotkeys else { return };
+        let Some(hotkeys) = &mut self.hotkeys else {
+            return;
+        };
         let refused = hotkeys.set(bindings);
         if !refused.is_empty() {
             logfile::warn(format_args!(
                 "shortcuts refused by {}: {}",
-                if cfg!(windows) { "Windows" } else { "the system" },
+                if cfg!(windows) {
+                    "Windows"
+                } else {
+                    "the system"
+                },
                 refused.join(", ")
             ));
             self.hotkey_status = (
@@ -1038,9 +1184,14 @@ impl App {
         }
         if let Some(combo) = &combo {
             let h = &mut self.settings.hotkeys;
-            let slots = [&mut h.mute, &mut h.bypass, &mut h.stop_clips, &mut h.dictate]
-                .into_iter()
-                .chain(self.settings.sounds.iter_mut().map(|p| &mut p.hotkey));
+            let slots = [
+                &mut h.mute,
+                &mut h.bypass,
+                &mut h.stop_clips,
+                &mut h.dictate,
+            ]
+            .into_iter()
+            .chain(self.settings.sounds.iter_mut().map(|p| &mut p.hotkey));
             for slot in slots {
                 if slot.as_deref().is_some_and(|s| hotkeys::same(s, combo)) {
                     *slot = None;
@@ -1059,77 +1210,172 @@ impl App {
 
     /// Record the next key press as a shortcut for the binding being set.
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
-        let Some(binding) = self.capturing.clone() else { return };
+        let Some(binding) = self.capturing.clone() else {
+            return;
+        };
         let held_id = egui::Id::new(("captured-shortcut-keys", ctx.viewport_id()));
-        let held = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(held_id)).unwrap_or_default();
+        let held = ctx
+            .data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(held_id))
+            .unwrap_or_default();
         let pressed = ctx.input(|i| {
-            i.events.iter().enumerate().find_map(|(index, event)| match event {
-                egui::Event::Key { key, physical_key, pressed: true, repeat, modifiers } => {
-                    let physical = physical_key.unwrap_or(*key);
-                    // egui counts repeats by logical key, even for different physical keys.
-                    let fresh = !repeat || physical_key.is_some_and(|scan| held.iter().any(|(saved, saved_scan)|
-                        saved == key && saved_scan.is_some_and(|saved_scan| saved_scan != scan)));
-                    (!is_modifier(physical) && fresh).then_some((index, *key, *physical_key, physical, *modifiers))
-                }
-                _ => None,
-            })
+            i.events
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| match event {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: true,
+                        repeat,
+                        modifiers,
+                    } => {
+                        let physical = physical_key.unwrap_or(*key);
+                        // egui counts repeats by logical key, even for different physical keys.
+                        let fresh = !repeat
+                            || physical_key.is_some_and(|scan| {
+                                held.iter().any(|(saved, saved_scan)| {
+                                    saved == key
+                                        && saved_scan.is_some_and(|saved_scan| saved_scan != scan)
+                                })
+                            });
+                        (!is_modifier(physical) && fresh).then_some((
+                            index,
+                            *key,
+                            *physical_key,
+                            physical,
+                            *modifiers,
+                        ))
+                    }
+                    _ => None,
+                })
         });
-        let cancel_button = !matches!(binding, Binding::Pad(_)) && pressed.is_some_and(|(_, logical, _, key, modifiers)|
-            matches!(logical, egui::Key::Enter | egui::Key::Space) && logical == key && !modifiers.ctrl && !modifiers.alt)
-            && ctx.data(|data| data.get_temp::<egui::Id>(egui::Id::new(("shortcut-row", &binding)).with("edit")))
+        let cancel_button = !matches!(binding, Binding::Pad(_))
+            && pressed.is_some_and(|(_, logical, _, key, modifiers)| {
+                matches!(logical, egui::Key::Enter | egui::Key::Space)
+                    && logical == key
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+            })
+            && ctx
+                .data(|data| {
+                    data.get_temp::<egui::Id>(
+                        egui::Id::new(("shortcut-row", &binding)).with("edit"),
+                    )
+                })
                 .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)));
         let combination = pressed.map(|(_, _, _, key, modifiers)| hotkeys::combo(key, modifiers));
         if let Some((index, logical, physical, _, _)) = pressed {
-            let tail = ctx.input_mut(|input| {
-                let next = input.events.iter().enumerate().skip(index + 1).find_map(|(next, event)| match event {
-                    egui::Event::Key { key, physical_key, pressed: true, repeat, .. }
-                        if !is_modifier(physical_key.unwrap_or(*key)) && (!repeat
-                            || !shortcut_key_matches((logical, physical), (*key, *physical_key))) => Some(next),
-                    _ => None,
+            let tail =
+                ctx.input_mut(|input| {
+                    let next = input.events.iter().enumerate().skip(index + 1).find_map(
+                        |(next, event)| match event {
+                            egui::Event::Key {
+                                key,
+                                physical_key,
+                                pressed: true,
+                                repeat,
+                                ..
+                            } if !is_modifier(physical_key.unwrap_or(*key))
+                                && (!repeat
+                                    || !shortcut_key_matches(
+                                        (logical, physical),
+                                        (*key, *physical_key),
+                                    )) =>
+                            {
+                                Some(next)
+                            }
+                            _ => None,
+                        },
+                    );
+                    next.map(|next| {
+                        // Releases also clear activation guards on the replacement control.
+                        let mut tail: Vec<_> = input.events[..next]
+                            .iter()
+                            .filter(|event| {
+                                matches!(event, egui::Event::Key { pressed: false, .. })
+                            })
+                            .cloned()
+                            .collect();
+                        tail.extend(input.events.split_off(next));
+                        tail
+                    })
                 });
-                next.map(|next| {
-                    // Releases also clear activation guards on the replacement control.
-                    let mut tail: Vec<_> = input.events[..next].iter().filter(|event|
-                        matches!(event, egui::Event::Key { pressed: false, .. })).cloned().collect();
-                    tail.extend(input.events.split_off(next));
-                    tail
-                })
-            });
             if let Some(tail) = tail {
-                ctx.plugin_or_default::<DeferredFocusInput>().lock().events.push_front(tail);
+                ctx.plugin_or_default::<DeferredFocusInput>()
+                    .lock()
+                    .events
+                    .push_front(tail);
                 ctx.request_repaint();
             }
         }
         let down = ctx.input(|input| {
             let mut down = Vec::new();
             for event in &input.events {
-                if let egui::Event::Key { key, physical_key, pressed, .. } = event
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    ..
+                } = event
                     && !is_modifier(physical_key.unwrap_or(*key))
                 {
                     let key = (*key, *physical_key);
-                    if *pressed { if !down.contains(&key) { down.push(key); } }
-                    else { down.retain(|saved| !shortcut_key_matches(*saved, key)); }
+                    if *pressed {
+                        if !down.contains(&key) {
+                            down.push(key);
+                        }
+                    } else {
+                        down.retain(|saved| !shortcut_key_matches(*saved, key));
+                    }
                 }
             }
             down
         });
         if !down.is_empty() {
             ctx.data_mut(|data| {
-                let mut held = data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(held_id).unwrap_or_default();
-                for key in down { if !held.contains(&key) { held.push(key); } }
+                let mut held = data
+                    .get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(held_id)
+                    .unwrap_or_default();
+                for key in down {
+                    if !held.contains(&key) {
+                        held.push(key);
+                    }
+                }
                 data.insert_temp(held_id, held);
             });
         }
         // Capture owns navigation and text as well as the combination's first key.
         ctx.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
-        ctx.input_mut(|input| input.events.retain(|event| !shortcut_keyboard_event(event) || matches!(event,
-            egui::Event::Key { key: egui::Key::Escape, .. }) || (cancel_button && matches!(event,
-                egui::Event::Key { key: egui::Key::Enter | egui::Key::Space, .. }))));
-        let Some((_, _, _, key, _)) = pressed else { return };
+        ctx.input_mut(|input| {
+            input.events.retain(|event| {
+                !shortcut_keyboard_event(event)
+                    || matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Escape,
+                            ..
+                        }
+                    )
+                    || (cancel_button
+                        && matches!(
+                            event,
+                            egui::Event::Key {
+                                key: egui::Key::Enter | egui::Key::Space,
+                                ..
+                            }
+                        ))
+            })
+        });
+        let Some((_, _, _, key, _)) = pressed else {
+            return;
+        };
         if key == egui::Key::Escape {
             // egui clears button focus before delivering Escape. Keep the pad reachable.
-            if matches!(binding, Binding::Pad(_)) && self.page == Page::Soundboard
-                && let Some(owner) = ctx.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus"))).flatten()
+            if matches!(binding, Binding::Pad(_))
+                && self.page == Page::Soundboard
+                && let Some(owner) = ctx
+                    .data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus")))
+                    .flatten()
             {
                 sound_tab::focus_soundboard_control(ctx, owner);
             }
@@ -1166,14 +1412,19 @@ impl App {
             return;
         }
         if !self.settings.speech_model.is_downloaded() {
-            self.dictation_status = ("Download a speech model on the Dictation page first".into(), AMBER);
+            self.dictation_status = (
+                "Download a speech model on the Dictation page first".into(),
+                AMBER,
+            );
             return;
         }
         // An empty choice falls back to the system default microphone.
         match Recorder::start(Source::Microphone, &self.settings.microphone) {
             Ok(recorder) => {
                 self.dictating = Some(DictationRecording {
-                    recorder, model: self.settings.speech_model, hold_to_talk: self.settings.dictation_hold,
+                    recorder,
+                    model: self.settings.speech_model,
+                    hold_to_talk: self.settings.dictation_hold,
                 });
                 self.dictation_status = (String::new(), MUTED);
             }
@@ -1196,7 +1447,11 @@ impl App {
 
     /// Finish and validate a take before handing it to the transcription worker.
     fn finish_dictation(&mut self) -> Option<(dictation::SpeechModel, Take)> {
-        if !self.dictating.as_ref().is_some_and(|recording| recording.recorder.ready_to_finish()) {
+        if !self
+            .dictating
+            .as_ref()
+            .is_some_and(|recording| recording.recorder.ready_to_finish())
+        {
             return None;
         }
         let recording = self.dictating.take()?;
@@ -1223,7 +1478,11 @@ impl App {
     }
 
     fn poll_dictation(&mut self) {
-        if let Some(e) = self.dictating.as_ref().and_then(|recording| recording.recorder.error()) {
+        if let Some(e) = self
+            .dictating
+            .as_ref()
+            .and_then(|recording| recording.recorder.error())
+        {
             self.dictating = None;
             self.dictation_status = (short(&e), RED);
         }
@@ -1235,9 +1494,13 @@ impl App {
         }
         while let Some(event) = self.dictation.poll() {
             self.dictation_status = match event {
-                dictation::Event::Downloaded(model) => (format!("{} is ready", model.label()), GREEN),
+                dictation::Event::Downloaded(model) => {
+                    (format!("{} is ready", model.label()), GREEN)
+                }
                 dictation::Event::DownloadCancelled => ("Model download cancelled".into(), MUTED),
-                dictation::Event::TranscriptionCancelled => ("Transcription cancelled".into(), MUTED),
+                dictation::Event::TranscriptionCancelled => {
+                    ("Transcription cancelled".into(), MUTED)
+                }
                 dictation::Event::DownloadFailed(e) => {
                     logfile::warn(format_args!("speech model download failed: {e}"));
                     (short(&e), RED)
@@ -1245,8 +1508,7 @@ impl App {
                 dictation::Event::Transcribed { text, typing_error } => {
                     self.last_dictation = text;
                     match typing_error {
-                        Some(error) if cfg!(windows) => (format!("Copy the transcript below: {error}"), AMBER),
-                        Some(_) => ("Transcript ready below".into(), MUTED),
+                        Some(error) => (format!("Copy the transcript below: {error}"), AMBER),
                         None => ("Typed".into(), GREEN),
                     }
                 }
@@ -1265,9 +1527,13 @@ impl App {
             self.run_command(ctx, command);
         }
         self.handle_close(ctx);
-        if self.quitting || self.settings.load_error.is_some() { return; }
+        if self.quitting || self.settings.load_error.is_some() {
+            return;
+        }
         self.poll_engine();
-        if self.hidden || self.page != Page::Soundboard { self.close_trim_editor(); }
+        if self.hidden || self.page != Page::Soundboard {
+            self.close_trim_editor();
+        }
         self.poll_clip_loads(ctx);
         self.pad_durations.poll(ctx);
         self.poll_recording_save(ctx);
@@ -1285,13 +1551,21 @@ impl App {
         }
         self.sync_hotkeys(ctx);
         let (muted, bypassed, running) = (self.settings.mute, self.settings.bypass, self.running());
-        let listening = self.dictating.as_ref().is_some_and(|recording| !recording.recorder.is_stopping());
+        let listening = self
+            .dictating
+            .as_ref()
+            .is_some_and(|recording| !recording.recorder.is_stopping());
         if let Some(tray) = &mut self.tray {
             tray.sync(muted, bypassed, running, listening, self.settings.collapsed);
         }
 
         if let Some(t) = self.dirty_since
-            && t.elapsed() >= if self.save_error.is_some() { DEVICE_POLL } else { Duration::from_millis(300) }
+            && t.elapsed()
+                >= if self.save_error.is_some() {
+                    DEVICE_POLL
+                } else {
+                    Duration::from_millis(300)
+                }
         {
             self.save_settings();
         }
@@ -1325,7 +1599,9 @@ impl eframe::App for App {
     /// Runs before every frame, and on its own while the window is hidden.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
-        if self.quitting { return; }
+        if self.quitting {
+            return;
+        }
         if self.settings.load_error.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
             return;
@@ -1348,7 +1624,9 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.quitting { return; }
+        if self.quitting {
+            return;
+        }
         if self.settings.load_error.is_some() {
             self.draw_settings_recovery(ui);
             return;
@@ -1358,7 +1636,9 @@ impl eframe::App for App {
         ui.data_mut(|data| data.remove::<Vec<egui::Id>>(openers));
         let routed_keyboard = if self.capturing.is_some() {
             // Shortcut capture reads the next physical key from the original batch.
-            ui.data_mut(|data| data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input")));
+            ui.data_mut(|data| {
+                data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input"))
+            });
             false
         } else {
             apply_keyboard_input(ui)
@@ -1400,7 +1680,9 @@ impl eframe::App for App {
                 Page::Settings => self.draw_settings_tab(ui),
             });
         });
-        if self.page != Page::Soundboard { self.close_trim_editor(); }
+        if self.page != Page::Soundboard {
+            self.close_trim_editor();
+        }
         if self.draw_release_notes(&ctx) {
             self.restore_release_notes_focus(&ctx);
         }
@@ -1431,34 +1713,68 @@ impl App {
             self.draw_version(ui);
         });
         if cfg!(debug_assertions) {
-            ui.label(RichText::new("dev build").small().color(widgets::text_color(ui, AMBER)))
-                .on_hover_text("Built without --release: slower, and never updates itself");
+            ui.label(
+                RichText::new("dev build")
+                    .small()
+                    .color(widgets::text_color(ui, AMBER)),
+            )
+            .on_hover_text("Built without --release: slower, and never updates itself");
         }
         ui.add_space(10.0);
-        let navigation_height = (ui.available_height() - self.status_panel_height(ui) - ui.spacing().item_spacing.y).max(0.0);
+        let navigation_height =
+            (ui.available_height() - self.status_panel_height(ui) - ui.spacing().item_spacing.y)
+                .max(0.0);
         let navigation_layout = egui::vec2(ui.available_width(), navigation_height);
-        let navigation_layout_id = egui::Id::new(("sidebar-navigation-layout", ui.ctx().viewport_id()));
+        let navigation_layout_id =
+            egui::Id::new(("sidebar-navigation-layout", ui.ctx().viewport_id()));
         let navigation_reflowed = ui.data_mut(|data| {
             let previous = data.get_temp::<egui::Vec2>(navigation_layout_id);
             data.insert_temp(navigation_layout_id, navigation_layout);
             previous.is_some_and(|previous| previous != navigation_layout)
         });
-        ScrollArea::vertical().id_salt("sidebar-navigation").max_height(navigation_height)
-            .min_scrolled_height(0.0).auto_shrink([false, true]).show(ui, |ui| {
+        ScrollArea::vertical()
+            .id_salt("sidebar-navigation")
+            .max_height(navigation_height)
+            .min_scrolled_height(0.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
                 for page in Page::ALL {
                     let label = match page {
-                        Page::Record if self.recorder.as_ref().is_some_and(Recorder::is_stopping) => "Record  • finishing".to_owned(),
+                        Page::Record
+                            if self.recorder.as_ref().is_some_and(Recorder::is_stopping) =>
+                        {
+                            "Record  • finishing".to_owned()
+                        }
                         Page::Record if self.recorder.is_some() => "Record  ⏺ REC".to_owned(),
-                        Page::Dictation if self.dictating.as_ref().is_some_and(|recording| recording.recorder.is_stopping()) => "Dictation  • finishing".to_owned(),
-                        Page::Dictation if self.dictating.is_some() => "Dictation  • listening".to_owned(),
+                        Page::Dictation
+                            if self
+                                .dictating
+                                .as_ref()
+                                .is_some_and(|recording| recording.recorder.is_stopping()) =>
+                        {
+                            "Dictation  • finishing".to_owned()
+                        }
+                        Page::Dictation if self.dictating.is_some() => {
+                            "Dictation  • listening".to_owned()
+                        }
                         _ => page.title().to_owned(),
                     };
                     let selected = self.page == page;
-                    let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
-                    let response = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, text));
+                    let text = if selected {
+                        RichText::new(label).strong()
+                    } else {
+                        RichText::new(label)
+                    };
+                    let response = ui.add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::selectable(selected, text),
+                    );
                     widgets::scroll_on_focus(&response);
-                    if navigation_reflowed && response.has_focus()
-                        && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+                    if navigation_reflowed
+                        && response.has_focus()
+                        && ui.input(|input| {
+                            !input.pointer.any_down() && !input.pointer.any_released()
+                        })
                     {
                         response.scroll_to_me(Some(egui::Align::Center));
                     }
@@ -1481,12 +1797,23 @@ impl App {
 
     fn status_panel_height(&self, ui: &mut egui::Ui) -> f32 {
         // Measure only readonly content; the processing buttons run once in the real panel.
-        let mut measure = ui.new_child(egui::UiBuilder::new().id_salt("status-size")
-            .layout(egui::Layout::bottom_up(egui::Align::Min)).invisible().sizing_pass());
+        let mut measure = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("status-size")
+                .layout(egui::Layout::bottom_up(egui::Align::Min))
+                .invisible()
+                .sizing_pass(),
+        );
         measure.add_space(8.0);
-        measure.allocate_exact_size(egui::vec2(measure.available_width(), 26.0), egui::Sense::hover());
+        measure.allocate_exact_size(
+            egui::vec2(measure.available_width(), 26.0),
+            egui::Sense::hover(),
+        );
         measure.add_space(4.0);
-        measure.allocate_exact_size(egui::vec2(measure.available_width(), 6.0), egui::Sense::hover());
+        measure.allocate_exact_size(
+            egui::vec2(measure.available_width(), 6.0),
+            egui::Sense::hover(),
+        );
         measure.add_space(4.0);
         self.draw_status_details(&mut measure);
         measure.min_rect().height()
@@ -1497,8 +1824,10 @@ impl App {
         ui.horizontal(|ui| {
             let running = self.running();
             let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-            let start = egui::Button::new(RichText::new(if running { "Stop" } else { "Start" }).color(Color32::BLACK))
-                .fill(if running { RED } else { GREEN });
+            let start = egui::Button::new(
+                RichText::new(if running { "Stop" } else { "Start" }).color(Color32::BLACK),
+            )
+            .fill(if running { RED } else { GREEN });
             let start = ui.add_sized([width, 26.0], start);
             self.restore_settings_retry_focus(&start, true);
             if start.clicked() {
@@ -1507,9 +1836,23 @@ impl App {
                 ui.ctx().request_repaint();
             }
             let muted = self.settings.mute;
-            let mute = egui::Button::new(RichText::new(if muted { "Unmute" } else { "Mute" }).color(if muted { Color32::BLACK } else { ui.visuals().text_color() }))
-                .fill(if muted { RED } else { ui.visuals().widgets.inactive.weak_bg_fill });
-            if ui.add_sized([width, 26.0], mute).on_hover_text("Silence your voice; the soundboard still plays").clicked() {
+            let mute = egui::Button::new(
+                RichText::new(if muted { "Unmute" } else { "Mute" }).color(if muted {
+                    Color32::BLACK
+                } else {
+                    ui.visuals().text_color()
+                }),
+            )
+            .fill(if muted {
+                RED
+            } else {
+                ui.visuals().widgets.inactive.weak_bg_fill
+            });
+            if ui
+                .add_sized([width, 26.0], mute)
+                .on_hover_text("Silence your voice; the soundboard still plays")
+                .clicked()
+            {
                 widgets::finish_keyboard_activation(ui.ctx());
                 self.settings.mute = !muted;
                 self.apply_live();
@@ -1519,12 +1862,26 @@ impl App {
         ui.add_space(4.0);
         // What Discord hears.
         let level = self.engine.as_ref().map(|e| e.stats().out_peak);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
         if let Some(peak) = level {
             let db = (20.0 * peak.max(1e-6).log10()).clamp(-60.0, 0.0);
-            let fill = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * (db + 60.0) / 60.0, rect.bottom()));
-            let color = if db > -6.0 { RED } else if db > -18.0 { AMBER } else { GREEN };
+            let fill = egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(
+                    rect.left() + rect.width() * (db + 60.0) / 60.0,
+                    rect.bottom(),
+                ),
+            );
+            let color = if db > -6.0 {
+                RED
+            } else if db > -18.0 {
+                AMBER
+            } else {
+                GREEN
+            };
             ui.painter().rect_filled(fill, 3.0, color);
         }
         ui.add_space(4.0);
@@ -1533,11 +1890,23 @@ impl App {
 
     fn draw_status_details(&self, ui: &mut egui::Ui) {
         if let Some(error) = &self.save_error {
-            ui.label(RichText::new("Settings not saved · retrying…").small().color(widgets::text_color(ui, RED))).on_hover_text(error);
+            ui.label(
+                RichText::new("Settings not saved · retrying…")
+                    .small()
+                    .color(widgets::text_color(ui, RED)),
+            )
+            .on_hover_text(error);
         }
         // Details beyond the state line ("Running · voice 42%", a warning).
         if self.status.0 != "Stopped" {
-            ui.add(egui::Label::new(RichText::new(&self.status.0).small().color(widgets::text_color(ui, self.status.1))).wrap());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&self.status.0)
+                        .small()
+                        .color(widgets::text_color(ui, self.status.1)),
+                )
+                .wrap(),
+            );
         }
         let (state, color) = match (self.engine.is_some(), self.settings.mute) {
             (true, true) => ("Muted", RED),
@@ -1545,7 +1914,11 @@ impl App {
             (false, _) if self.waiting_for_device => ("Waiting for a device", AMBER),
             (false, _) => ("Stopped", MUTED),
         };
-        ui.label(RichText::new(format!("• {state}")).strong().color(widgets::text_color(ui, color)));
+        ui.label(
+            RichText::new(format!("• {state}"))
+                .strong()
+                .color(widgets::text_color(ui, color)),
+        );
     }
 }
 
@@ -1553,6 +1926,23 @@ impl App {
 
 fn cpal_host() -> cpal::Host {
     cpal::default_host()
+}
+
+fn host_devices() -> (Vec<ListedDevice>, Vec<String>) {
+    let host = cpal_host();
+    (list_device_details(&host, false), list_devices(&host, true))
+}
+
+/// Inputs known only by display name. Their monitor status comes from the label.
+#[cfg(test)]
+fn named_inputs(names: impl IntoIterator<Item = String>) -> Vec<ListedDevice> {
+    names
+        .into_iter()
+        .map(|name| ListedDevice {
+            name,
+            id: String::new(),
+        })
+        .collect()
 }
 
 fn short(msg: &str) -> String {
@@ -1582,39 +1972,71 @@ fn is_modifier(key: egui::Key) -> bool {
     use egui::Key::*;
     matches!(
         key,
-        ShiftLeft | ShiftRight | ControlLeft | ControlRight | AltLeft | AltRight | SuperLeft | SuperRight
+        ShiftLeft
+            | ShiftRight
+            | ControlLeft
+            | ControlRight
+            | AltLeft
+            | AltRight
+            | SuperLeft
+            | SuperRight
     )
 }
 
 fn shortcut_keyboard_event(event: &egui::Event) -> bool {
-    matches!(event, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
-        | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut
-        | egui::Event::Ime(_))
+    matches!(
+        event,
+        egui::Event::Key { pressed: true, .. }
+            | egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Ime(_)
+    )
 }
 
-fn shortcut_key_matches((logical, physical): (egui::Key, Option<egui::Key>), (key, scan): (egui::Key, Option<egui::Key>)) -> bool {
-    physical.zip(scan).map_or(logical == key, |(physical, scan)| physical == scan)
+fn shortcut_key_matches(
+    (logical, physical): (egui::Key, Option<egui::Key>),
+    (key, scan): (egui::Key, Option<egui::Key>),
+) -> bool {
+    physical
+        .zip(scan)
+        .map_or(logical == key, |(physical, scan)| physical == scan)
 }
 
 fn shortcut_capture_opener(response: &egui::Response) {
     if response.enabled() {
         let id = egui::Id::new(("shortcut-capture-openers", response.ctx.viewport_id()));
-        response.ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<egui::Id>>(id).push(response.id));
+        response.ctx.data_mut(|data| {
+            data.get_temp_mut_or_default::<Vec<egui::Id>>(id)
+                .push(response.id)
+        });
     }
 }
 
 /// A captured or rejected shortcut key stays out of the UI until it is released.
 fn consume_captured_shortcut(ctx: &egui::Context) {
     let id = egui::Id::new(("captured-shortcut-keys", ctx.viewport_id()));
-    let Some(mut held) = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(id)) else { return };
+    let Some(mut held) = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(id))
+    else {
+        return;
+    };
     let mut text_from_capture = true;
     let mut navigation = false;
     let mut escape = false;
     if ctx.input(|input| input.focused) {
         ctx.input_mut(|input| {
             input.events.retain(|event| {
-                if let egui::Event::Key { key, physical_key, pressed, .. } = event {
-                    if let Some(index) = held.iter().position(|saved| shortcut_key_matches(*saved, (*key, *physical_key)))
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    ..
+                } = event
+                {
+                    if let Some(index) = held
+                        .iter()
+                        .position(|saved| shortcut_key_matches(*saved, (*key, *physical_key)))
                     {
                         if !pressed {
                             held.remove(index);
@@ -1622,33 +2044,58 @@ fn consume_captured_shortcut(ctx: &egui::Context) {
                             return true;
                         }
                         text_from_capture = true;
-                        navigation |= matches!(key, egui::Key::Tab | egui::Key::ArrowUp | egui::Key::ArrowDown
-                            | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::Escape);
+                        navigation |= matches!(
+                            key,
+                            egui::Key::Tab
+                                | egui::Key::ArrowUp
+                                | egui::Key::ArrowDown
+                                | egui::Key::ArrowLeft
+                                | egui::Key::ArrowRight
+                                | egui::Key::Escape
+                        );
                         escape |= *key == egui::Key::Escape;
                         return false;
                     }
-                    if *pressed && !is_modifier(*key) { text_from_capture = false; }
+                    if *pressed && !is_modifier(*key) {
+                        text_from_capture = false;
+                    }
                 }
-                !(text_from_capture && !matches!(event, egui::Event::Key { .. }) && shortcut_keyboard_event(event))
+                !(text_from_capture
+                    && !matches!(event, egui::Event::Key { .. })
+                    && shortcut_keyboard_event(event))
             });
             // A different physical key can release the same logical key in egui.
             held.retain(|(logical, physical)| physical.is_some() || input.key_down(*logical));
         });
-    } else { held.clear(); }
+    } else {
+        held.clear();
+    }
     if navigation {
         // egui sees navigation before App::ui. Recompute it from the remaining input.
-        let direction = ctx.input(|input| input.events.iter().rev().find_map(keyboard_focus_direction)
-            .unwrap_or(egui::FocusDirection::None));
+        let direction = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .rev()
+                .find_map(keyboard_focus_direction)
+                .unwrap_or(egui::FocusDirection::None)
+        });
         ctx.memory_mut(|memory| memory.move_focus(direction));
     }
-    if escape && ctx.memory(|memory| memory.focused()).is_none()
-        && let Some(owner) = ctx.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus"))).flatten()
+    if escape
+        && ctx.memory(|memory| memory.focused()).is_none()
+        && let Some(owner) = ctx
+            .data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus")))
+            .flatten()
     {
         ctx.memory_mut(|memory| memory.request_focus(owner));
     }
     ctx.data_mut(|data| {
-        if held.is_empty() { data.remove::<Vec<(egui::Key, Option<egui::Key>)>>(id); }
-        else { data.insert_temp(id, held); }
+        if held.is_empty() {
+            data.remove::<Vec<(egui::Key, Option<egui::Key>)>>(id);
+        } else {
+            data.insert_temp(id, held);
+        }
     });
 }
 
@@ -1661,47 +2108,137 @@ fn on_a_monitor([x, y]: [i32; 2]) -> bool {
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
     // A point inside the main title bar or the strip's microphone.
     // SAFETY: a pure query on a point.
-    !unsafe { MonitorFromPoint(POINT { x: x.saturating_add(16), y: y.saturating_add(16) }, MONITOR_DEFAULTTONULL) }.is_invalid()
+    !unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: x.saturating_add(16),
+                y: y.saturating_add(16),
+            },
+            MONITOR_DEFAULTTONULL,
+        )
+    }
+    .is_invalid()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn on_a_monitor(px: [i32; 2]) -> bool {
+    crate::monitors::on_a_monitor(px)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn on_a_monitor(_: [i32; 2]) -> bool {
     true
 }
 
-fn open_url(ctx: &egui::Context, url: &str) {
+fn open_url(ctx: &egui::Context, target: &str) {
     widgets::finish_keyboard_activation(ctx);
     #[cfg(test)]
-    ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<String>>(egui::Id::new("opened-urls")).push(url.to_owned()));
-    // Explorer hands URLs to the default browser.
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<String>>(egui::Id::new("opened-urls"))
+            .push(target.to_owned())
+    });
+    // Tests record the target instead of launching a browser or file manager.
     #[cfg(not(test))]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    {
+        let program = open_program();
+        if let Err(error) = spawn_open(program, target) {
+            crate::logfile::warn(format_args!(
+                "could not open {target} with {program}: {error}"
+            ));
+        }
+    }
+}
+
+/// Explorer opens a URL in the browser and a folder in the file manager.
+/// Linux uses `xdg-open` for both.
+fn open_program() -> &'static str {
+    if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    }
+}
+
+fn spawn_open(program: &str, target: &str) -> std::io::Result<()> {
+    std::process::Command::new(program)
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Input that can change a numeric field's text, including undo and redo.
 fn number_text_edit(ui: &egui::Ui) -> bool {
-    ui.input(|input| !input.pointer.any_pressed() && input.events.iter().any(|event| matches!(event,
-        egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut
-            | egui::Event::Ime(egui::ImeEvent::Commit(_))
-            | egui::Event::Key { key: egui::Key::Backspace | egui::Key::Delete | egui::Key::Z | egui::Key::Y, pressed: true, .. }
-            | egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-                action: egui::accesskit::Action::SetValue, data: Some(egui::accesskit::ActionData::Value(_)), ..
-            }))))
+    ui.input(|input| {
+        !input.pointer.any_pressed()
+            && input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Cut
+                        | egui::Event::Ime(egui::ImeEvent::Commit(_))
+                        | egui::Event::Key {
+                            key: egui::Key::Backspace
+                                | egui::Key::Delete
+                                | egui::Key::Z
+                                | egui::Key::Y,
+                            pressed: true,
+                            ..
+                        }
+                        | egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                            action: egui::accesskit::Action::SetValue,
+                            data: Some(egui::accesskit::ActionData::Value(_)),
+                            ..
+                        })
+                )
+            })
+    })
 }
 
 fn keyboard_edit(event: &egui::Event) -> bool {
-    matches!(event, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut
-        | egui::Event::Ime(_)
-        | egui::Event::Key { pressed: true, key: egui::Key::ArrowLeft | egui::Key::ArrowRight
-            | egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::Home | egui::Key::End
-            | egui::Key::Backspace | egui::Key::Delete | egui::Key::A | egui::Key::Z | egui::Key::Y, .. })
+    matches!(
+        event,
+        egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Ime(_)
+            | egui::Event::Key {
+                pressed: true,
+                key: egui::Key::ArrowLeft
+                    | egui::Key::ArrowRight
+                    | egui::Key::ArrowUp
+                    | egui::Key::ArrowDown
+                    | egui::Key::Home
+                    | egui::Key::End
+                    | egui::Key::Backspace
+                    | egui::Key::Delete
+                    | egui::Key::A
+                    | egui::Key::Z
+                    | egui::Key::Y,
+                ..
+            }
+    )
 }
 
 fn keyboard_focus_direction(event: &egui::Event) -> Option<egui::FocusDirection> {
     use egui::{Event, FocusDirection, Key};
     match event {
-        Event::Key { key: Key::Tab, pressed: true, modifiers, .. } if modifiers.shift_only() => Some(FocusDirection::Previous),
-        Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => match key {
+        Event::Key {
+            key: Key::Tab,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.shift_only() => Some(FocusDirection::Previous),
+        Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.is_none() => match key {
             Key::Tab => Some(FocusDirection::Next),
             Key::ArrowLeft => Some(FocusDirection::Left),
             Key::ArrowRight => Some(FocusDirection::Right),
@@ -1720,38 +2257,79 @@ struct DeferredFocusInput {
 }
 
 impl egui::plugin::Plugin for DeferredFocusInput {
-    fn debug_name(&self) -> &'static str { "Deferred focus input" }
+    fn debug_name(&self) -> &'static str {
+        "Deferred focus input"
+    }
 
     fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if input.viewport_id != egui::ViewportId::ROOT { return; }
+        if input.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
         let key = egui::Id::new("keyboard-input");
-        let capturing = ctx.data(|data| data.get_temp::<bool>(
-            egui::Id::new(("shortcut-capture-active", input.viewport_id)))).unwrap_or(false);
-        let mut held = ctx.data(|data| data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(
-            egui::Id::new(("captured-shortcut-keys", input.viewport_id)))).unwrap_or_default();
-        if !capturing && input.events.iter().any(|event| {
-            if let egui::Event::Key { key, physical_key, pressed, .. } = event {
-                let scan = (*key, *physical_key);
-                if !pressed { held.retain(|saved| !shortcut_key_matches(*saved, scan)); }
-                else if *key == egui::Key::Escape { return !held.iter().any(|saved| shortcut_key_matches(*saved, scan)); }
-            }
-            false
-        })
+        let capturing = ctx
+            .data(|data| {
+                data.get_temp::<bool>(egui::Id::new((
+                    "shortcut-capture-active",
+                    input.viewport_id,
+                )))
+            })
+            .unwrap_or(false);
+        let mut held = ctx
+            .data(|data| {
+                data.get_temp::<Vec<(egui::Key, Option<egui::Key>)>>(egui::Id::new((
+                    "captured-shortcut-keys",
+                    input.viewport_id,
+                )))
+            })
+            .unwrap_or_default();
+        if !capturing
+            && input.events.iter().any(|event| {
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    ..
+                } = event
+                {
+                    let scan = (*key, *physical_key);
+                    if !pressed {
+                        held.retain(|saved| !shortcut_key_matches(*saved, scan));
+                    } else if *key == egui::Key::Escape {
+                        return !held.iter().any(|saved| shortcut_key_matches(*saved, scan));
+                    }
+                }
+                false
+            })
         {
             // Escape cancels an edit that has not been shown yet.
             ctx.data_mut(|data| data.remove::<(Option<egui::Id>, Vec<egui::Event>)>(key));
             for events in &mut self.events {
-                events.retain(|event| !keyboard_edit(event) && !matches!(event, egui::Event::Key { pressed: true, .. }));
+                events.retain(|event| {
+                    !keyboard_edit(event)
+                        && !matches!(event, egui::Event::Key { pressed: true, .. })
+                });
             }
             self.events.retain(|events| !events.is_empty());
         }
-        let pending = ctx.data(|data| data.get_temp::<(Option<egui::Id>, Vec<egui::Event>)>(key).is_some());
-        let assistive_focus = |event: &egui::Event| matches!(event,
-            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-                action: egui::accesskit::Action::Focus, target_tree: egui::accesskit::TreeId::ROOT, data: None, ..
-            }));
-        let changes_focus = input.events.iter().any(|event| assistive_focus(event) || matches!(event,
-            egui::Event::PointerButton { pressed: true, .. }));
+        let pending = ctx.data(|data| {
+            data.get_temp::<(Option<egui::Id>, Vec<egui::Event>)>(key)
+                .is_some()
+        });
+        let assistive_focus = |event: &egui::Event| {
+            matches!(
+                event,
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    data: None,
+                    ..
+                })
+            )
+        };
+        let changes_focus = input.events.iter().any(|event| {
+            assistive_focus(event)
+                || matches!(event, egui::Event::PointerButton { pressed: true, .. })
+        });
         if (pending && changes_focus) || !self.events.is_empty() {
             // Preserve input frames: egui does not recognize a drag when its
             // press and release arrive together in the same pass.
@@ -1766,18 +2344,31 @@ impl egui::plugin::Plugin for DeferredFocusInput {
             // egui claims assistive focus as its target is drawn. Commands must
             // wait until then, and earlier input must use the previous focus.
             let tail = input.events.split_off(if focus == 0 { 1 } else { focus });
-            if !tail.is_empty() { self.events.push_front(tail); }
+            if !tail.is_empty() {
+                self.events.push_front(tail);
+            }
         }
         if capturing {
             let mut candidate = false;
             let next = input.events.iter().enumerate().find_map(|(index, event)| {
-                if let egui::Event::Key { key, physical_key, pressed, repeat, .. } = event
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    repeat,
+                    ..
+                } = event
                     && !is_modifier(physical_key.unwrap_or(*key))
                 {
                     let scan = (*key, *physical_key);
-                    if !pressed { held.retain(|saved| !shortcut_key_matches(*saved, scan)); }
-                    else if !repeat && !held.iter().any(|saved| shortcut_key_matches(*saved, scan)) {
-                        if candidate { return Some(index); }
+                    if !pressed {
+                        held.retain(|saved| !shortcut_key_matches(*saved, scan));
+                    } else if !repeat
+                        && !held.iter().any(|saved| shortcut_key_matches(*saved, scan))
+                    {
+                        if candidate {
+                            return Some(index);
+                        }
                         candidate = true;
                         held.push(scan);
                     }
@@ -1790,66 +2381,115 @@ impl egui::plugin::Plugin for DeferredFocusInput {
                 self.events.push_front(tail);
             }
         }
-        let openers = ctx.data(|data| data.get_temp::<Vec<egui::Id>>(
-            egui::Id::new(("shortcut-capture-openers", input.viewport_id)))).unwrap_or_default();
-        let openers: Vec<_> = openers.into_iter().filter_map(|id| ctx.read_response(id)).filter(egui::Response::enabled).collect();
+        let openers = ctx
+            .data(|data| {
+                data.get_temp::<Vec<egui::Id>>(egui::Id::new((
+                    "shortcut-capture-openers",
+                    input.viewport_id,
+                )))
+            })
+            .unwrap_or_default();
+        let openers: Vec<_> = openers
+            .into_iter()
+            .filter_map(|id| ctx.read_response(id))
+            .filter(egui::Response::enabled)
+            .collect();
         let focused = ctx.memory(|memory| memory.focused());
-        let (mut enter, mut space) = ctx.input(|input| (input.key_down(egui::Key::Enter), input.key_down(egui::Key::Space)));
+        let (mut enter, mut space) = ctx.input(|input| {
+            (
+                input.key_down(egui::Key::Enter),
+                input.key_down(egui::Key::Space),
+            )
+        });
         let activation = input.events.iter().position(|event| match event {
-            egui::Event::Key { key: key @ (egui::Key::Enter | egui::Key::Space), pressed, .. } => {
-                let down = if *key == egui::Key::Enter { &mut enter } else { &mut space };
+            egui::Event::Key {
+                key: key @ (egui::Key::Enter | egui::Key::Space),
+                pressed,
+                ..
+            } => {
+                let down = if *key == egui::Key::Enter {
+                    &mut enter
+                } else {
+                    &mut space
+                };
                 let fresh = *pressed && !*down;
                 *down = *pressed;
                 fresh && openers.iter().any(|response| focused == Some(response.id))
             }
             egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-                action: egui::accesskit::Action::Click, target_tree: egui::accesskit::TreeId::ROOT, target_node, ..
-            }) => openers.iter().any(|response| target_node.0 == response.id.value()),
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } =>
-                openers.iter().any(|response| response.is_pointer_button_down_on() && response.interact_rect.contains(*pos)
-                    && ctx.layer_id_at(*pos) == Some(response.layer_id)),
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node,
+                ..
+            }) => openers
+                .iter()
+                .any(|response| target_node.0 == response.id.value()),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                ..
+            } => openers.iter().any(|response| {
+                response.is_pointer_button_down_on()
+                    && response.interact_rect.contains(*pos)
+                    && ctx.layer_id_at(*pos) == Some(response.layer_id)
+            }),
             _ => false,
         });
         if let Some(activation) = activation {
             // Draw Set before later keys can change focus or activate its replacement.
             let tail = input.events.split_off(activation + 1);
-            if !tail.is_empty() { self.events.push_front(tail); }
+            if !tail.is_empty() {
+                self.events.push_front(tail);
+            }
         }
     }
 
     fn on_end_pass(&mut self, ui: &mut egui::Ui) {
         if ui.ctx().viewport_id() == egui::ViewportId::ROOT && !self.events.is_empty() {
-            ui.ctx().request_discard("Process input in order before changing focus");
+            ui.ctx()
+                .request_discard("Process input in order before changing focus");
             ui.ctx().request_repaint();
         }
     }
 }
 
 fn defer_keyboard_input(ui: &egui::Ui, owner: Option<egui::Id>, mut events: Vec<egui::Event>) {
-    if events.is_empty() { return; }
+    if events.is_empty() {
+        return;
+    }
     ui.data_mut(|data| {
         let key = egui::Id::new("keyboard-input");
-        if let Some((_, remaining)) = data.remove_temp::<(Option<egui::Id>, Vec<egui::Event>)>(key) {
+        if let Some((_, remaining)) = data.remove_temp::<(Option<egui::Id>, Vec<egui::Event>)>(key)
+        {
             events.extend(remaining);
         }
         data.insert_temp(key, (owner, events));
     });
-    ui.ctx().request_discard("Apply keyboard input in order after focus settles");
+    ui.ctx()
+        .request_discard("Apply keyboard input in order after focus settles");
     ui.ctx().request_repaint();
 }
 
 /// Process input before Tab, navigate, then deliver the remaining command in order.
 fn apply_keyboard_input(ui: &egui::Ui) -> bool {
     use egui::FocusDirection;
-    let pending = ui.data_mut(|data| data.remove_temp::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input")));
+    let pending = ui.data_mut(|data| {
+        data.remove_temp::<(Option<egui::Id>, Vec<egui::Event>)>(egui::Id::new("keyboard-input"))
+    });
     let mut routed = false;
     if let Some((owner, mut events)) = pending
         && owner.is_none_or(|id| ui.memory(|memory| memory.has_focus(id)))
     {
         let focused = ui.memory(|memory| memory.focused());
-        let rendered_focus = ui.data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus"))).flatten();
-        if owner.is_none() && focused != rendered_focus
-            && ui.input(|input| !input.pointer.any_pressed() && !input.key_pressed(egui::Key::Escape))
+        let rendered_focus = ui
+            .data(|data| data.get_temp::<Option<egui::Id>>(egui::Id::new("keyboard-focus")))
+            .flatten();
+        if owner.is_none()
+            && focused != rendered_focus
+            && ui.input(|input| {
+                !input.pointer.any_pressed() && !input.key_pressed(egui::Key::Escape)
+            })
         {
             // Backward Tab applies focus at the start of the next pass. Render
             // the target first so native selection and Enter's blur can work.
@@ -1866,14 +2506,29 @@ fn apply_keyboard_input(ui: &egui::Ui) -> bool {
         ui.ctx().request_repaint();
     }
     let split = ui.input(|input| {
-        if input.pointer.any_pressed() || input.key_pressed(egui::Key::Escape) { return None; }
-        let tabs = input.events.iter().enumerate().filter_map(|(index, event)| {
-            let direction = keyboard_focus_direction(event)?;
-            matches!(direction, FocusDirection::Next | FocusDirection::Previous).then_some(index)
-        }).collect::<Vec<_>>();
-        let command = input.events.iter().any(|event| keyboard_edit(event) || matches!(event,
-            egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::Tab));
-        if routed || tabs.len() > 1 || command { tabs.first().copied() } else { None }
+        if input.pointer.any_pressed() || input.key_pressed(egui::Key::Escape) {
+            return None;
+        }
+        let tabs = input
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                let direction = keyboard_focus_direction(event)?;
+                matches!(direction, FocusDirection::Next | FocusDirection::Previous)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let command = input.events.iter().any(|event| {
+            keyboard_edit(event)
+                || matches!(event,
+            egui::Event::Key { key, pressed: true, .. } if *key != egui::Key::Tab)
+        });
+        if routed || tabs.len() > 1 || command {
+            tabs.first().copied()
+        } else {
+            None
+        }
     });
     if let Some(tab) = split {
         let tail = ui.input_mut(|input| input.events.split_off(if tab == 0 { 1 } else { tab }));
@@ -1881,7 +2536,14 @@ fn apply_keyboard_input(ui: &egui::Ui) -> bool {
         routed = true;
     }
     if routed {
-        let direction = ui.input(|input| input.events.iter().rev().find_map(keyboard_focus_direction).unwrap_or(FocusDirection::None));
+        let direction = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .rev()
+                .find_map(keyboard_focus_direction)
+                .unwrap_or(FocusDirection::None)
+        });
         ui.memory_mut(|memory| memory.move_focus(direction));
     }
     routed
@@ -1891,35 +2553,73 @@ fn apply_keyboard_input(ui: &egui::Ui) -> bool {
 fn number_field(ui: &mut egui::Ui, widget: egui::DragValue<'_>) -> egui::Response {
     let id = ui.next_auto_id();
     let layer = ui.layer_id();
-    let editing_input = ui.input(|input| !input.pointer.any_pressed() && input.events.iter().any(keyboard_edit));
-    let requested_elsewhere = ui.input(|input| input.events.iter().rev().find_map(|event| match event {
-        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-            action: egui::accesskit::Action::Focus, target_tree: egui::accesskit::TreeId::ROOT, target_node, ..
-        }) => Some(*target_node != id.accesskit_id()),
-        _ => None,
-    }).unwrap_or(false));
+    let editing_input =
+        ui.input(|input| !input.pointer.any_pressed() && input.events.iter().any(keyboard_edit));
+    let requested_elsewhere = ui.input(|input| {
+        input
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node,
+                    ..
+                }) => Some(*target_node != id.accesskit_id()),
+                _ => None,
+            })
+            .unwrap_or(false)
+    });
     if editing_input && requested_elsewhere {
         // AccessKit focus is claimed when its target is drawn. Until then,
         // the previous field must not receive the target's keyboard input.
         let events = ui.input_mut(|input| std::mem::take(&mut input.events));
-        ui.input_mut(|input| input.events = events.iter().filter(|event|
-            matches!(event, egui::Event::AccessKitActionRequest(_))).cloned().collect());
+        ui.input_mut(|input| {
+            input.events = events
+                .iter()
+                .filter(|event| matches!(event, egui::Event::AccessKitActionRequest(_)))
+                .cloned()
+                .collect()
+        });
         let response = ui.add(widget);
         ui.input_mut(|input| input.events = events);
         return response;
     }
-    let focused = editing_input && ui.is_enabled() && ui.memory_mut(|memory| {
-        memory.interested_in_focus(id, layer);
-        memory.has_focus(id)
-    });
-    if focused { ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None)); }
-    let gained = focused && ui.ctx().read_response(id).is_none_or(|response| response.gained_focus());
-    if !gained { return ui.add(widget); }
+    let focused = editing_input
+        && ui.is_enabled()
+        && ui.memory_mut(|memory| {
+            memory.interested_in_focus(id, layer);
+            memory.has_focus(id)
+        });
+    if focused {
+        ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
+    let gained = focused
+        && ui
+            .ctx()
+            .read_response(id)
+            .is_none_or(|response| response.gained_focus());
+    if !gained {
+        return ui.add(widget);
+    }
     let events = ui.input_mut(|input| std::mem::take(&mut input.events));
-    let pending = events.iter().filter(|event| !matches!(event,
-        egui::Event::Key { key: egui::Key::Tab, .. }
-            | egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
-                action: egui::accesskit::Action::Focus, .. }))).cloned().collect::<Vec<_>>();
+    let pending = events
+        .iter()
+        .filter(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    ..
+                } | egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Focus,
+                    ..
+                })
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     // The next pass handles input with the selection in place, preserving
     // native caret movement, selection, undo, and event order.
     defer_keyboard_input(ui, Some(id), pending);
@@ -1930,34 +2630,61 @@ fn number_field(ui: &mut egui::Ui, widget: egui::DragValue<'_>) -> egui::Respons
 
 /// A 0..100% volume slider that also takes the mouse wheel (1% per notch).
 fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> egui::Response {
-    let mut response = ui.horizontal(|ui| {
-        let slider = ui.add(Slider::new(value, 0.0..=1.0).show_value(false));
-        let original = *value;
-        let focus_before = ui.memory(|memory| memory.focused());
-        let text_edit = number_text_edit(ui);
-        let submitted = ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.key_pressed(egui::Key::Tab));
-        let number = number_field(ui, egui::DragValue::new(value).range(0.0..=1.0).speed(0.01)
-            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-            .custom_parser(|text| {
-                // Live text edits already update the value. Re-parsing the
-                // rounded display on blur could override a slider adjustment.
-                if !text_edit { return None; }
-                let text = text.trim();
-                text.strip_suffix('%').unwrap_or(text).trim().parse::<f64>().ok()
-                    .filter(|value| value.is_finite()).map(|value| value / 100.0)
-            }));
-        let focused = number.has_focus();
-        let explicit_edit = number.dragged() || ui.input(|input| {
-            use egui::accesskit::Action;
-            focused || (submitted && focus_before == Some(number.id))
-                || [Action::SetValue, Action::Increment, Action::Decrement].into_iter()
-                    .any(|action| input.has_accesskit_action_request(number.id, action))
-        });
-        if number.lost_focus() && text_edit && !explicit_edit { *value = original; }
-        if number.gained_focus() || focused || number.lost_focus() { number.union(slider) } else { slider.union(number) }
-    }).inner;
+    let mut response = ui
+        .horizontal(|ui| {
+            let slider = ui.add(Slider::new(value, 0.0..=1.0).show_value(false));
+            let original = *value;
+            let focus_before = ui.memory(|memory| memory.focused());
+            let text_edit = number_text_edit(ui);
+            let submitted = ui.input(|input| {
+                input.key_pressed(egui::Key::Enter) && !input.key_pressed(egui::Key::Tab)
+            });
+            let number = number_field(
+                ui,
+                egui::DragValue::new(value)
+                    .range(0.0..=1.0)
+                    .speed(0.01)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .custom_parser(|text| {
+                        // Live text edits already update the value. Re-parsing the
+                        // rounded display on blur could override a slider adjustment.
+                        if !text_edit {
+                            return None;
+                        }
+                        let text = text.trim();
+                        text.strip_suffix('%')
+                            .unwrap_or(text)
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .map(|value| value / 100.0)
+                    }),
+            );
+            let focused = number.has_focus();
+            let explicit_edit = number.dragged()
+                || ui.input(|input| {
+                    use egui::accesskit::Action;
+                    focused
+                        || (submitted && focus_before == Some(number.id))
+                        || [Action::SetValue, Action::Increment, Action::Decrement]
+                            .into_iter()
+                            .any(|action| input.has_accesskit_action_request(number.id, action))
+                });
+            if number.lost_focus() && text_edit && !explicit_edit {
+                *value = original;
+            }
+            if number.gained_focus() || focused || number.lost_focus() {
+                number.union(slider)
+            } else {
+                slider.union(number)
+            }
+        })
+        .inner;
     let notches = viz::wheel_notches(ui, response.id, response.hovered() && !response.dragged());
-    if viz::step_by(value, notches, 0.01, 0.0..=1.0) { response.mark_changed(); }
+    if viz::step_by(value, notches, 0.01, 0.0..=1.0) {
+        response.mark_changed();
+    }
     response
 }
 
@@ -1971,14 +2698,29 @@ mod tests {
     }
 
     #[test]
+    fn links_and_folders_use_the_platform_opener() {
+        if cfg!(windows) {
+            assert_eq!(open_program(), "explorer");
+        } else {
+            assert_eq!(open_program(), "xdg-open");
+        }
+    }
+
+    #[test]
+    fn a_missing_opener_is_reported() {
+        let error = spawn_open("openmic-missing-opener", "https://example.com").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn loaded_decibel_controls_stay_within_the_supported_audio_range() {
-        for (db, input_db, output_db, gate_db) in [
-            (1e30, 24.0, 12.0, -20.0),
-            (-1e30, -12.0, -24.0, -80.0),
-        ] {
+        for (db, input_db, output_db, gate_db) in
+            [(1e30, 24.0, 12.0, -20.0), (-1e30, -12.0, -24.0, -80.0)]
+        {
             let settings: Settings = serde_json::from_value(serde_json::json!({
                 "input_gain_db": db, "output_gain_db": db, "gate_threshold_db": db,
-            })).unwrap();
+            }))
+            .unwrap();
             let app = App::stopped(settings);
             let params = app.params();
             assert!(params.input_gain.is_finite() && params.output_gain.is_finite());
@@ -1987,7 +2729,10 @@ mod tests {
             assert_eq!(params.gate_threshold_db, gate_db);
         }
         let app = App::stopped(Settings {
-            input_gain_db: 6.0, output_gain_db: -6.0, gate_threshold_db: -50.0, ..Settings::default()
+            input_gain_db: 6.0,
+            output_gain_db: -6.0,
+            gate_threshold_db: -50.0,
+            ..Settings::default()
         });
         let params = app.params();
         assert_eq!(params.input_gain, dsp::db_to_gain(6.0));
@@ -2014,7 +2759,10 @@ mod tests {
                 assert_eq!(take.samples().unwrap().len(), count / 2);
                 assert!(app.record_status.0.starts_with("Partial take ready"));
                 assert_eq!(app.record_status.1, AMBER);
-                assert!(app.update_blocker().is_some(), "the recovered audio still needs to be saved");
+                assert!(
+                    app.update_blocker().is_some(),
+                    "the recovered audio still needs to be saved"
+                );
             }
         }
     }
@@ -2024,7 +2772,11 @@ mod tests {
         let mut app = App::stopped(Settings::default());
         let recorder = Recorder::from_samples_for_test(&[0.25; 96]);
         recorder.report_skipped_for_test();
-        app.dictating = Some(DictationRecording { recorder, model: app.settings.speech_model, hold_to_talk: true });
+        app.dictating = Some(DictationRecording {
+            recorder,
+            model: app.settings.speech_model,
+            hold_to_talk: true,
+        });
         app.stop_dictation();
         assert!(app.dictating.is_none());
         assert!(!app.dictation.busy());
@@ -2039,9 +2791,13 @@ mod tests {
             app.last_dictation = "Previous phrase".into();
             let recorder = Recorder::from_samples_for_test(&[]);
             recorder.report_error_for_test("Mic disconnected");
-            if skipped { recorder.report_skipped_for_test(); }
+            if skipped {
+                recorder.report_skipped_for_test();
+            }
             app.dictating = Some(DictationRecording {
-                recorder, model: app.settings.speech_model, hold_to_talk: true,
+                recorder,
+                model: app.settings.speech_model,
+                hold_to_talk: true,
             });
 
             // Hotkey commands run before capture polling, so finishing itself
@@ -2050,7 +2806,10 @@ mod tests {
             assert!(app.dictating.is_none() && !app.dictation.busy());
             assert_eq!(app.dictation_status.1, RED);
             assert!(app.dictation_status.0.contains("Mic disconnected"));
-            assert_eq!(app.dictation_status.0.contains("audio was skipped"), skipped);
+            assert_eq!(
+                app.dictation_status.0.contains("audio was skipped"),
+                skipped
+            );
             assert_eq!(app.last_dictation, "Previous phrase");
         }
     }
@@ -2064,7 +2823,9 @@ mod tests {
         app.page = Page::Dictation;
         app.last_dictation = "Previous phrase".into();
         app.dictating = Some(DictationRecording {
-            recorder, model: dictation::SpeechModel::TinyEn, hold_to_talk: true,
+            recorder,
+            model: dictation::SpeechModel::TinyEn,
+            hold_to_talk: true,
         });
         app.settings.speech_model = dictation::SpeechModel::Small;
 
@@ -2078,29 +2839,47 @@ mod tests {
         let recording = app.dictating.as_ref().unwrap();
         assert!(recording.recorder.is_stopping() && !recording.recorder.ready_to_finish());
         assert_eq!(recording.model, dictation::SpeechModel::TinyEn);
-        assert!(!app.dictation.busy(), "the WAV must finish before transcription starts");
-        assert_eq!(app.update_blocker(), Some("Wait for speech to text to finish"));
+        assert!(
+            !app.dictation.busy(),
+            "the WAV must finish before transcription starts"
+        );
+        assert_eq!(
+            app.update_blocker(),
+            Some("Wait for speech to text to finish")
+        );
         let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
         assert!(visible(&texts, "Finishing recording…").is_some());
         assert!(visible(&texts, "Listening…").is_none());
         assert!(visible(&texts, "Discard recording").is_some());
         assert!(visible(&texts, "Previous phrase").is_some());
         app.run_command(&ctx, Command::ToggleMute);
-        assert!(app.settings.mute, "mic controls remain responsive while finalizing");
+        assert!(
+            app.settings.mute,
+            "mic controls remain responsive while finalizing"
+        );
 
         finish.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while app.dictating.is_some() {
             app.poll_dictation();
-            assert!(Instant::now() < deadline, "dictation did not finish writing");
+            assert!(
+                Instant::now() < deadline,
+                "dictation did not finish writing"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(app.dictation.busy(), "the finished take is handed to the existing worker");
+        assert!(
+            app.dictation.busy(),
+            "the finished take is handed to the existing worker"
+        );
         app.run_command(&ctx, Command::DictateReleased);
         transcribe.send(()).unwrap();
         while app.dictation.busy() || app.dictation_status.0 != "No speech heard" {
             app.poll_dictation();
-            assert!(Instant::now() < deadline, "the short fixture did not finish transcription");
+            assert!(
+                Instant::now() < deadline,
+                "the short fixture did not finish transcription"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(app.last_dictation, "Previous phrase");
@@ -2111,12 +2890,16 @@ mod tests {
     fn discarded_or_failed_dictation_releases_capture_without_waiting_or_typing() {
         for capture_error in [None, Some("Microphone disconnected")] {
             let (recorder, finish) = Recorder::delayed_writer_for_test(&[0.25; 96]);
-            if let Some(error) = capture_error { recorder.report_error_for_test(error); }
+            if let Some(error) = capture_error {
+                recorder.report_error_for_test(error);
+            }
             let mut app = App::stopped(Settings::default());
             app.page = Page::Dictation;
             app.last_dictation = "Previous phrase".into();
             app.dictating = Some(DictationRecording {
-                recorder, model: app.settings.speech_model, hold_to_talk: false,
+                recorder,
+                model: app.settings.speech_model,
+                hold_to_talk: false,
             });
             if capture_error.is_some() {
                 app.poll_dictation();
@@ -2130,17 +2913,33 @@ mod tests {
                 app.run_command(&egui::Context::default(), Command::DictateReleased);
             }
             assert!(app.dictating.is_none() && !app.dictation.busy());
-            assert!(app.update_blocker().is_none(), "discard immediately releases the recording slot");
+            assert!(
+                app.update_blocker().is_none(),
+                "discard immediately releases the recording slot"
+            );
             let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
             assert!(visible(&texts, "Finishing recording…").is_none());
             assert!(visible(&texts, "Listening…").is_none());
             assert!(visible(&texts, "Discard recording").is_none());
             assert!(visible(&texts, &expected.0).is_some());
-            assert_eq!(expected, (capture_error.unwrap_or("Dictation recording discarded").into(), if capture_error.is_some() { RED } else { MUTED }));
+            assert_eq!(
+                expected,
+                (
+                    capture_error
+                        .unwrap_or("Dictation recording discarded")
+                        .into(),
+                    if capture_error.is_some() { RED } else { MUTED }
+                )
+            );
 
-            finish.send(()).expect("discard must not wait for the writer to drain");
+            finish
+                .send(())
+                .expect("discard must not wait for the writer to drain");
             app.poll_dictation();
-            assert!(!app.dictation.busy(), "discarded takes never reach transcription");
+            assert!(
+                !app.dictation.busy(),
+                "discarded takes never reach transcription"
+            );
             assert_eq!(app.dictation_status, expected);
             assert_eq!(app.last_dictation, "Previous phrase");
             assert!(app.update_blocker().is_none());
@@ -2151,9 +2950,14 @@ mod tests {
     fn active_dictation_keeps_its_original_stop_behavior_when_the_mode_changes() {
         let ctx = egui::Context::default();
         for hold_to_talk in [true, false] {
-            let mut app = App::stopped(Settings { dictation_hold: hold_to_talk, ..Settings::default() });
+            let mut app = App::stopped(Settings {
+                dictation_hold: hold_to_talk,
+                ..Settings::default()
+            });
             app.dictating = Some(DictationRecording {
-                recorder: Recorder::from_samples_for_test(&[]), model: app.settings.speech_model, hold_to_talk,
+                recorder: Recorder::from_samples_for_test(&[]),
+                model: app.settings.speech_model,
+                hold_to_talk,
             });
             app.settings.dictation_hold = !hold_to_talk;
             let (ignored, stops) = if hold_to_talk {
@@ -2162,12 +2966,24 @@ mod tests {
                 (Command::DictateReleased, Command::Dictate)
             };
             app.run_command(&ctx, ignored);
-            assert!(app.dictating.is_some(), "the new preference must not change the current take");
+            assert!(
+                app.dictating.is_some(),
+                "the new preference must not change the current take"
+            );
             app.run_command(&ctx, stops);
-            assert!(app.dictating.is_none(), "the original stop gesture must still work");
-            assert!(!app.dictation.busy(), "the empty fixture never loads a speech model");
+            assert!(
+                app.dictating.is_none(),
+                "the original stop gesture must still work"
+            );
+            assert!(
+                !app.dictation.busy(),
+                "the empty fixture never loads a speech model"
+            );
             assert_eq!(app.dictation_status.0, "Nothing was heard");
-            assert_eq!(app.settings.dictation_hold, !hold_to_talk, "keep the preference for the next take");
+            assert_eq!(
+                app.settings.dictation_hold, !hold_to_talk,
+                "keep the preference for the next take"
+            );
         }
     }
 
@@ -2177,17 +2993,25 @@ mod tests {
         app.last_dictation = "Previous transcript".into();
         for hold_to_talk in [true, false] {
             app.dictating = Some(DictationRecording {
-                recorder: Recorder::from_samples_for_test(&[0.25; 96]), model: app.settings.speech_model, hold_to_talk,
+                recorder: Recorder::from_samples_for_test(&[0.25; 96]),
+                model: app.settings.speech_model,
+                hold_to_talk,
             });
             app.discard_dictation();
             assert!(app.dictating.is_none());
-            assert!(!app.dictation.busy(), "discarded audio must never reach the transcription worker");
+            assert!(
+                !app.dictation.busy(),
+                "discarded audio must never reach the transcription worker"
+            );
             assert_eq!(app.last_dictation, "Previous transcript");
             assert_eq!(app.dictation_status.0, "Dictation recording discarded");
 
             app.run_command(&egui::Context::default(), Command::DictateReleased);
             assert!(app.dictating.is_none());
-            assert!(!app.dictation.busy(), "a late key release must not transcribe the discarded take");
+            assert!(
+                !app.dictation.busy(),
+                "a late key release must not transcribe the discarded take"
+            );
         }
     }
 
@@ -2201,12 +3025,17 @@ mod tests {
         });
         app.settings.speech_model = dictation::SpeechModel::Small;
 
-        let (model, take) = app.finish_dictation().expect("take prepared for transcription");
+        let (model, take) = app
+            .finish_dictation()
+            .expect("take prepared for transcription");
         assert_eq!(model, dictation::SpeechModel::TinyEn);
         assert_eq!(take.samples().unwrap().len(), 48);
         assert!(app.dictating.is_none());
-        assert_eq!(app.settings.speech_model, dictation::SpeechModel::Small,
-            "keep the new preference for the next recording");
+        assert_eq!(
+            app.settings.speech_model,
+            dictation::SpeechModel::Small,
+            "keep the new preference for the next recording"
+        );
     }
 
     #[test]
@@ -2214,7 +3043,11 @@ mod tests {
         for active in [true, false] {
             for window_close in [true, false] {
                 let ctx = egui::Context::default();
-                let mut app = App::stopped(Settings { close_to_tray: false, collapsed: true, ..Settings::default() });
+                let mut app = App::stopped(Settings {
+                    close_to_tray: false,
+                    collapsed: true,
+                    ..Settings::default()
+                });
                 let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
                 if active {
                     app.recorder = Some(recorder);
@@ -2224,7 +3057,12 @@ mod tests {
                 app.hidden = true;
                 let mut input = egui::RawInput::default();
                 if window_close {
-                    input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+                    input
+                        .viewports
+                        .entry(egui::ViewportId::ROOT)
+                        .or_default()
+                        .events
+                        .push(egui::ViewportEvent::Close);
                 }
                 let output = ctx.run_ui(input, |ui| {
                     if window_close {
@@ -2237,12 +3075,73 @@ mod tests {
                 assert!(commands.contains(&ViewportCommand::CancelClose));
                 assert!(!commands.contains(&ViewportCommand::Close));
                 assert!(app.confirm_quit && !app.quitting);
-                assert!(!app.hidden && !app.settings.collapsed, "a hidden quit request must reveal the choice");
+                assert!(
+                    !app.hidden && !app.settings.collapsed,
+                    "a hidden quit request must reveal the choice"
+                );
                 assert_eq!(app.page, Page::Record);
-                assert_eq!(app.recorder.is_some(), active, "asking to quit must not stop capture");
-                let take = if active { Arc::new(app.recorder.take().unwrap().finish().unwrap().unwrap()) } else { app.take.take().unwrap() };
+                assert_eq!(
+                    app.recorder.is_some(),
+                    active,
+                    "asking to quit must not stop capture"
+                );
+                let take = if active {
+                    Arc::new(app.recorder.take().unwrap().finish().unwrap().unwrap())
+                } else {
+                    app.take.take().unwrap()
+                };
                 assert_eq!(take.samples().unwrap().len(), 240, "no audio was discarded");
             }
+        }
+    }
+
+    #[test]
+    fn closing_hides_only_when_the_notification_area_is_available() {
+        let close = |close_to_tray, tray, load_error| {
+            let ctx = egui::Context::default();
+            let mut app = App::stopped(Settings {
+                close_to_tray,
+                ..Settings::default()
+            });
+            if tray {
+                app.tray = Some(Tray::present_for_test());
+            }
+            if load_error {
+                app.settings.load_error = Some(crate::config::SettingsLoadError {
+                    path: "settings.json".into(),
+                    message: "unreadable".into(),
+                });
+            }
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run_ui(input, |ui| app.handle_close(ui.ctx()));
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            (app.hidden, app.quitting, commands.clone())
+        };
+
+        let (hidden, quitting, commands) = close(true, true, false);
+        assert!(hidden && !quitting, "a notification area keeps processing");
+        assert!(commands.contains(&ViewportCommand::CancelClose));
+        assert!(commands.contains(&ViewportCommand::Visible(false)));
+        assert!(!commands.contains(&ViewportCommand::Close));
+
+        for (close_to_tray, tray, load_error) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let (hidden, quitting, commands) = close(close_to_tray, tray, load_error);
+            assert!(
+                !hidden && quitting,
+                "close_to_tray={close_to_tray}, tray={tray}, load_error={load_error}"
+            );
+            assert!(commands.contains(&ViewportCommand::Close));
+            assert!(!commands.contains(&ViewportCommand::Visible(false)));
         }
     }
 
@@ -2250,9 +3149,12 @@ mod tests {
     fn quit_confirmation_can_return_to_the_take_or_explicitly_discard_it() {
         use eframe::App as _;
         for (active, choice) in [
-            (false, "Back to recording"), (true, "Keep recording"),
-            (false, "Discard and quit"), (true, "Discard and quit"),
-            (false, "Escape"), (true, "Escape"),
+            (false, "Back to recording"),
+            (true, "Keep recording"),
+            (false, "Discard and quit"),
+            (true, "Discard and quit"),
+            (false, "Escape"),
+            (true, "Escape"),
         ] {
             let mut app = App::stopped(Settings::default());
             let recorder = Recorder::from_samples_for_test(&[0.25; 480]);
@@ -2265,42 +3167,91 @@ mod tests {
             app.run_command(&ctx, Command::Quit);
             let mut frame = eframe::Frame::_new_kittest();
             let mut draw = |app: &mut App, events| {
-                ctx.run_ui(egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 420.0))),
-                    events,
-                    ..Default::default()
-                }, |ui| app.ui(ui, &mut frame))
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(700.0, 420.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut frame),
+                )
             };
             draw(&mut app, Vec::new());
             let output = draw(&mut app, Vec::new());
             let output = if choice == "Escape" {
-                draw(&mut app, vec![egui::Event::Key {
-                    key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE,
-                }])
+                draw(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                )
             } else {
-                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == choice => Some(text.visual_bounding_rect().center()),
-                    _ => None,
-                }).unwrap_or_else(|| panic!("{choice} must be visible"));
-                let mut click = |pressed| draw(&mut app, vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
-                ]);
+                let pos = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == choice => {
+                            Some(text.visual_bounding_rect().center())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{choice} must be visible"));
+                let mut click = |pressed| {
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    )
+                };
                 click(true);
                 click(false)
             };
             let discard = choice == "Discard and quit";
             assert!(!app.confirm_quit);
             assert_eq!(app.quitting, discard);
-            assert_eq!(output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&ViewportCommand::Close), discard);
-            assert_eq!(app.recorder.is_some(), active, "capture continues until actual exit");
-            let take = if active { Arc::new(app.recorder.take().unwrap().finish().unwrap().unwrap()) } else { app.take.take().unwrap() };
-            assert_eq!(take.samples().unwrap().len(), 240, "the take remains intact until actual exit");
+            assert_eq!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&ViewportCommand::Close),
+                discard
+            );
+            assert_eq!(
+                app.recorder.is_some(),
+                active,
+                "capture continues until actual exit"
+            );
+            let take = if active {
+                Arc::new(app.recorder.take().unwrap().finish().unwrap().unwrap())
+            } else {
+                app.take.take().unwrap()
+            };
+            assert_eq!(
+                take.samples().unwrap().len(),
+                240,
+                "the take remains intact until actual exit"
+            );
         }
 
         let mut app = App::stopped(Settings::default());
         app.run_command(&egui::Context::default(), Command::Quit);
-        assert!(app.quitting && !app.confirm_quit, "nothing to lose: quit immediately");
+        assert!(
+            app.quitting && !app.confirm_quit,
+            "nothing to lose: quit immediately"
+        );
     }
 
     #[test]
@@ -2311,16 +3262,23 @@ mod tests {
             app.dictation = dictation;
             app.dictating = Some(DictationRecording {
                 recorder: Recorder::from_samples_for_test(&[0.25; 96]),
-                model: app.settings.speech_model, hold_to_talk: true,
+                model: app.settings.speech_model,
+                hold_to_talk: true,
             });
-            let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+            let take = Recorder::from_samples_for_test(&[0.25; 96])
+                .finish()
+                .unwrap()
+                .unwrap();
             app.dictation.transcribe(app.settings.speech_model, take);
             let ctx = egui::Context::default();
             if confirm_first {
                 app.recorder = Some(Recorder::from_samples_for_test(&[0.25; 96]));
                 app.run_command(&ctx, Command::Quit);
                 assert!(app.confirm_quit && !app.quitting);
-                assert!(!app.dictation.transcription_cancelling(), "asking to quit must let the user keep working");
+                assert!(
+                    !app.dictation.transcription_cancelling(),
+                    "asking to quit must let the user keep working"
+                );
                 app.quit(&ctx); // the user chooses Discard and quit
             } else {
                 app.run_command(&ctx, Command::Quit);
@@ -2330,15 +3288,29 @@ mod tests {
             let dirty = app.dirty_since;
             let hidden = app.hidden;
             for command in [
-                Command::DictateReleased, Command::Dictate, Command::ToggleMute,
-                Command::ToggleBypass, Command::ToggleRunning, Command::ToggleCollapse, Command::Show,
+                Command::DictateReleased,
+                Command::Dictate,
+                Command::ToggleMute,
+                Command::ToggleBypass,
+                Command::ToggleRunning,
+                Command::ToggleCollapse,
+                Command::Show,
             ] {
                 app.commands.0.send(command).unwrap();
             }
-            if let Some(recorder) = &app.recorder { recorder.report_error_for_test("capture ended during shutdown"); }
+            if let Some(recorder) = &app.recorder {
+                recorder.report_error_for_test("capture ended during shutdown");
+            }
             app.tick(&ctx);
-            assert!(app.dictating.is_some(), "a late shortcut release must not submit the unfinished take");
-            assert_eq!(app.recorder.is_some(), confirm_first, "normal polling stops once quitting starts");
+            assert!(
+                app.dictating.is_some(),
+                "a late shortcut release must not submit the unfinished take"
+            );
+            assert_eq!(
+                app.recorder.is_some(),
+                confirm_first,
+                "normal polling stops once quitting starts"
+            );
             assert_eq!(serde_json::to_value(&app.settings).unwrap(), settings);
             assert_eq!(app.dirty_since, dirty);
             assert_eq!(app.hidden, hidden);
@@ -2346,7 +3318,10 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(3);
             while app.dictation.busy() || app.dictation_status.0 != "Transcription cancelled" {
                 app.poll_dictation();
-                assert!(Instant::now() < deadline, "quitting failed to cancel speech work");
+                assert!(
+                    Instant::now() < deadline,
+                    "quitting failed to cancel speech work"
+                );
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -2357,7 +3332,10 @@ mod tests {
         let (dictation, release) = Dictation::delayed_for_test();
         let mut app = App::stopped(Settings::default());
         app.dictation = dictation;
-        let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+        let take = Recorder::from_samples_for_test(&[0.25; 96])
+            .finish()
+            .unwrap()
+            .unwrap();
         app.dictation.transcribe(app.settings.speech_model, take);
         let ctx = egui::Context::default();
         app.set_collapsed(&ctx, true);
@@ -2407,12 +3385,18 @@ mod tests {
     fn stop_cancels_waiting_even_when_vb_cable_appears() {
         let mut app = App::stopped(Settings::default());
         app.start_engine();
-        assert!(app.waiting_for_device, "a start request survives a missing output");
+        assert!(
+            app.waiting_for_device,
+            "a start request survives a missing output"
+        );
 
         app.stop_engine(true);
         app.update_devices(Vec::new(), names(&["CABLE Input", "Headphones"]), false);
         assert!(app.settings.auto_start);
-        assert!(!app.waiting_for_device, "Stop cancels the pending start request");
+        assert!(
+            !app.waiting_for_device,
+            "Stop cancels the pending start request"
+        );
         assert!(app.engine.is_none());
         assert_eq!(app.status.0, "Stopped");
     }
@@ -2430,11 +3414,43 @@ mod tests {
         app.start_engine();
         assert_eq!(app.status.0, "Waiting for USB mic to connect");
 
-        app.update_devices(names(&["USB mic"]), names(&["CABLE Input"]), false);
+        app.update_devices(
+            super::named_inputs(names(&["USB mic"])),
+            names(&["CABLE Input"]),
+            false,
+        );
         assert!(app.waiting_for_device);
         assert_eq!(app.settings.microphone, "USB mic");
         assert_eq!(app.settings.monitor_output, "Headphones");
         assert_eq!(app.status.0, "Waiting for Headphones to connect");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_translated_monitor_source_is_not_selected_as_the_microphone() {
+        let mut app = App::stopped(Settings::default());
+        let speakers = "Monitor von Lautsprecher";
+        app.update_devices(
+            vec![
+                ListedDevice {
+                    name: speakers.into(),
+                    id: "alsa_output.pci.analog-stereo.monitor".into(),
+                },
+                ListedDevice {
+                    name: "USB-Mikrofon".into(),
+                    id: "alsa_input.usb".into(),
+                },
+            ],
+            names(&["Lautsprecher", "OpenMic Virtual Cable"]),
+            true,
+        );
+        assert_eq!(app.settings.microphone, "USB-Mikrofon");
+        assert_eq!(app.settings.output, "OpenMic Virtual Cable");
+        assert_eq!(app.monitor_inputs, [speakers]);
+        assert!(
+            app.inputs.iter().any(|name| name == speakers),
+            "the monitor stays available to choose"
+        );
     }
 
     #[test]
@@ -2491,17 +3507,29 @@ mod tests {
         });
         app.assign_hotkey(&Binding::Pad("a.wav".into()), Some("Ctrl+Alt+1".into()));
         app.assign_hotkey(&Binding::Mute, Some("Ctrl+Alt+M".into()));
-        app.assign_hotkey(&Binding::Pad("b.wav".into()), Some("control+alt+Digit1".into()));
+        app.assign_hotkey(
+            &Binding::Pad("b.wav".into()),
+            Some("control+alt+Digit1".into()),
+        );
         assert_eq!(app.settings.sounds[0].hotkey, None, "taken over by pad b");
-        assert_eq!(app.settings.sounds[1].hotkey.as_deref(), Some("control+alt+Digit1"));
+        assert_eq!(
+            app.settings.sounds[1].hotkey.as_deref(),
+            Some("control+alt+Digit1")
+        );
 
         let bindings = app.hotkey_bindings();
         assert_eq!(bindings.len(), 2);
         assert!(bindings.contains(&("Ctrl+Alt+M".into(), Command::ToggleMute)));
-        assert!(bindings.contains(&("control+alt+Digit1".into(), Command::PlayPad("b.wav".into()))));
+        assert!(bindings.contains(&(
+            "control+alt+Digit1".into(),
+            Command::PlayPad("b.wav".into())
+        )));
 
         app.start_capture(Binding::StopClips);
-        assert!(app.hotkey_bindings().is_empty(), "keys are freed while recording one");
+        assert!(
+            app.hotkey_bindings().is_empty(),
+            "keys are freed while recording one"
+        );
     }
 
     #[test]
@@ -2515,7 +3543,10 @@ mod tests {
         app.assign_hotkey(&Binding::Dictate, None);
         assert!(app.capturing.is_none(), "Clear must end shortcut capture");
         assert!(app.settings.hotkeys.dictate.is_none());
-        assert_eq!(app.hotkey_bindings(), vec![("Ctrl+Alt+M".into(), Command::ToggleMute)]);
+        assert_eq!(
+            app.hotkey_bindings(),
+            vec![("Ctrl+Alt+M".into(), Command::ToggleMute)]
+        );
     }
 
     #[test]
@@ -2532,44 +3563,111 @@ mod tests {
             ctx.options_mut(|options| options.max_passes = passes.try_into().unwrap());
             ctx.enable_accesskit();
             let mut frame = eframe::Frame::_new_kittest();
-            let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
-                time: Some(ctx.cumulative_frame_nr() as f64 * 0.2), events, ..Default::default()
-            }, |ui| app.ui(ui, &mut frame));
-            for _ in 0..3 { draw(&mut app, Vec::new()); }
-            let output = draw(&mut app, Vec::new());
-            let owner = *output.platform_output.accesskit_update.unwrap().nodes.iter()
-                .find(|(_, node)| node.label() == Some("Start processing automatically")).map(|(id, _)| id).unwrap();
-            draw(&mut app, vec![egui::Event::AccessKitActionRequest(ActionRequest {
-                action: Action::Focus, target_tree: TreeId::ROOT, target_node: owner, data: None,
-            })]);
-            for _ in 0..8 { draw(&mut app, Vec::new()); }
-            let key = |key, pressed, modifiers| egui::Event::Key {
-                key, physical_key: Some(key), pressed, repeat: false, modifiers,
+            let mut draw = |app: &mut App, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(760.0, 880.0),
+                        )),
+                        time: Some(ctx.cumulative_frame_nr() as f64 * 0.2),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut frame),
+                )
             };
-            let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+            for _ in 0..3 {
+                draw(&mut app, Vec::new());
+            }
+            let output = draw(&mut app, Vec::new());
+            let owner = *output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Start processing automatically"))
+                .map(|(id, _)| id)
+                .unwrap();
+            draw(
+                &mut app,
+                vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                    action: Action::Focus,
+                    target_tree: TreeId::ROOT,
+                    target_node: owner,
+                    data: None,
+                })],
+            );
+            for _ in 0..8 {
+                draw(&mut app, Vec::new());
+            }
+            let key = |key, pressed, modifiers| egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed,
+                repeat: false,
+                modifiers,
+            };
+            let ctrl = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            };
             // Edits deferred before capture started must never become shortcuts.
-            ctx.data_mut(|data| data.insert_temp(egui::Id::new("keyboard-input"),
-                (None::<egui::Id>, vec![key(egui::Key::M, true, ctrl), egui::Event::Text("m".into())])));
-            draw(&mut app, vec![key(egui::Key::Tab, true, egui::Modifiers::NONE)]);
-            for _ in 0..3 { draw(&mut app, Vec::new()); }
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("keyboard-input"),
+                    (
+                        None::<egui::Id>,
+                        vec![key(egui::Key::M, true, ctrl), egui::Event::Text("m".into())],
+                    ),
+                )
+            });
+            draw(
+                &mut app,
+                vec![key(egui::Key::Tab, true, egui::Modifiers::NONE)],
+            );
+            for _ in 0..3 {
+                draw(&mut app, Vec::new());
+            }
             assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
             assert!(app.capturing.is_some(), "a rejected key keeps capture open");
             assert!(app.dirty_since.is_none());
             // A fresh correction is captured; neither the rejected Tab nor its repeats navigate.
-            draw(&mut app, vec![key(egui::Key::Tab, true, egui::Modifiers::NONE),
-                key(egui::Key::M, true, ctrl), egui::Event::Text("m".into())]);
-            for _ in 0..3 { draw(&mut app, Vec::new()); }
+            draw(
+                &mut app,
+                vec![
+                    key(egui::Key::Tab, true, egui::Modifiers::NONE),
+                    key(egui::Key::M, true, ctrl),
+                    egui::Event::Text("m".into()),
+                ],
+            );
+            for _ in 0..3 {
+                draw(&mut app, Vec::new());
+            }
             let output = draw(&mut app, Vec::new());
             expected["hotkeys"]["mute"] = serde_json::json!("Ctrl+M");
             assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
-            assert_eq!(output.platform_output.accesskit_update.unwrap().focus, owner);
+            assert_eq!(
+                output.platform_output.accesskit_update.unwrap().focus,
+                owner
+            );
             assert!(app.capturing.is_none() && app.dirty_since.is_some());
             assert_eq!(app.page, Page::Settings);
             assert!(app.pad_filter.is_empty() && app.engine.is_none() && app.dictating.is_none());
-            draw(&mut app, vec![key(egui::Key::Tab, false, egui::Modifiers::NONE), key(egui::Key::M, false, ctrl)]);
+            draw(
+                &mut app,
+                vec![
+                    key(egui::Key::Tab, false, egui::Modifiers::NONE),
+                    key(egui::Key::M, false, ctrl),
+                ],
+            );
             app.start_capture(Binding::Mute);
-            draw(&mut app, vec![key(egui::Key::F13, true, egui::Modifiers::NONE)]);
+            draw(
+                &mut app,
+                vec![key(egui::Key::F13, true, egui::Modifiers::NONE)],
+            );
             expected["hotkeys"]["mute"] = serde_json::json!("F13");
             assert_eq!(serde_json::to_value(&app.settings).unwrap(), expected);
             assert!(app.capturing.is_none() && app.dirty_since.is_some());
@@ -2591,25 +3689,60 @@ mod tests {
             *app.binding_slot(&binding).unwrap() = Some("Ctrl+Alt+M".into());
             let ctx = egui::Context::default();
             let mut frame = eframe::Frame::_new_kittest();
-            let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
-                events, ..Default::default()
-            }, |ui| app.ui(ui, &mut frame));
+            let mut draw = |app: &mut App, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(760.0, 880.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut frame),
+                )
+            };
             draw(&mut app, Vec::new());
             for label in ["Set…", "Clear"] {
                 let output = draw(&mut app, Vec::new());
-                let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect().center()),
-                    _ => None,
-                }).expect("shortcut control is visible");
+                let pos = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => {
+                            Some(text.visual_bounding_rect().center())
+                        }
+                        _ => None,
+                    })
+                    .expect("shortcut control is visible");
                 for pressed in [true, false] {
-                    draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
-                        pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
-                    }]);
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
                 }
-                assert!(app.capturing.is_none(), "unavailable hotkeys must not start capture");
-                assert_eq!(app.binding_slot(&binding).unwrap().is_none(), label == "Clear", "{page:?}: {binding:?}");
-                assert_eq!(app.dirty_since.is_some(), label == "Clear", "only clearing changes settings");
+                assert!(
+                    app.capturing.is_none(),
+                    "unavailable hotkeys must not start capture"
+                );
+                assert_eq!(
+                    app.binding_slot(&binding).unwrap().is_none(),
+                    label == "Clear",
+                    "{page:?}: {binding:?}"
+                );
+                assert_eq!(
+                    app.dirty_since.is_some(),
+                    label == "Clear",
+                    "only clearing changes settings"
+                );
             }
             assert_eq!(app.hotkey_status, ("Shortcut cleared".into(), MUTED));
         }
@@ -2630,8 +3763,15 @@ mod tests {
             app.hidden = hidden;
 
             let ctx = egui::Context::default();
-            let mut input = egui::RawInput { focused, ..Default::default() };
-            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().minimized = Some(minimized);
+            let mut input = egui::RawInput {
+                focused,
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .minimized = Some(minimized);
             let _ = ctx.run_ui(input, |ui| app.sync_hotkeys(ui.ctx()));
 
             let active = focused && !hidden && !minimized;
@@ -2655,29 +3795,58 @@ mod tests {
             app.start_capture(Binding::Dictate);
             let ctx = egui::Context::default();
             let mut frame = eframe::Frame::_new_kittest();
-            let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 880.0))),
-                events,
-                ..Default::default()
-            }, |ui| app.ui(ui, &mut frame));
-            let output = draw(&mut app, vec![]);
-            let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == destination.title()
-                    && text.visual_bounding_rect().right() < SIDEBAR_WIDTH => Some(text.visual_bounding_rect().center()),
-                _ => None,
-            }).expect("sidebar navigation");
-            let button = |pressed| egui::Event::PointerButton {
-                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            let mut draw = |app: &mut App, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(760.0, 880.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui, &mut frame),
+                )
             };
-            for events in [vec![egui::Event::PointerMoved(pos)], vec![button(true)], vec![button(false)]] {
+            let output = draw(&mut app, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text() == destination.title()
+                            && text.visual_bounding_rect().right() < SIDEBAR_WIDTH =>
+                    {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .expect("sidebar navigation");
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for events in [
+                vec![egui::Event::PointerMoved(pos)],
+                vec![button(true)],
+                vec![button(false)],
+            ] {
                 draw(&mut app, events);
             }
             assert_eq!(app.page, destination);
-            assert_eq!(app.capturing.is_some(), destination == Page::Settings,
-                "only leaving the current page cancels capture");
+            assert_eq!(
+                app.capturing.is_some(),
+                destination == Page::Settings,
+                "only leaving the current page cancels capture"
+            );
             assert_eq!(app.settings.hotkeys.dictate.as_deref(), Some("Ctrl+Alt+D"));
             if destination != Page::Settings {
-                assert_eq!(app.hotkey_bindings(), vec![("Ctrl+Alt+D".into(), Command::Dictate)]);
+                assert_eq!(
+                    app.hotkey_bindings(),
+                    vec![("Ctrl+Alt+D".into(), Command::Dictate)]
+                );
             }
         }
     }
@@ -2718,7 +3887,10 @@ mod tests {
     }
 
     fn visible<'a>(texts: &'a [(String, egui::Rect)], needle: &str) -> Option<&'a egui::Rect> {
-        texts.iter().find(|(text, _)| text.contains(needle)).map(|(_, rect)| rect)
+        texts
+            .iter()
+            .find(|(text, _)| text.contains(needle))
+            .map(|(_, rect)| rect)
     }
 
     #[test]
@@ -2757,32 +3929,67 @@ mod tests {
         app.last_dictation = "Previous transcript".into();
         app.dictating = Some(DictationRecording {
             recorder: Recorder::from_samples_for_test(&[0.25; 96]),
-            model: app.settings.speech_model, hold_to_talk: false,
+            model: app.settings.speech_model,
+            hold_to_talk: false,
         });
-        let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+        let take = Recorder::from_samples_for_test(&[0.25; 96])
+            .finish()
+            .unwrap()
+            .unwrap();
         app.dictation.transcribe(app.settings.speech_model, take);
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut frame = eframe::Frame::_new_kittest();
-        let mut draw = |app: &mut App, events| ctx.run_ui(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 650.0))),
-            events, ..Default::default()
-        }, |ui| app.ui(ui, &mut frame));
+        let mut draw = |app: &mut App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(760.0, 650.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui(ui, &mut frame),
+            )
+        };
         draw(&mut app, Vec::new());
         let output = draw(&mut app, Vec::new());
-        let pos = output.shapes.iter().find_map(|shape| match &shape.shape {
-            egui::Shape::Text(text) if text.galley.text() == "Cancel transcription" => Some(text.visual_bounding_rect().center()),
-            _ => None,
-        }).expect("cancellation must be visible while transcribing");
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Cancel transcription" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("cancellation must be visible while transcribing");
         let tree = output.platform_output.accesskit_update.unwrap();
-        assert!(tree.nodes.iter().any(|(_, node)| node.label() == Some("Cancel transcription")));
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Cancel transcription"))
+        );
         for pressed in [true, false] {
-            draw(&mut app, vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
-                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
-            }]);
+            draw(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
         }
         assert!(app.dictation.transcription_cancelling());
-        assert!(app.dictating.is_some(), "cancelling completed takes must not discard a new recording");
+        assert!(
+            app.dictating.is_some(),
+            "cancelling completed takes must not discard a new recording"
+        );
         assert_eq!(app.last_dictation, "Previous transcript");
         let (texts, _) = render(&mut app, egui::vec2(760.0, 650.0));
         assert!(visible(&texts, "Cancelling transcription…").is_some());
@@ -2810,11 +4017,29 @@ mod tests {
             app.dictation = dictation;
             app.page = Page::Dictation;
             app.last_dictation = "Previous transcript remains available to copy.".into();
-            let take = Recorder::from_samples_for_test(&[0.25; 96]).finish().unwrap().unwrap();
+            let take = Recorder::from_samples_for_test(&[0.25; 96])
+                .finish()
+                .unwrap()
+                .unwrap();
             app.dictation.transcribe(app.settings.speech_model, take);
             for cancelling in [false, true] {
-                if cancelling { app.dictation.cancel_transcription(); }
-                snapshot::snapshot(&mut app, &format!("dictation-{}-{theme}", if cancelling { "cancelling" } else { "transcribing" }), egui::vec2(700.0, 420.0), 1.0, dark);
+                if cancelling {
+                    app.dictation.cancel_transcription();
+                }
+                snapshot::snapshot(
+                    &mut app,
+                    &format!(
+                        "dictation-{}-{theme}",
+                        if cancelling {
+                            "cancelling"
+                        } else {
+                            "transcribing"
+                        }
+                    ),
+                    egui::vec2(700.0, 420.0),
+                    1.0,
+                    dark,
+                );
             }
         }
     }
@@ -2828,12 +4053,25 @@ mod tests {
             app.page = Page::Dictation;
             app.last_dictation = "Previous transcript remains available to copy.".into();
             app.dictating = Some(DictationRecording {
-                recorder, model: app.settings.speech_model, hold_to_talk: true,
+                recorder,
+                model: app.settings.speech_model,
+                hold_to_talk: true,
             });
             app.stop_dictation();
             for discarded in [false, true] {
-                if discarded { app.discard_dictation(); }
-                snapshot::snapshot(&mut app, &format!("dictation-{}-{theme}", if discarded { "discarded" } else { "finishing" }), egui::vec2(700.0, 420.0), 1.0, dark);
+                if discarded {
+                    app.discard_dictation();
+                }
+                snapshot::snapshot(
+                    &mut app,
+                    &format!(
+                        "dictation-{}-{theme}",
+                        if discarded { "discarded" } else { "finishing" }
+                    ),
+                    egui::vec2(700.0, 420.0),
+                    1.0,
+                    dark,
+                );
             }
             finish.send(()).unwrap();
         }
@@ -2851,14 +4089,31 @@ mod tests {
                 let (texts, _) = render(&mut app, size);
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
                 for needle in ["OpenMic", "Voice", "Settings", "• Stopped", "Start", "Mute"] {
-                    let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} missing on {page:?} at {size:?}"));
-                    assert!(screen.contains_rect(*rect), "{needle} off screen on {page:?} at {size:?}: {rect:?}");
-                    assert!(rect.right() < SIDEBAR_WIDTH + 4.0 || needle == "Voice", "{needle} is in the sidebar: {rect:?}");
+                    let rect = visible(&texts, needle)
+                        .unwrap_or_else(|| panic!("{needle} missing on {page:?} at {size:?}"));
+                    assert!(
+                        screen.contains_rect(*rect),
+                        "{needle} off screen on {page:?} at {size:?}: {rect:?}"
+                    );
+                    assert!(
+                        rect.right() < SIDEBAR_WIDTH + 4.0 || needle == "Voice",
+                        "{needle} is in the sidebar: {rect:?}"
+                    );
                 }
                 let start = visible(&texts, "Start").unwrap();
-                assert!(start.bottom() > size.y - 40.0, "the status panel sits at the bottom: {start:?}");
-                let title = texts.iter().filter(|(t, _)| t == page.title()).map(|(_, r)| r).find(|r| r.left() > SIDEBAR_WIDTH);
-                assert!(title.is_some(), "{page:?} shows its title beside the sidebar");
+                assert!(
+                    start.bottom() > size.y - 40.0,
+                    "the status panel sits at the bottom: {start:?}"
+                );
+                let title = texts
+                    .iter()
+                    .filter(|(t, _)| t == page.title())
+                    .map(|(_, r)| r)
+                    .find(|r| r.left() > SIDEBAR_WIDTH);
+                assert!(
+                    title.is_some(),
+                    "{page:?} shows its title beside the sidebar"
+                );
             }
         }
     }
@@ -2866,7 +4121,10 @@ mod tests {
     #[test]
     fn the_window_reopens_where_it_was_and_remembers_moves() {
         use eframe::App as _;
-        let mut app = App::stopped(Settings { window_position: Some([3900, 150]), ..Settings::default() });
+        let mut app = App::stopped(Settings {
+            window_position: Some([3900, 150]),
+            ..Settings::default()
+        });
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
         // eframe reports the window at 150% scaling, where Windows first put it.
@@ -2874,40 +4132,77 @@ mod tests {
             let info = egui::ViewportInfo {
                 native_pixels_per_point: Some(1.5),
                 outer_rect: Some(egui::Rect::from_min_size(min, egui::vec2(760.0, 880.0))),
-                inner_rect: Some(egui::Rect::from_min_size(min + egui::vec2(8.0, 30.0), egui::vec2(744.0, 842.0))),
+                inner_rect: Some(egui::Rect::from_min_size(
+                    min + egui::vec2(8.0, 30.0),
+                    egui::vec2(744.0, 842.0),
+                )),
                 ..Default::default()
             };
             let mut input = egui::RawInput::default();
             input.viewports.insert(egui::ViewportId::ROOT, info);
-            ctx.run_ui(input, |ui| app.logic(ui.ctx(), &mut frame)).viewport_output
+            ctx.run_ui(input, |ui| app.logic(ui.ctx(), &mut frame))
+                .viewport_output
         };
         let first = frame_at(&mut app, egui::pos2(100.0, 100.0));
         let moved: Vec<_> = first.values().flat_map(|v| v.commands.clone()).collect();
         if on_a_monitor([3900, 150]) {
-            assert!(moved.contains(&ViewportCommand::OuterPosition(egui::pos2(2600.0, 100.0))), "{moved:?}");
+            assert!(
+                moved.contains(&ViewportCommand::OuterPosition(egui::pos2(2600.0, 100.0))),
+                "{moved:?}"
+            );
         } else {
-            let placed = moved.iter().any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
-            assert!(!placed, "a position on a monitor that's gone is ignored: {moved:?}");
+            let placed = moved
+                .iter()
+                .any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
+            assert!(
+                !placed,
+                "a position on a monitor that's gone is ignored: {moved:?}"
+            );
         }
         for _ in 0..6 {
             frame_at(&mut app, egui::pos2(400.0, 300.0));
         }
-        assert_eq!(app.settings.window_position, Some([600, 450]), "saved in screen pixels");
-        assert_eq!(app.settings.window_size, Some([744.0, 842.0]), "and the size in points");
+        assert_eq!(
+            app.settings.window_position,
+            Some([600, 450]),
+            "saved in screen pixels"
+        );
+        assert_eq!(
+            app.settings.window_size,
+            Some([744.0, 842.0]),
+            "and the size in points"
+        );
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_saved_position_off_every_monitor_is_ignored() {
         use eframe::App as _;
-        assert!(!on_a_monitor([-100_000, -100_000]) || !cfg!(windows));
-        let mut app = App::stopped(Settings { window_position: Some([-100_000, -100_000]), ..Settings::default() });
+        // Windows always has a monitor list. Linux only does on X11; Wayland
+        // and a missing server keep the saved position, which this test skips.
+        #[cfg(windows)]
+        assert!(
+            !on_a_monitor([-100_000, -100_000]),
+            "Windows reports connected monitors"
+        );
+        if on_a_monitor([-100_000, -100_000]) {
+            return;
+        }
+        let mut app = App::stopped(Settings {
+            window_position: Some([-100_000, -100_000]),
+            ..Settings::default()
+        });
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
         let info = egui::ViewportInfo {
             native_pixels_per_point: Some(1.0),
-            outer_rect: Some(egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(760.0, 880.0))),
-            inner_rect: Some(egui::Rect::from_min_size(egui::pos2(58.0, 80.0), egui::vec2(744.0, 842.0))),
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(50.0, 50.0),
+                egui::vec2(760.0, 880.0),
+            )),
+            inner_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(58.0, 80.0),
+                egui::vec2(744.0, 842.0),
+            )),
             ..Default::default()
         };
         let mut input = egui::RawInput::default();
@@ -2918,7 +4213,7 @@ mod tests {
             .values()
             .flat_map(|v| &v.commands)
             .any(|c| matches!(c, ViewportCommand::OuterPosition(_)));
-        assert!(!placed, "the window stays where Windows put it");
+        assert!(!placed, "an off-screen saved position is not applied");
     }
 
     /// egui's built-in fonts lack many symbols (check marks, arrows, most
@@ -2941,7 +4236,12 @@ mod tests {
             ("viz.rs", include_str!("../viz.rs")),
             ("tray.rs", include_str!("../tray.rs")),
             // Labels the UI shows for speech models.
-            ("dictation.rs", &include_str!("../dictation.rs")[..include_str!("../dictation.rs").find("// ---- download").unwrap()]),
+            (
+                "dictation.rs",
+                &include_str!("../dictation.rs")[..include_str!("../dictation.rs")
+                    .find("// ---- download")
+                    .unwrap()],
+            ),
         ];
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
@@ -2953,14 +4253,19 @@ mod tests {
                     continue;
                 }
                 for ch in code.chars().filter(|c| !c.is_ascii()) {
-                    let drawn = ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), ch));
+                    let drawn =
+                        ctx.fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), ch));
                     if !drawn {
                         missing.push(format!("{file}:{} {ch} (U+{:04X})", n + 1, ch as u32));
                     }
                 }
             }
         }
-        assert!(missing.is_empty(), "symbols the fonts can't draw:\n{}", missing.join("\n"));
+        assert!(
+            missing.is_empty(),
+            "symbols the fonts can't draw:\n{}",
+            missing.join("\n")
+        );
     }
 
     #[test]
@@ -2970,24 +4275,40 @@ mod tests {
         let ctx = egui::Context::default();
         let mut frame = eframe::Frame::_new_kittest();
         let mut frame_with = |app: &mut App, minimized: bool| {
-            let info = egui::ViewportInfo { minimized: Some(minimized), ..Default::default() };
+            let info = egui::ViewportInfo {
+                minimized: Some(minimized),
+                ..Default::default()
+            };
             let mut input = egui::RawInput::default();
             input.viewports.insert(egui::ViewportId::ROOT, info);
             let output = ctx.run_ui(input, |ui| app.logic(ui.ctx(), &mut frame));
-            output.viewport_output.into_values().flat_map(|v| v.commands).collect::<Vec<_>>()
+            output
+                .viewport_output
+                .into_values()
+                .flat_map(|v| v.commands)
+                .collect::<Vec<_>>()
         };
         frame_with(&mut app, false);
         let commands = frame_with(&mut app, true);
-        assert!(app.settings.collapsed && app.hidden, "minimize collapsed it");
+        assert!(
+            app.settings.collapsed && app.hidden,
+            "minimize collapsed it"
+        );
         assert!(commands.contains(&ViewportCommand::Visible(false)));
 
         // Expanding restores the window; a stale "minimized" doesn't re-collapse.
         app.commands.0.send(Command::Show).unwrap();
         let commands = frame_with(&mut app, true);
-        assert!(commands.contains(&ViewportCommand::Minimized(false)), "{commands:?}");
+        assert!(
+            commands.contains(&ViewportCommand::Minimized(false)),
+            "{commands:?}"
+        );
         assert!(!app.settings.collapsed && !app.hidden);
         frame_with(&mut app, true);
-        assert!(!app.settings.collapsed, "no flip-flop while Windows catches up");
+        assert!(
+            !app.settings.collapsed,
+            "no flip-flop while Windows catches up"
+        );
         frame_with(&mut app, false);
         frame_with(&mut app, true);
         assert!(app.settings.collapsed, "minimizing again collapses again");
@@ -3018,17 +4339,40 @@ mod tests {
             ];
             let mut last_top = 0.0;
             for (title, explain) in rows {
-                let t = *visible(&texts, title).unwrap_or_else(|| panic!("{title} missing at {size:?}"));
-                let e = *visible(&texts, explain).unwrap_or_else(|| panic!("{title}'s explanation missing"));
+                let t = *visible(&texts, title)
+                    .unwrap_or_else(|| panic!("{title} missing at {size:?}"));
+                let e = *visible(&texts, explain)
+                    .unwrap_or_else(|| panic!("{title}'s explanation missing"));
                 assert!(t.top() > last_top, "{title} is below the row before it");
-                assert!(e.top() > t.top() && e.top() - t.bottom() < 12.0, "{title}'s explanation sits under it");
+                assert!(
+                    e.top() > t.top() && e.top() - t.bottom() < 12.0,
+                    "{title}'s explanation sits under it"
+                );
                 assert!(e.right() <= size.x, "{title} fits at {size:?}");
                 last_top = t.top();
             }
-            for chip in ["Balanced", "Mechanical keyboard", "Quiet room", "Noisy room", "Low CPU", "Bypass", "Test my mic", "DeepFilterNet"] {
-                assert!(visible(&texts, chip).is_some(), "{chip} missing at {size:?}");
+            for chip in [
+                "Balanced",
+                "Mechanical keyboard",
+                "Quiet room",
+                "Noisy room",
+                "Low CPU",
+                "Bypass",
+                "Test my mic",
+                "DeepFilterNet",
+            ] {
+                assert!(
+                    visible(&texts, chip).is_some(),
+                    "{chip} missing at {size:?}"
+                );
             }
-            for gone in ["Simple", "Advanced", "LIVE SCOPE", "PROCESSING", "Noise reduction"] {
+            for gone in [
+                "Simple",
+                "Advanced",
+                "LIVE SCOPE",
+                "PROCESSING",
+                "Noise reduction",
+            ] {
                 assert!(visible(&texts, gone).is_none(), "{gone} should be gone");
             }
         }
@@ -3042,7 +4386,11 @@ mod tests {
         let mut frame = eframe::Frame::_new_kittest();
         let size = egui::vec2(760.0, 1400.0);
         let mut run = |app: &mut App, events: Vec<egui::Event>| {
-            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            };
             ctx.run_ui(input, |ui| app.ui(ui, &mut frame))
         };
         let output = run(&mut app, vec![]);
@@ -3050,15 +4398,30 @@ mod tests {
             .shapes
             .iter()
             .find_map(|c| match &c.shape {
-                egui::Shape::Text(t) if t.galley.text() == "Noisy room" => Some(t.visual_bounding_rect().center()),
+                egui::Shape::Text(t) if t.galley.text() == "Noisy room" => {
+                    Some(t.visual_bounding_rect().center())
+                }
                 _ => None,
             })
             .expect("Noisy room chip");
-        let button = |pressed| egui::Event::PointerButton { pos: chip, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
-        for events in [vec![egui::Event::PointerMoved(chip)], vec![button(true)], vec![button(false)], vec![]] {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: chip,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(chip)],
+            vec![button(true)],
+            vec![button(false)],
+            vec![],
+        ] {
             run(&mut app, events);
         }
-        let noisy = crate::config::builtin_presets().into_iter().find(|p| p.name == "Noisy room").unwrap();
+        let noisy = crate::config::builtin_presets()
+            .into_iter()
+            .find(|p| p.name == "Noisy room")
+            .unwrap();
         assert_eq!(app.settings.processing(), noisy.processing);
         assert!(app.settings.gate, "Noisy room turns the quiet cut-off on");
     }
@@ -3074,7 +4437,10 @@ mod tests {
         app.inputs = vec!["Yeti".into()];
         app.settings.microphone = "Yeti".into();
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "2 of 4").is_some(), "VB-Cable and the mic are seen");
+        assert!(
+            visible(&texts, "2 of 4").is_some(),
+            "VB-Cable and the mic are seen"
+        );
         assert!(visible(&texts, "Input Device to Default").is_some());
 
         app.settings.setup.discord = true;
@@ -3090,39 +4456,66 @@ mod tests {
 
     #[test]
     fn routing_is_on_the_voice_page_above_the_settings() {
-        let mut app = App::stopped(Settings { microphone: "Yeti".into(), output: "CABLE Input".into(), ..Settings::default() });
+        let mut app = App::stopped(Settings {
+            microphone: "Yeti".into(),
+            output: "CABLE Input".into(),
+            ..Settings::default()
+        });
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
         let routing = *visible(&texts, "ROUTING").expect("routing on the Voice page");
         let rows = *visible(&texts, "YOUR VOICE, STEP BY STEP").unwrap();
-        assert!(routing.top() < rows.top(), "devices first, then what happens to your voice");
+        assert!(
+            routing.top() < rows.top(),
+            "devices first, then what happens to your voice"
+        );
         for label in ["Microphone", "Processed output", "Monitor output"] {
             assert!(visible(&texts, label).is_some(), "{label} chooser missing");
         }
-        assert!(visible(&texts, "Hear yourself").is_some(), "the monitor is a Voice control");
+        assert!(
+            visible(&texts, "Hear yourself").is_some(),
+            "the monitor is a Voice control"
+        );
 
         app.page = Page::Settings;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
         assert!(visible(&texts, "ROUTING").is_none() && visible(&texts, "HOTKEYS").is_some());
-        assert!(visible(&texts, "Always show the strip").is_some(), "strip visibility is a Settings option");
-        assert!(visible(&texts, "SPEECH TO TEXT").is_none(), "dictation has its own page");
+        assert!(
+            visible(&texts, "Always show the strip").is_some(),
+            "strip visibility is a Settings option"
+        );
+        assert!(
+            visible(&texts, "SPEECH TO TEXT").is_none(),
+            "dictation has its own page"
+        );
         app.page = Page::Dictation;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "SPEECH TO TEXT").is_some() && visible(&texts, "Shortcut").is_some());
+        assert!(
+            visible(&texts, "SPEECH TO TEXT").is_some() && visible(&texts, "Shortcut").is_some()
+        );
         app.page = Page::Record;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
         assert!(visible(&texts, "RECORD A CLIP").is_some());
         app.page = Page::Soundboard;
         let (texts, _) = render(&mut app, egui::vec2(760.0, 1400.0));
-        assert!(visible(&texts, "RECORD A CLIP").is_none(), "recording has its own page");
+        assert!(
+            visible(&texts, "RECORD A CLIP").is_none(),
+            "recording has its own page"
+        );
     }
 
     #[test]
     fn update_states_show_in_the_header() {
         use crate::update::{Release, Status};
         let cases = [
-            (Status::Available(Release::sample("v9.0.0")), "v9.0.0 available"),
+            (
+                Status::Available(Release::sample("v9.0.0")),
+                "v9.0.0 available",
+            ),
             (Status::Downloading(Release::sample("v9.0.0")), "/ 54 MB"),
-            (Status::Ready(Release::sample("v9.0.0")), "Restart to update"),
+            (
+                Status::Ready(Release::sample("v9.0.0")),
+                "Restart to update",
+            ),
             (Status::Checking, "Checking for updates"),
         ];
         for (status, needle) in cases {
@@ -3130,8 +4523,14 @@ mod tests {
             app.updater.set_status_for_test(status);
             let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
             let rect = visible(&texts, needle).unwrap_or_else(|| panic!("{needle} not shown"));
-            assert!(rect.top() < 60.0, "{needle} belongs in the title row: {rect:?}");
-            assert!(visible(&texts, "Clean voice").is_none(), "the tagline gives way to {needle}");
+            assert!(
+                rect.top() < 60.0,
+                "{needle} belongs in the title row: {rect:?}"
+            );
+            assert!(
+                visible(&texts, "Clean voice").is_none(),
+                "the tagline gives way to {needle}"
+            );
         }
     }
 
@@ -3140,14 +4539,19 @@ mod tests {
         use crate::update::Status;
         for (status, message) in [
             (Status::UpToDate, "is up to date"),
-            (Status::Failed("Connection timed out".into()), "Couldn't check for updates"),
+            (
+                Status::Failed("Connection timed out".into()),
+                "Couldn't check for updates",
+            ),
         ] {
             let mut app = App::stopped(Settings::default());
             app.manual_update_check = true;
             app.updater.set_status_for_test(Status::Checking);
             app.poll_updates();
-            assert!(app.manual_update_check && app.update_checked_at.is_none(),
-                "the result timer must not run during a slow check");
+            assert!(
+                app.manual_update_check && app.update_checked_at.is_none(),
+                "the result timer must not run during a slow check"
+            );
 
             let completed = Instant::now();
             app.updater.set_status_for_test(status.clone());
@@ -3156,9 +4560,16 @@ mod tests {
             let shown_at = app.update_checked_at.unwrap();
             assert!(shown_at >= completed);
             let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
-            assert!(visible(&texts, message).is_some(), "{message} must be shown when the result arrives");
+            assert!(
+                visible(&texts, message).is_some(),
+                "{message} must be shown when the result arrives"
+            );
             app.poll_updates();
-            assert_eq!(app.update_checked_at, Some(shown_at), "polling must not extend the result forever");
+            assert_eq!(
+                app.update_checked_at,
+                Some(shown_at),
+                "polling must not extend the result forever"
+            );
 
             let expired = Instant::now() - Duration::from_secs(60);
             app.update_checked_at = Some(expired);
@@ -3169,9 +4580,16 @@ mod tests {
             app.poll_updates();
             app.updater.set_status_for_test(status);
             app.poll_updates();
-            assert_eq!(app.update_checked_at, Some(expired), "an automatic check must not restart the manual timer");
+            assert_eq!(
+                app.update_checked_at,
+                Some(expired),
+                "an automatic check must not restart the manual timer"
+            );
             let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
-            assert!(visible(&texts, message).is_none(), "automatic check results stay quiet");
+            assert!(
+                visible(&texts, message).is_none(),
+                "automatic check results stay quiet"
+            );
         }
     }
 
@@ -3183,14 +4601,24 @@ mod tests {
             app.page = Page::Soundboard;
             app.update_checked_at = checked_at;
             app.updater.set_status_for_test(Status::DownloadFailed {
-                release: Release::sample("v9.0.0"), error: "Connection interrupted".into(),
+                release: Release::sample("v9.0.0"),
+                error: "Connection interrupted".into(),
             });
             let (texts, _) = render(&mut app, egui::vec2(700.0, 420.0));
-            let error = visible(&texts, "Update download failed").expect("the failure must stay visible");
-            let retry = visible(&texts, "Retry update").expect("the failed release can be retried directly");
-            let title = &texts.iter().find(|(text, rect)| text == "Soundboard" && rect.left() >= SIDEBAR_WIDTH).unwrap().1;
+            let error =
+                visible(&texts, "Update download failed").expect("the failure must stay visible");
+            let retry = visible(&texts, "Retry update")
+                .expect("the failed release can be retried directly");
+            let title = &texts
+                .iter()
+                .find(|(text, rect)| text == "Soundboard" && rect.left() >= SIDEBAR_WIDTH)
+                .unwrap()
+                .1;
             assert!(error.top() < 60.0 && retry.top() < 60.0);
-            assert!(title.right() < error.left() && error.right() < retry.left(), "header controls overlap");
+            assert!(
+                title.right() < error.left() && error.right() < retry.left(),
+                "header controls overlap"
+            );
             assert!(visible(&texts, "Couldn't check for updates").is_none());
             assert!(visible(&texts, "Clean voice").is_none());
         }
@@ -3202,10 +4630,18 @@ mod tests {
         for (dark, theme) in [(true, "dark"), (false, "light")] {
             let mut app = App::stopped(Settings::default());
             app.page = Page::Soundboard;
-            app.updater.set_status_for_test(crate::update::Status::DownloadFailed {
-                release: crate::update::Release::sample("v9.0.0"), error: "Connection interrupted".into(),
-            });
-            snapshot::snapshot(&mut app, &format!("update-download-failed-{theme}"), egui::vec2(700.0, 420.0), 1.0, dark);
+            app.updater
+                .set_status_for_test(crate::update::Status::DownloadFailed {
+                    release: crate::update::Release::sample("v9.0.0"),
+                    error: "Connection interrupted".into(),
+                });
+            snapshot::snapshot(
+                &mut app,
+                &format!("update-download-failed-{theme}"),
+                egui::vec2(700.0, 420.0),
+                1.0,
+                dark,
+            );
         }
     }
 
@@ -3214,7 +4650,10 @@ mod tests {
         use crate::update::{Release, Status};
         for status in [
             Status::Available(Release::sample("v9.0.0")),
-            Status::DownloadFailed { release: Release::sample("v9.0.0"), error: "Connection interrupted".into() },
+            Status::DownloadFailed {
+                release: Release::sample("v9.0.0"),
+                error: "Connection interrupted".into(),
+            },
         ] {
             let mut app = App::stopped(Settings::default());
             app.updater.set_status_for_test(status);
@@ -3222,7 +4661,10 @@ mod tests {
             let (texts, _) = render(&mut app, egui::vec2(760.0, 880.0));
             assert!(visible(&texts, "What's new in v9.0.0").is_some());
             assert!(visible(&texts, "Fixes").is_some());
-            assert!(visible(&texts, "Faster updates, see the docs").is_some(), "inline Markdown is plain text");
+            assert!(
+                visible(&texts, "Faster updates, see the docs").is_some(),
+                "inline Markdown is plain text"
+            );
         }
     }
 
@@ -3230,10 +4672,28 @@ mod tests {
     fn screen_readers_can_name_the_controls() {
         let mut app = App::stopped(Settings::default());
         let (_, output) = render(&mut app, egui::vec2(760.0, 880.0));
-        let tree = output.platform_output.accesskit_update.expect("accessibility tree");
-        let labels: Vec<String> = tree.nodes.iter().filter_map(|(_, node)| node.label().map(str::to_owned)).collect();
-        for control in ["Start", "Mute", "Voice", "Soundboard", "Record", "Dictation", "Settings"] {
-            assert!(labels.iter().any(|l| l.contains(control)), "{control} has no accessible name: {labels:?}");
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        let labels: Vec<String> = tree
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect();
+        for control in [
+            "Start",
+            "Mute",
+            "Voice",
+            "Soundboard",
+            "Record",
+            "Dictation",
+            "Settings",
+        ] {
+            assert!(
+                labels.iter().any(|l| l.contains(control)),
+                "{control} has no accessible name: {labels:?}"
+            );
         }
     }
 
