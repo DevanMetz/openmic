@@ -6,7 +6,7 @@ Status of each Windows user-facing feature on Linux in this tree: `working`, `pa
 |---|---|---|
 | DeepFilterNet 3 and RNNoise, voice gate, rumble filter, gains, level gate, bypass, mute, presets | working | `src/denoise.rs`, `src/dsp.rs`, `src/gui/mic_tab.rs` |
 | Live scope and the voice rows | working | `src/gui/mic_tab.rs`, `src/viz.rs` |
-| Microphone, processed output, and headphone monitor routing, with live changes and reconnect | working | `src/engine.rs`, `src/gui/routes.rs` |
+| Microphone, processed output, and headphone monitor routing, with live changes and reconnect | working | `src/engine.rs`, `src/gui/routes.rs` — ALSA pickers exclude silent null PCMs and prefer default/PipeWire/system routes before hardware |
 | Devices opened at their native format and resampled to the 48 kHz DSP core | working | `src/engine.rs`, `src/resample.rs` |
 | 10 ms PulseAudio buffers and clock-drift correction | working | `src/engine.rs` |
 | Real-time priority for audio threads | working | `src/rt.rs`, `src/engine.rs` — requests RealtimeKit priority and logs refusals |
