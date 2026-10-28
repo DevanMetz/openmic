@@ -97,6 +97,22 @@ pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
     };
     if let Ok(devices) = iter {
         for device in devices {
+            #[cfg(target_os = "linux")]
+            if !output && host.id() == cpal::HostId::Alsa {
+                let id = device.id().map(|id| id.id().to_owned()).unwrap_or_default();
+                let description = device.description().ok();
+                let name = device.to_string();
+                if is_noop_alsa_input(
+                    &id,
+                    std::iter::once(name.as_str()).chain(
+                        description
+                            .iter()
+                            .flat_map(|description| description.extended()),
+                    ),
+                ) {
+                    continue;
+                }
+            }
             listed.push(ListedDevice {
                 name: device.to_string(),
                 #[cfg(not(windows))]
@@ -105,6 +121,33 @@ pub fn list_device_details(host: &Host, output: bool) -> Vec<ListedDevice> {
         }
     }
     listed
+}
+
+/// ALSA's null PCM can be exposed under an alias, so inspect its description too.
+#[cfg(target_os = "linux")]
+fn is_noop_alsa_input<'a>(id: &str, descriptions: impl IntoIterator<Item = &'a str>) -> bool {
+    id.trim().eq_ignore_ascii_case("null")
+        || descriptions.into_iter().any(|description| {
+            let text = description.trim().to_ascii_lowercase();
+            text == "null"
+                || (text.contains("discard all samples") && text.contains("generate zero samples"))
+        })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn filters_alsa_noop_inputs_by_id_or_description() {
+    assert!(is_noop_alsa_input("null", ["Anything"]));
+    assert!(is_noop_alsa_input("alias", ["Null"]));
+    assert!(is_noop_alsa_input(
+        "alias",
+        [
+            "Dummy",
+            "Discard all samples (playback) or generate zero samples (capture)"
+        ]
+    ));
+    assert!(!is_noop_alsa_input("hw:0", ["USB microphone"]));
+    assert!(!is_noop_alsa_input("hw:1", ["Null Audio USB microphone"]));
 }
 
 /// Deduped friendly names for a direction. The first device keeps the name.
