@@ -1,13 +1,17 @@
 //! Notification-area icon: shows whether the mic is muted and offers the
 //! main controls while the window is hidden.
+//!
+//! Windows uses the shell notification area. Linux uses a StatusNotifierItem
+//! (the ksni backend), which needs a desktop that shows those icons. Anywhere
+//! the icon cannot be created, [`Tray::new`] fails and closing the window quits.
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use fallback::Tray;
-#[cfg(windows)]
-pub use windows_tray::Tray;
+#[cfg(any(windows, target_os = "linux"))]
+pub use native::Tray;
 
-#[cfg(windows)]
-mod windows_tray {
+#[cfg(any(windows, target_os = "linux"))]
+mod native {
     use anyhow::{Context, Result};
     use crossbeam_channel::Sender;
     use eframe::egui;
@@ -19,7 +23,49 @@ mod windows_tray {
     use crate::gui::Command;
     use crate::icon;
 
+    enum Inner {
+        Live(Live),
+        #[cfg(test)]
+        Stub,
+    }
+
     pub struct Tray {
+        inner: Inner,
+    }
+
+    impl Tray {
+        /// Menu picks and left clicks are sent to `commands` and wake the
+        /// app through `ctx`, even while the window is hidden.
+        pub fn new(ctx: &egui::Context, commands: Sender<Command>) -> Result<Self> {
+            Ok(Self {
+                inner: Inner::Live(Live::new(ctx, commands)?),
+            })
+        }
+
+        /// A tray that is present for close-to-tray tests, without a desktop session.
+        #[cfg(test)]
+        pub(crate) fn present_for_test() -> Self {
+            Self { inner: Inner::Stub }
+        }
+
+        /// `listening`: dictation is recording speech to type.
+        pub fn sync(
+            &mut self,
+            muted: bool,
+            bypassed: bool,
+            running: bool,
+            listening: bool,
+            collapsed: bool,
+        ) {
+            match &mut self.inner {
+                Inner::Live(live) => live.sync(muted, bypassed, running, listening, collapsed),
+                #[cfg(test)]
+                Inner::Stub => {}
+            }
+        }
+    }
+
+    struct Live {
         icon: TrayIcon,
         mute: CheckMenuItem,
         bypass: CheckMenuItem,
@@ -29,10 +75,8 @@ mod windows_tray {
         shown: Option<(bool, bool, bool, bool, bool)>,
     }
 
-    impl Tray {
-        /// Menu picks and left clicks are sent to `commands` and wake the
-        /// app through `ctx`, even while the window is hidden.
-        pub fn new(ctx: &egui::Context, commands: Sender<Command>) -> Result<Self> {
+    impl Live {
+        fn new(ctx: &egui::Context, commands: Sender<Command>) -> Result<Self> {
             let show = MenuItem::new("Show OpenMic", true, None);
             let mute = CheckMenuItem::new("Mute mic", true, false, None);
             let bypass = CheckMenuItem::new("Bypass processing", true, false, None);
@@ -100,7 +144,7 @@ mod windows_tray {
         }
 
         /// `listening`: dictation is recording speech to type.
-        pub fn sync(
+        fn sync(
             &mut self,
             muted: bool,
             bypassed: bool,
@@ -147,10 +191,49 @@ mod windows_tray {
         const SIZE: u32 = 32;
         Icon::from_rgba(icon::listening_rgba(SIZE), SIZE, SIZE).context("draw tray icon")
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tray_icons_are_square_rgba() {
+            const SIZE: u32 = 32;
+            for pixels in [
+                icon::rgba(SIZE, false),
+                icon::rgba(SIZE, true),
+                icon::listening_rgba(SIZE),
+            ] {
+                assert_eq!(pixels.len(), (SIZE * SIZE * 4) as usize);
+                Icon::from_rgba(pixels, SIZE, SIZE).expect("tray icon pixels");
+            }
+        }
+
+        /// Startup calls this on the UI thread. A missing session bus or
+        /// StatusNotifier host must come back as an error, not a hang or a panic.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn starting_the_tray_returns() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = egui::Context::default();
+            let (commands, _rx) = crossbeam_channel::unbounded();
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Tray::new(&ctx, commands)
+                }));
+                let _ = tx.send(result.map(|tray| tray.is_ok()));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(_started)) => {}
+                Ok(Err(_)) => panic!("tray startup panicked"),
+                Err(_) => panic!("tray startup did not return"),
+            }
+        }
+    }
 }
 
-/// No notification area outside Windows; the window simply closes.
-#[cfg(not(windows))]
+/// No notification area on this platform; the window simply closes.
+#[cfg(not(any(windows, target_os = "linux")))]
 mod fallback {
     use anyhow::Result;
     use crossbeam_channel::Sender;
@@ -163,6 +246,11 @@ mod fallback {
     impl Tray {
         pub fn new(_ctx: &egui::Context, _commands: Sender<Command>) -> Result<Self> {
             anyhow::bail!("no notification area on this platform")
+        }
+
+        #[cfg(test)]
+        pub(crate) fn present_for_test() -> Self {
+            Self
         }
 
         pub fn sync(

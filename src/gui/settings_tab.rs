@@ -79,28 +79,25 @@ impl App {
                 if auto_start.changed() {
                     self.touch();
                 }
-                #[cfg(windows)]
-                {
-                    let tray_ok = self.tray.is_some();
-                    let tray = ui.add_enabled(
-                        tray_ok,
-                        egui::Checkbox::new(
-                            &mut self.settings.close_to_tray,
-                            "Keep running in the notification area when the window closes",
-                        ),
-                    );
-                    widgets::scroll_on_focus(&tray);
-                    if tray.changed() {
-                        self.touch();
-                    }
-                    ui.weak(if !tray_ok {
-                        "The notification area isn't available, so closing the window quits OpenMic."
-                    } else if self.settings.close_to_tray {
-                        "Click the tray icon to reopen OpenMic; quit from its right-click menu."
-                    } else {
-                        "Closing the window quits OpenMic."
-                    });
+                let tray_ok = self.tray.is_some();
+                let tray = ui.add_enabled(
+                    tray_ok,
+                    egui::Checkbox::new(
+                        &mut self.settings.close_to_tray,
+                        "Keep running in the notification area when the window closes",
+                    ),
+                );
+                widgets::scroll_on_focus(&tray);
+                if tray.changed() {
+                    self.touch();
                 }
+                ui.weak(if !tray_ok {
+                    "The notification area isn't available, so closing the window quits OpenMic."
+                } else if self.settings.close_to_tray {
+                    "Click the tray icon to reopen OpenMic; quit from its right-click menu."
+                } else {
+                    "Closing the window quits OpenMic."
+                });
                 let minimize = ui
                     .checkbox(
                         &mut self.settings.minimize_to_strip,

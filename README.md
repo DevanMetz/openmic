@@ -49,9 +49,11 @@ Download `openmic-<tag>-linux-x86_64.tar.gz` from the [releases page](https://gi
 
 While OpenMic runs it creates a 48 kHz stereo null sink, **OpenMic Virtual Cable**, for its processed voice and soundboard, plus a remap source, **OpenMic Microphone**, for Discord, OBS and browsers. Both are removed on exit. A leftover from a crash, or a cable that is not 48 kHz stereo, is replaced on the next launch. On PulseAudio the cable's buffer is capped at 50 ms instead of the null sink's 2 s default. OpenMic opens its streams at 10 ms. **Start on login** writes an XDG autostart entry and opens OpenMic the way you left it. Turning that entry off in the desktop’s startup settings leaves it off. Launching OpenMic again brings the running window back. Computer audio is recorded from the selected output's monitor source, matched by its PulseAudio name so a translated description still records the selected output and is not chosen as a microphone. On X11, a window or strip saved on a monitor that is no longer connected opens on a connected one, and the window is fitted to the work area. Audio threads ask RealtimeKit (`rtkit`) for real-time priority; without it they keep normal priority and OpenMic logs the refusal.
 
+Closing the window hides OpenMic in the notification area when the desktop shows StatusNotifier icons, and quits otherwise.
+
 To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libdbus-1-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
 
-Not available on Linux: the notification-area tray (closing the window quits), the in-app updater (click the version number to open the releases page), and global hotkeys on Wayland (they work on X11). Dictation types into the focused app on X11; on Wayland the transcript is shown to copy.
+Not available on Linux: the in-app updater (click the version number to open the releases page), and global hotkeys on Wayland (they work on X11). Dictation types into the focused app on X11; on Wayland the transcript is shown to copy.
 
 ## Windows requirements
 
@@ -184,7 +186,7 @@ Holding **Enter** or **Space** on **Set…** opens capture once. Release that ke
 
 Focused settings stay visible when you resize the window. Clicking **Cancel** or **Clear** in a shortcut row keeps the page where you scrolled.
 
-Closing the window hides OpenMic to the notification area, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
+Closing the window hides OpenMic to the notification area when one is available, where processing and hotkeys keep running. Click the tray icon to bring the window back; right-click it for **Mute mic**, **Bypass processing**, **Start/Stop OpenMic**, **Collapse to strip** and **Quit OpenMic**. The icon turns red while the mic is muted and amber while speech to text is listening. Untick **Keep running in the notification area when the window closes** on the **Settings** page to make closing quit instead. With **Start with Windows** on, OpenMic starts hidden in the notification area, even if you'd collapsed it to the strip.
 
 ## Updates
 

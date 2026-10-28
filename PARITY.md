@@ -24,7 +24,7 @@ Status of each Windows user-facing feature on Linux in this tree: `working`, `pa
 | Global hotkeys on Wayland | missing | `src/hotkeys.rs` — `global-hotkey` grabs keys on X11 only |
 | Dictation transcription on this computer, including model download | working | `src/dictation.rs` |
 | Dictation typed into the focused app | X11 | `src/x11_type.rs` — on Wayland the transcript is shown and can be copied |
-| Notification area, close-to-tray, and the tray menu | missing | `src/tray.rs`, `src/gui/settings_tab.rs` — `Tray::new` fails, the checkbox is hidden, and closing the window quits |
+| Notification area, close-to-tray, and the tray menu | working | `src/tray.rs`, `src/gui/settings_tab.rs` — requires a StatusNotifier host; closing quits if the tray cannot start |
 | A second launch shows the running window | missing | `src/instance.rs` — the lock is exclusive and `on_show` does nothing |
 | Start on login | partial | `src/config.rs` — writes an XDG autostart entry that runs `--minimized`; any existing file counts as enabled, including one the desktop disabled |
 | Start processing automatically, and wait for a device that connects after launch | working | `src/gui/mod.rs`, `src/config.rs` |

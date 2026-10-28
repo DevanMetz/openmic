@@ -113,7 +113,7 @@ impl DefaultMicSync {
 
 /// Something the tray menu or a global hotkey asked for. Delivered through
 /// a channel so it works while the window is hidden.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))] // tray commands have no Linux source
+#[cfg_attr(not(any(windows, target_os = "linux", test)), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Show,
@@ -297,7 +297,10 @@ impl App {
                 ctx.request_repaint()
             });
         }
-        app.tray = Tray::new(ctx, app.commands.0.clone()).ok();
+        match Tray::new(ctx, app.commands.0.clone()) {
+            Ok(tray) => app.tray = Some(tray),
+            Err(error) => logfile::warn(format_args!("notification area unavailable: {error:#}")),
+        }
         {
             let (commands, ctx) = (app.commands.0.clone(), ctx.clone());
             instance.on_show(move || {
@@ -3089,6 +3092,56 @@ mod tests {
                 };
                 assert_eq!(take.samples().unwrap().len(), 240, "no audio was discarded");
             }
+        }
+    }
+
+    #[test]
+    fn closing_hides_only_when_the_notification_area_is_available() {
+        let close = |close_to_tray, tray, load_error| {
+            let ctx = egui::Context::default();
+            let mut app = App::stopped(Settings {
+                close_to_tray,
+                ..Settings::default()
+            });
+            if tray {
+                app.tray = Some(Tray::present_for_test());
+            }
+            if load_error {
+                app.settings.load_error = Some(crate::config::SettingsLoadError {
+                    path: "settings.json".into(),
+                    message: "unreadable".into(),
+                });
+            }
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let output = ctx.run_ui(input, |ui| app.handle_close(ui.ctx()));
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            (app.hidden, app.quitting, commands.clone())
+        };
+
+        let (hidden, quitting, commands) = close(true, true, false);
+        assert!(hidden && !quitting, "a notification area keeps processing");
+        assert!(commands.contains(&ViewportCommand::CancelClose));
+        assert!(commands.contains(&ViewportCommand::Visible(false)));
+        assert!(!commands.contains(&ViewportCommand::Close));
+
+        for (close_to_tray, tray, load_error) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let (hidden, quitting, commands) = close(close_to_tray, tray, load_error);
+            assert!(
+                !hidden && quitting,
+                "close_to_tray={close_to_tray}, tray={tray}, load_error={load_error}"
+            );
+            assert!(commands.contains(&ViewportCommand::Close));
+            assert!(!commands.contains(&ViewportCommand::Visible(false)));
         }
     }
 
