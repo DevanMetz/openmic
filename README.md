@@ -51,9 +51,9 @@ While OpenMic runs it creates a 48 kHz stereo null sink, **OpenMic Virtual Cable
 
 Closing the window hides OpenMic in the notification area when the desktop shows StatusNotifier icons, and quits otherwise.
 
-To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libdbus-1-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
+To build on Linux you need Rust plus `clang`, `pkg-config`, `libasound2-dev`, `libdbus-1-dev`, `libxdo-dev`, `libx11-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libgl1-mesa-dev` and `libssl-dev`. Then run `cargo build --release`; the binary is `target/release/openmic`.
 
-Not available on Linux: global hotkeys on Wayland (they work on X11). Other CPU architectures have no published archive, so they have no in-app updater. Dictation types into the focused app on X11; on Wayland the transcript is shown to copy.
+Global hotkeys work on X11, and on Wayland through the desktop global-shortcuts portal (confirmed once in the desktop dialog). Without that portal, only X11 windows receive them. Other CPU architectures have no published archive, so they have no in-app updater. Dictation types into the focused app on X11; on Wayland the transcript is shown to copy.
 
 ## Windows requirements
 

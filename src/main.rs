@@ -18,6 +18,8 @@ mod logfile;
 #[cfg(any(target_os = "linux", test))]
 mod monitors;
 mod playback;
+#[cfg(target_os = "linux")]
+mod portal_shortcuts;
 mod record;
 mod resample;
 mod rt;

@@ -21,7 +21,7 @@ Status of each Windows user-facing feature on Linux in this tree: `working`, `pa
 | Soundboard pads, trim, search, overlap, drag-and-drop reorder, WAV/FLAC/OGG/MP3/AIFF | working | `src/gui/clips.rs`, `src/decode.rs`, `src/gui/sound_tab.rs` |
 | Drag clips onto the window | working | `src/gui/mod.rs` |
 | Global hotkeys on X11 (mute, bypass, stop clips, dictation, pads) | working | `src/hotkeys.rs` |
-| Global hotkeys on Wayland | missing | `src/hotkeys.rs` — `global-hotkey` grabs keys on X11 only |
+| Global hotkeys on Wayland | working | `src/portal_shortcuts.rs`, `src/hotkeys.rs` — the desktop global-shortcuts portal when it is installed (one confirmation). Without it, the X11 grab is used and only X11 windows receive the keys |
 | Dictation transcription on this computer, including model download | working | `src/dictation.rs` |
 | Dictation typed into the focused app | X11 | `src/x11_type.rs` — on Wayland the transcript is shown and can be copied |
 | Notification area, close-to-tray, and the tray menu | working | `src/tray.rs`, `src/gui/settings_tab.rs` — requires a StatusNotifier host; closing quits if the tray cannot start |

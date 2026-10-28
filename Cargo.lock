@@ -3795,6 +3795,7 @@ version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "ashpd",
  "audio_thread_priority",
  "candle-core",
  "candle-nn",
@@ -3808,11 +3809,14 @@ dependencies = [
  "ed25519-dalek",
  "eframe",
  "flate2",
+ "futures-channel",
+ "futures-util",
  "global-hotkey",
  "glutin",
  "glutin-winit",
  "ndarray",
  "parking_lot",
+ "pollster",
  "rfd",
  "serde",
  "serde_json",
@@ -3831,6 +3835,7 @@ dependencies = [
  "winresource",
  "x11rb",
  "xkeysym",
+ "zbus",
 ]
 
 [[package]]
