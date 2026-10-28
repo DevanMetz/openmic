@@ -62,6 +62,9 @@ audio_thread_priority = { version = "0.35", default-features = false, features =
 # X11 dictation and monitor placement share this connection.
 x11rb = { version = "0.13.2", default-features = false, features = ["xtest", "randr", "resource_manager"] }
 xkeysym = "0.2.1"
+# Reuse the Wayland client and protocol bindings already linked by winit.
+wayland-client = "0.31.15"
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 # Enable window surfaces on both Wayland and X11.
 glutin = { version = "=0.32.3", default-features = false, features = ["egl", "glx", "wayland", "x11"] }
 glutin-winit = { version = "=0.5.0", default-features = false, features = ["egl", "glx", "wayland", "x11"] }

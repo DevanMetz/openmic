@@ -1097,7 +1097,11 @@ fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn type_text(text: &str, cancel: &AtomicBool) -> Result<()> {
-    crate::x11_type::type_text(text, cancel)
+    if crate::wayland_type::is_wayland() {
+        crate::wayland_type::type_text(text, cancel)
+    } else {
+        crate::x11_type::type_text(text, cancel)
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
