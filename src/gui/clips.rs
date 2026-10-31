@@ -6836,9 +6836,7 @@ mod tests {
                                     node.role() == Role::Slider
                                         && node.numeric_value() == Some(original.volume as f64)
                                 }
-                                ("master volume", true) => {
-                                    node.label() == Some("Let clips overlap")
-                                }
+                                ("master volume", true) => node.label() == Some("Hear soundboard"),
                                 _ => {
                                     node.role() == Role::Slider
                                         && node.numeric_value()
