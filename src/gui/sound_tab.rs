@@ -14,7 +14,7 @@ use eframe::egui::{self, Color32, ComboBox, RichText, ScrollArea};
 use super::routes::{default_microphone_label, default_output_label};
 use super::{
     AMBER, App, Binding, CYAN, CachedClip, GREEN, MUTED, RED, VIOLET, clip_key, clock_time,
-    file_name, number_field, number_text_edit, short, volume_slider,
+    file_name, number_field, number_text_edit, short, volume_slider, volume_slider_up_to,
 };
 use crate::config::Pad;
 use crate::record::{self, PEAKS_PER_SECOND, Recorder, Source};
@@ -74,7 +74,10 @@ enum RecordingDestination {
 pub(super) fn focus_soundboard_control(ctx: &egui::Context, target: egui::Id) {
     widgets::finish_keyboard_activation(ctx);
     ctx.memory_mut(|memory| memory.request_focus(target));
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("soundboard-focus-reveal"), target));
+    ctx.data_mut(|data| {
+        data.insert_temp(egui::Id::new("soundboard-focus-reveal"), target);
+        data.insert_temp(egui::Id::new("soundboard-explicit-focus"), target);
+    });
     ctx.request_repaint();
 }
 
@@ -1158,7 +1161,7 @@ impl App {
         ui.horizontal(|ui| {
             let label = ui.label("Volume");
             let mut volume = pad.volume;
-            let slider = volume_slider(ui, &mut volume).labelled_by(label.id);
+            let slider = volume_slider_up_to(ui, &mut volume, 5.0).labelled_by(label.id);
             if focus_volume {
                 slider.request_focus();
             }
@@ -1675,19 +1678,20 @@ impl App {
                                                 .as_ref()
                                                 .is_some_and(|edit| edit.path == pad.path),
                                         };
-                                        let (play, remove, star, name, reveal_page) = clip_pad(
-                                            ui,
-                                            i,
-                                            pad,
-                                            width,
-                                            state,
-                                            (row_number, column),
-                                        );
+                                        let (play, remove, star, name, edit, reveal_page) =
+                                            clip_pad(
+                                                ui,
+                                                i,
+                                                pad,
+                                                width,
+                                                state,
+                                                (row_number, column),
+                                            );
                                         reveal_grid |= reveal_page;
                                         // A removed pad shifts the rows. Reveal the new grid
                                         // position rather than the destination's previous rect.
                                         reveal_grid |= focus_to_reveal.is_some_and(|target| {
-                                            [&play, &remove, &star, &name]
+                                            [&play, &remove, &star, &name, &edit]
                                                 .into_iter()
                                                 .any(|response| response.id == target)
                                         });
@@ -1717,9 +1721,57 @@ impl App {
                                         if let Some(from) = play.dnd_release_payload::<usize>() {
                                             moved = Some((*from, i));
                                         }
+                                        let edit_was_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&edit));
+                                        egui::Popup::menu(&edit)
+                                            .close_behavior(
+                                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                            )
+                                            .show(|ui| {
+                                                trim_open = true;
+                                                ui.set_width(320.0);
+                                                let max_height = (ui.ctx().content_rect().height()
+                                                    - egui::Frame::popup(ui.style()).total_margin().sum().y)
+                                                    .max(1.0);
+                                                ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new(pad.display_name()).strong(),
+                                                    );
+                                                    ui.horizontal(|ui| {
+                                                        let label = ui.label("Clip volume");
+                                                        let mut volume = pad.volume;
+                                                        let slider = volume_slider_up_to(ui, &mut volume, 5.0)
+                                                            .labelled_by(label.id);
+                                                        if edit.clicked() && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released()) {
+                                                            widgets::finish_keyboard_activation(ui.ctx());
+                                                            slider.request_focus();
+                                                        }
+                                                        if volume != pad.volume {
+                                                            self.set_pad_volume(i, volume);
+                                                        }
+                                                    });
+                                                    ui.weak(
+                                                        "Drag the markers to keep part of the clip. Volume above 100% may distort.",
+                                                    );
+                                                    ui.separator();
+                                                    self.trim_editor(ui, i);
+                                                    if let Some(focused) = ui.memory(|memory| memory.focused())
+                                                        .and_then(|id| ui.ctx().read_response(id))
+                                                        && focused.layer_id == ui.layer_id()
+                                                        && focused.gained_focus()
+                                                    {
+                                                        focused.scroll_to_me(Some(egui::Align::Center));
+                                                    }
+                                                });
+                                            });
+                                        if edit_was_open
+                                            && ui
+                                                .input(|input| input.key_pressed(egui::Key::Escape))
+                                        {
+                                            edit.request_focus();
+                                        }
                                         let menu_id = egui::Popup::default_response_id(&play);
                                         let origin_id = menu_id.with("keyboard-origin");
-                                        let keyboard_owner = [&play, &remove, &star, &name]
+                                        let keyboard_owner = [&play, &remove, &star, &name, &edit]
                                             .into_iter()
                                             .find(|response| response.has_focus())
                                             .filter(|_| {
@@ -2059,6 +2111,7 @@ fn clip_pad(
     egui::Response,
     egui::Response,
     egui::Response,
+    egui::Response,
     bool,
 ) {
     let playing = state.playing;
@@ -2116,6 +2169,10 @@ fn clip_pad(
     });
     let star_rect = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 8.0, body.bottom() + 2.0),
+        egui::pos2(rect.right() - 57.0, rect.bottom() - 6.0),
+    );
+    let edit_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - 53.0, body.bottom() + 2.0),
         egui::pos2(rect.right() - 8.0, rect.bottom() - 6.0),
     );
     let star_response = ui
@@ -2147,6 +2204,18 @@ fn clip_pad(
         ui.id().with(("sound_remove", path)),
         egui::Sense::click(),
     );
+    let edit_response = ui.interact(
+        edit_rect,
+        ui.id().with(("sound_edit", path)),
+        egui::Sense::click(),
+    );
+    edit_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Edit {name}"),
+        )
+    });
     play_response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
@@ -2172,6 +2241,7 @@ fn clip_pad(
         &remove_response,
         &star_response,
         &name_response,
+        &edit_response,
     ]
     .into_iter()
     .chain(rename_response.iter())
@@ -2191,11 +2261,31 @@ fn clip_pad(
             data.insert_temp(position_id, position);
             previous != Some(position)
         });
-        if (response.gained_focus() || moved)
-            && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
+        let reveal_id = egui::Id::new("sound-pad-reveal-frames");
+        let newly_focused = response.gained_focus();
+        let remaining = ui.data_mut(|data| {
+            let remaining = if newly_focused || moved {
+                3u8
+            } else {
+                data.get_temp::<u8>(reveal_id).unwrap_or(0)
+            };
+            data.insert_temp(reveal_id, remaining.saturating_sub(1));
+            remaining
+        });
+        let explicit_focus = ui
+            .data(|data| data.get_temp::<egui::Id>(egui::Id::new("soundboard-explicit-focus")))
+            == Some(response.id);
+        let activation_held =
+            ui.input(|input| input.key_down(egui::Key::Enter) || input.key_down(egui::Key::Space));
+        if (if activation_held || explicit_focus {
+            newly_focused || moved
+        } else {
+            remaining > 0
+        }) && ui.input(|input| !input.pointer.any_down() && !input.pointer.any_released())
         {
             reveal_page = !ui.clip_rect().contains_rect(rect);
             ui.scroll_to_rect(rect, None);
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2413,6 +2503,30 @@ fn clip_pad(
         egui::FontId::proportional(11.0),
         star_color,
     );
+    let edit_visuals = ui.style().interact(&edit_response);
+    painter.rect(
+        edit_rect,
+        4.0,
+        edit_visuals.weak_bg_fill,
+        edit_visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    if edit_response.has_focus() {
+        painter.rect_stroke(
+            edit_rect.expand(2.0),
+            6.0,
+            visuals.selection.stroke,
+            egui::StrokeKind::Outside,
+        );
+    }
+    painter.text(
+        edit_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Edit",
+        egui::FontId::proportional(11.0),
+        edit_visuals.text_color(),
+    );
+    let edit_response = edit_response.on_hover_text("Change clip volume and trim");
     let star_response = star_response.on_hover_text(if state.starred {
         "Remove this pad from the strip"
     } else {
@@ -2437,6 +2551,7 @@ fn clip_pad(
         remove_response,
         star_response,
         name_response,
+        edit_response,
         reveal_page,
     )
 }
@@ -2785,7 +2900,7 @@ mod tests {
             );
             responses.unwrap()
         };
-        let (play, remove, star, name, _) = frame(Vec::new());
+        let (play, remove, star, name, _edit, _) = frame(Vec::new());
         assert!(play.rect.right() <= remove.rect.left());
         assert!(star.rect.top() >= play.rect.bottom() && star.rect.top() >= remove.rect.bottom());
         for (pos, expected) in [
@@ -2806,7 +2921,7 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 },
             ]);
-            let (play, remove, star, name, _) = frame(vec![egui::Event::PointerButton {
+            let (play, remove, star, name, _edit, _) = frame(vec![egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
                 pressed: false,

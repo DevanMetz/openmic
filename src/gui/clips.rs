@@ -1310,6 +1310,33 @@ mod tests {
     }
 
     #[test]
+    fn edit_button_opens_volume_and_trim_for_the_selected_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav(dir.path(), "edit.wav");
+        let mut app = app_with(std::slice::from_ref(&path));
+        app.cache_clip(
+            path.clone(),
+            CachedClip::read(&path, &AtomicBool::new(false)).unwrap(),
+        );
+        let ctx = egui::Context::default();
+        let output = draw_board(&mut app, &ctx, Vec::new());
+        let pos = text_rect(&output, "Edit").center();
+        for pressed in [true, false] {
+            draw_board(
+                &mut app,
+                &ctx,
+                click(pos, egui::PointerButton::Primary, pressed),
+            );
+        }
+        let output = draw_board(&mut app, &ctx, Vec::new());
+        text_rect(&output, "Clip volume");
+        text_rect(&output, "Trim");
+        text_rect(&output, "Start");
+        text_rect(&output, "End");
+        assert_eq!(app.trim_clip.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
     fn volume_text_entry_uses_percentages_and_updates_playing_clips() {
         use egui::accesskit::{Action, ActionData, ActionRequest, Role, TreeId};
         let dir = tempfile::tempdir().unwrap();
@@ -1433,8 +1460,19 @@ mod tests {
                     (" 37.5% ", true, 0.375),
                     ("0%", false, 0.0),
                     ("150", false, 1.0),
+                    ("500", false, 1.0),
+                    ("600", false, 1.0),
                     ("-20%", false, 0.0),
                 ] {
+                    let expected = if pad_volume {
+                        match input {
+                            "150" => 1.5,
+                            "500" | "600" => 5.0,
+                            _ => expected,
+                        }
+                    } else {
+                        expected
+                    };
                     draw_board(
                         &mut app,
                         &ctx,
@@ -1813,7 +1851,7 @@ mod tests {
                     }
                     let output = draw_board(&mut app, &ctx, Vec::new());
                     let tree = output.platform_output.accesskit_update.as_ref().unwrap();
-                    let [first, second] = ["Remove first", "Play second"].map(|label| {
+                    let [first, second] = ["Edit first", "Play second"].map(|label| {
                         *tree
                             .nodes
                             .iter()
@@ -2896,7 +2934,7 @@ mod tests {
                                 egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
                             );
                             assert!(output.shapes.iter().any(|shape| shape.clip_rect.expand(1.0 / zoom).contains_rect(rect)
-                                && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the destination is fully visible");
+                                && matches!(&shape.shape, egui::Shape::Rect(shape) if shape.rect.intersects(rect))), "the destination is fully visible: count={count}, index={index}, activation={activation}, zoom={zoom}, passes={passes}, next={next}, rect={rect:?}");
                             if next.starts_with("Play ") {
                                 assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(pad)
                                     if (pad.rect.height() - 108.0).abs() < 0.01 && pad.rect.contains(rect.center())

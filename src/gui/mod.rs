@@ -2642,9 +2642,13 @@ fn number_field(ui: &mut egui::Ui, widget: egui::DragValue<'_>) -> egui::Respons
 
 /// A 0..100% volume slider that also takes the mouse wheel (1% per notch).
 fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> egui::Response {
+    volume_slider_up_to(ui, value, 1.0)
+}
+
+fn volume_slider_up_to(ui: &mut egui::Ui, value: &mut f32, maximum: f32) -> egui::Response {
     let mut response = ui
         .horizontal(|ui| {
-            let slider = ui.add(Slider::new(value, 0.0..=1.0).show_value(false));
+            let slider = ui.add(Slider::new(value, 0.0..=maximum).show_value(false));
             let original = *value;
             let focus_before = ui.memory(|memory| memory.focused());
             let text_edit = number_text_edit(ui);
@@ -2654,7 +2658,7 @@ fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> egui::Response {
             let number = number_field(
                 ui,
                 egui::DragValue::new(value)
-                    .range(0.0..=1.0)
+                    .range(0.0..=maximum)
                     .speed(0.01)
                     .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                     .custom_parser(|text| {
@@ -2694,7 +2698,7 @@ fn volume_slider(ui: &mut egui::Ui, value: &mut f32) -> egui::Response {
         })
         .inner;
     let notches = viz::wheel_notches(ui, response.id, response.hovered() && !response.dragged());
-    if viz::step_by(value, notches, 0.01, 0.0..=1.0) {
+    if viz::step_by(value, notches, 0.01, 0.0..=maximum) {
         response.mark_changed();
     }
     response

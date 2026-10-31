@@ -155,7 +155,7 @@ pub struct Pad {
     pub path: PathBuf,
     /// A display name; the audio file's stem is used when unset.
     pub name: Option<String>,
-    /// The pad's own volume (0..1), on top of the soundboard volume.
+    /// The pad's own volume (0..5), on top of the soundboard volume.
     pub volume: f32,
     /// Global shortcut that plays the pad, e.g. "Ctrl+Alt+1".
     pub hotkey: Option<String>,
