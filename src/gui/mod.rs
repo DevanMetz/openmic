@@ -455,6 +455,7 @@ impl App {
             bypass: s.bypass,
             mute: s.mute,
             monitor_on: s.monitor,
+            monitor_clips: s.monitor_clips,
         }
     }
 
@@ -528,7 +529,7 @@ impl App {
                 monitor,
                 &self.outputs,
                 "a monitor output",
-                self.settings.monitor,
+                self.settings.monitor || self.settings.monitor_clips,
             ),
         ]
         .into_iter()
@@ -550,9 +551,9 @@ impl App {
         // instant; it can't share the processed output's device. Linux opens
         // it only while monitoring: PulseAudio clients can hold fewer streams.
         let monitor_wanted = if cfg!(windows) {
-            self.settings.monitor || *monitor != self.settings.output
+            self.settings.monitor || self.settings.monitor_clips || *monitor != self.settings.output
         } else {
-            self.settings.monitor
+            self.settings.monitor || self.settings.monitor_clips
         };
         let monitor = (monitor_present && monitor_wanted).then_some(monitor.as_str());
         match Engine::start(

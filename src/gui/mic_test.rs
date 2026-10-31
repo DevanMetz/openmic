@@ -86,6 +86,7 @@ impl App {
         Params {
             mute: false,
             monitor_on: false,
+            monitor_clips: false,
             monitor_gain: 1.0,
             sound_gain: 1.0,
             ..self.params()

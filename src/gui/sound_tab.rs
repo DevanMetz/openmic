@@ -1937,6 +1937,17 @@ impl App {
                                 response
                             })
                             .inner;
+                        let hear_clips = ui
+                            .checkbox(&mut self.settings.monitor_clips, "Hear soundboard")
+                            .on_hover_text("Play clips through the monitor output selected on the Voice page. Monitor volume also applies.");
+                        if hear_clips.changed() {
+                            self.apply_live();
+                            if self.settings.monitor_clips
+                                && self.engine.as_ref().is_some_and(|engine| !engine.has_monitor())
+                            {
+                                self.restart_engine();
+                            }
+                        }
                         let overlap = ui
                             .checkbox(&mut self.settings.overlap_clips, "Let clips overlap")
                             .on_hover_text(
@@ -1945,7 +1956,7 @@ impl App {
                         if overlap.changed() {
                             self.touch();
                         }
-                        for response in [&stop, &volume, &overlap] {
+                        for response in [&stop, &volume, &hear_clips, &overlap] {
                             if reflowed
                                 && response.has_focus()
                                 && ui.input(|input| {

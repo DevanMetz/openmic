@@ -38,6 +38,7 @@ pub struct Params {
     pub bypass: bool,
     pub mute: bool,
     pub monitor_on: bool,
+    pub monitor_clips: bool,
 }
 
 impl Default for Params {
@@ -58,6 +59,7 @@ impl Default for Params {
             bypass: false,
             mute: false,
             monitor_on: false,
+            monitor_clips: false,
         }
     }
 }
@@ -389,15 +391,32 @@ impl Mixer {
     }
 
     /// Mix the playing clips into `frame` in place, advancing/completing playback.
+    #[cfg(test)]
     pub fn mix(&mut self, frame: &mut [f32], gain: f32) {
+        self.mix_with_monitor(frame, None, gain);
+    }
+
+    /// Advance clips once while optionally adding them to a separate monitor mix.
+    pub fn mix_with_monitor(
+        &mut self,
+        frame: &mut [f32],
+        mut monitor: Option<&mut [f32]>,
+        gain: f32,
+    ) {
         if self.voices.is_empty() {
             return;
         }
         for clip in self.voices.iter_mut().filter(|v| !v.paused) {
             let end = (clip.pos + frame.len()).min(clip.samples().len());
             let g = gain * clip.gain;
-            for (s, src) in frame.iter_mut().zip(&clip.samples()[clip.pos..end]) {
+            let samples = &clip.samples()[clip.pos..end];
+            for (s, src) in frame.iter_mut().zip(samples) {
                 *s += src * g;
+            }
+            if let Some(monitor) = monitor.as_deref_mut() {
+                for (s, src) in monitor.iter_mut().zip(samples) {
+                    *s += src * g;
+                }
             }
             clip.pos = end;
         }
@@ -567,6 +586,23 @@ mod tests {
         assert_eq!(&rest[12_000..18_000], &vec![0.2; 6_000]);
         assert_eq!(rest[18_000], 0.0, "do not leak audio past the trim end");
         assert!(routed.progress().is_empty());
+    }
+
+    #[test]
+    fn clips_monitor_independently_without_advancing_twice() {
+        let mut mixer = Mixer::default();
+        mixer.play(clip(1, vec![0.4; 4]), false);
+        let mut output = [0.2; 2];
+        let mut monitor = [0.0; 2];
+        mixer.mix_with_monitor(&mut output, Some(&mut monitor), 0.5);
+        assert_eq!(output, [0.4; 2]);
+        assert_eq!(monitor, [0.2; 2]);
+        let mut output = [0.2; 2];
+        let mut voice_monitor = [0.2; 2];
+        mixer.mix_with_monitor(&mut output, Some(&mut voice_monitor), 0.5);
+        assert_eq!(output, [0.4; 2]);
+        assert_eq!(voice_monitor, [0.4; 2]);
+        assert!(mixer.playing_keys().is_empty());
     }
 
     // Ported from test_soundboard.py mixing section.

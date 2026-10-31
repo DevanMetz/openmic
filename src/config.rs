@@ -36,6 +36,7 @@ pub struct Settings {
     pub mute: bool,
     pub monitor: bool,
     pub monitor_volume: f32,
+    pub monitor_clips: bool,
     pub sound_volume: f32,
     /// Soundboard pads, in board order.
     pub sounds: Vec<Pad>,
@@ -103,6 +104,7 @@ impl Default for Settings {
             mute: false,
             monitor: false,
             monitor_volume: 1.0,
+            monitor_clips: false,
             sound_volume: 0.8,
             sounds: Vec::new(),
             overlap_clips: false,

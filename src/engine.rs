@@ -921,7 +921,12 @@ fn process_loop(
             }
             history.push_back(frame);
         }
-        mixer.lock().mix(&mut z, p.sound_gain);
+        let mut monitor_mix = if p.monitor_on { z } else { [0.0; FRAME] };
+        mixer.lock().mix_with_monitor(
+            &mut z,
+            p.monitor_clips.then_some(&mut monitor_mix),
+            p.sound_gain,
+        );
         set_f32(&stats.prob, prob);
         stats
             .model
@@ -929,8 +934,9 @@ fn process_loop(
         set_f32(&stats.out_peak, peak(&z));
 
         out.send(&z, &mut scratch);
-        if let Some(mon) = mon.as_mut().filter(|_| p.monitor_on) {
-            let gained = z.map(|s| (s * p.monitor_gain).clamp(-1.0, 1.0));
+        if let Some(mon) = mon.as_mut().filter(|_| p.monitor_on || p.monitor_clips) {
+            let gained =
+                monitor_mix.map(|s| (s.clamp(-1.0, 1.0) * p.monitor_gain).clamp(-1.0, 1.0));
             mon.send(&gained, &mut scratch);
         }
     }
