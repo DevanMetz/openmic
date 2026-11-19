@@ -95,7 +95,7 @@ impl App {
 
     /// Where the test plays: the headphone monitor if one is chosen,
     /// otherwise the Windows default output, but never VB-Cable.
-    fn test_output(&self) -> String {
+    pub(super) fn preview_output(&self) -> String {
         let monitor = &self.settings.monitor_output;
         if !monitor.is_empty()
             && self.outputs.contains(monitor)
@@ -198,7 +198,11 @@ impl App {
             },
         };
         let Some(samples) = samples else { return };
-        match Player::play(&self.test_output(), &self.settings.output, &samples) {
+        match Player::play(
+            &self.preview_output(),
+            &self.settings.output,
+            crate::dsp::Clip::new(0, samples, 1.0),
+        ) {
             Ok(player) => {
                 self.mic_test.player = Some((player, version));
                 let fallback = version == Version::Cleaned && self.mic_test.used_fallback();
@@ -1284,11 +1288,15 @@ mod tests {
             "CABLE Input (VB-Audio Virtual Cable)".into(),
             "Headphones".into(),
         ];
-        assert_eq!(app.test_output(), "", "falls back to the Windows default");
+        assert_eq!(
+            app.preview_output(),
+            "",
+            "falls back to the Windows default"
+        );
         app.settings.monitor_output = "Headphones".into();
-        assert_eq!(app.test_output(), "Headphones");
+        assert_eq!(app.preview_output(), "Headphones");
         app.settings.monitor_output = "Unplugged headset".into();
-        assert_eq!(app.test_output(), "");
+        assert_eq!(app.preview_output(), "");
     }
 
     #[test]

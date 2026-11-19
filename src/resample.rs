@@ -111,7 +111,7 @@ impl Resampler {
 
 /// Catmull-Rom (4-point cubic Hermite) interpolation between `y1` and `y2`.
 /// Much flatter treble than linear interpolation at fractional offsets.
-fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+pub(crate) fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
     let c1 = 0.5 * (y2 - y0);
     let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
     let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);

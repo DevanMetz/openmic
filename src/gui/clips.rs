@@ -133,8 +133,26 @@ impl App {
         None
     }
 
+    pub(super) fn toggle_trim_preview(&mut self, index: usize) {
+        if matches!(self.trim_preview.take(), Some(Ok(_))) {
+            return;
+        }
+        let pad = &self.settings.sounds[index];
+        let Some(cached) = self.clip_cache.get(&pad.path) else {
+            return;
+        };
+        let gain = pad.volume * self.settings.sound_volume * self.settings.monitor_volume;
+        let clip = Clip::new(clip_key(&pad.path), Arc::clone(&cached.samples), gain)
+            .with_trim(pad.start, pad.end);
+        self.trim_preview = Some(
+            crate::playback::Player::play(&self.preview_output(), &self.settings.output, clip)
+                .map_err(|error| format!("{error:#}")),
+        );
+    }
+
     pub(super) fn close_trim_editor(&mut self) {
         self.trim_clip = None;
+        self.trim_preview = None;
         self.prune_clip_loads();
     }
 
@@ -153,6 +171,9 @@ impl App {
     }
 
     pub(super) fn forget_clip(&mut self, path: &Path) {
+        if self.trim_clip.as_deref() == Some(path) {
+            self.trim_preview = None;
+        }
         self.clip_cache.remove(path);
         self.clip_errors.remove(path);
         self.pad_durations.forget(path);
@@ -207,7 +228,7 @@ impl App {
 
     pub(super) fn cancel_clip_loading(&mut self, path: &Path) {
         if self.trim_clip.as_deref() == Some(path) {
-            self.trim_clip = None;
+            self.close_trim_editor();
         }
         if let Some(pending) = &mut self.clip_loads {
             pending.retain(|r| r.path != path);
@@ -1330,10 +1351,88 @@ mod tests {
         }
         let output = draw_board(&mut app, &ctx, Vec::new());
         text_rect(&output, "Clip volume");
+        text_rect(&output, "Preview");
         text_rect(&output, "Trim");
         text_rect(&output, "Start");
         text_rect(&output, "End");
         assert_eq!(app.trim_clip.as_deref(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn trim_preview_reports_an_unavailable_monitor_without_triggering_the_pad() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = wav(dir.path(), "preview.wav");
+        let mut app = app_with(std::slice::from_ref(&path));
+        app.settings.monitor_output = "OpenMic missing test headphones".into();
+        app.outputs.push(app.settings.monitor_output.clone());
+        app.cache_clip(
+            path.clone(),
+            CachedClip::read(&path, &AtomicBool::new(false)).unwrap(),
+        );
+        let ctx = egui::Context::default();
+        open_trim_menu(&mut app, &ctx, "preview");
+        let pos = text_rect(&draw_board(&mut app, &ctx, Vec::new()), "Preview").center();
+        for pressed in [true, false] {
+            draw_board(
+                &mut app,
+                &ctx,
+                click(pos, egui::PointerButton::Primary, pressed),
+            );
+        }
+        assert!(matches!(app.trim_preview, Some(Err(_))));
+        assert!(app.engine.as_ref().unwrap().clip_progress().is_empty());
+        assert!(egui::Popup::is_any_open(&ctx));
+        app.close_trim_editor();
+        assert!(app.trim_preview.is_none());
+    }
+
+    #[test]
+    #[ignore = "plays a short tone on a local output device"]
+    fn trim_editor_plays_on_the_local_device_while_the_engine_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        let tone: Vec<_> = (0..dsp::SR)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / dsp::SR as f32).sin() * 0.08)
+            .collect();
+        crate::record::Recorder::from_samples_for_test(&tone)
+            .finish()
+            .unwrap()
+            .unwrap()
+            .save_wav(&path)
+            .unwrap();
+        let mut app = app_with(std::slice::from_ref(&path));
+        app.engine = None;
+        app.settings.sounds[0].start = 0.25;
+        app.settings.sounds[0].end = Some(0.75);
+        app.cache_clip(
+            path.clone(),
+            CachedClip::read(&path, &AtomicBool::new(false)).unwrap(),
+        );
+        let ctx = egui::Context::default();
+        open_trim_menu(&mut app, &ctx, "tone");
+        let pos = text_rect(&draw_board(&mut app, &ctx, Vec::new()), "Preview").center();
+        for pressed in [true, false] {
+            draw_board(
+                &mut app,
+                &ctx,
+                click(pos, egui::PointerButton::Primary, pressed),
+            );
+        }
+        let player = app
+            .trim_preview
+            .as_ref()
+            .expect("started preview")
+            .as_ref()
+            .expect("opened local output");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !player.finished() {
+            assert!(player.take_error().is_none());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(player.progress(), 1.0);
+        draw_board(&mut app, &ctx, Vec::new());
+        assert!(app.trim_preview.is_none());
     }
 
     #[test]
@@ -6438,13 +6537,11 @@ mod tests {
             if long {
                 expected.push("Clear");
             }
-            expected.extend([
-                "Show on the strip",
-                "Start",
-                "End",
-                "Reset",
-                "Remove from soundboard",
-            ]);
+            expected.extend(["Show on the strip", "Start", "End", "Reset"]);
+            if !long {
+                expected.push("Preview");
+            }
+            expected.push("Remove from soundboard");
             assert_eq!(visited, expected);
             for &expected in stops.iter().rev().skip(1) {
                 draw_board_size(
@@ -7853,6 +7950,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trim.wav");
         for (state, count, start, end) in [
+            ("selection", 96_000, 0.25, Some(1.5)),
             ("shorter", 96_000, 2.0, Some(3.0)),
             ("tiny", 1_920, 0.003, Some(0.019)),
             ("sub-millisecond", 2, 0.0, None),

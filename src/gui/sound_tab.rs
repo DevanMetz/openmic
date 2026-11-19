@@ -1359,6 +1359,14 @@ impl App {
                 egui::Stroke::new(2.0, AMBER),
             );
         }
+        if let Some(Ok(player)) = &self.trim_preview {
+            let x = x_of(start + (end.min(length) - start) * player.progress());
+            painter.vline(
+                x,
+                wave.rect.y_range(),
+                egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+            );
+        }
 
         // DragValue also parses its displayed (rounded) number on blur. Ignore
         // that alone, but accept typed input and explicit accessibility edits
@@ -1441,12 +1449,6 @@ impl App {
                 .wrap(),
             );
         }
-        ui.weak(format!(
-            "Plays {} of {}",
-            clock_seconds((end.min(length) - start.min(length)).max(0.0)),
-            clock_seconds(length)
-        ));
-
         let new_end = if end_changed {
             (end < length - 0.005).then_some(end)
         } else {
@@ -1462,6 +1464,35 @@ impl App {
             pad.start = new_start;
             pad.end = new_end;
             self.touch();
+            self.trim_preview = None;
+        }
+        if let Some(Ok(player)) = &self.trim_preview {
+            if let Some(error) = player.take_error() {
+                self.trim_preview = Some(Err(error));
+            } else if player.finished() {
+                self.trim_preview = None;
+            }
+        }
+        let playing = matches!(self.trim_preview, Some(Ok(_)));
+        ui.horizontal(|ui| {
+            let label = if playing { "Stop preview" } else { "Preview" };
+            let preview = ui
+                .add_enabled_ui(end.min(length) > start, |ui| {
+                    menu_control(ui, "preview", egui::Button::new(label))
+                })
+                .inner
+                .on_hover_text("Listen to this selection on your headphones or speakers");
+            if preview.clicked() {
+                self.toggle_trim_preview(index);
+            }
+            ui.weak(format!(
+                "Plays {} of {}",
+                clock_seconds((end.min(length) - start.min(length)).max(0.0)),
+                clock_seconds(length)
+            ));
+        });
+        if let Some(Err(error)) = &self.trim_preview {
+            ui.colored_label(widgets::text_color(ui, RED), format!("Preview: {error}"));
         }
     }
 

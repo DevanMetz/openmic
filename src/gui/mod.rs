@@ -187,6 +187,7 @@ pub struct App {
     renaming_pad: Option<sound_tab::PadRename>,
     /// The trim menu's current clip.
     trim_clip: Option<PathBuf>,
+    trim_preview: Option<Result<crate::playback::Player, String>>,
     /// Load failures stay on their pads until retried or removed.
     clip_errors: HashMap<PathBuf, String>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
@@ -370,6 +371,7 @@ impl App {
             pad_to_reveal: None,
             renaming_pad: None,
             trim_clip: None,
+            trim_preview: None,
             clip_errors: HashMap::new(),
             clip_cache: HashMap::new(),
             clip_import: None,

@@ -1,5 +1,4 @@
-//! Play a recording to the user's own headphones or speakers (the mic test),
-//! never into VB-Cable: this audio is for you, not for Discord.
+//! Local headphone or speaker playback for mic tests and soundboard trim previews.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -10,9 +9,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::dsp::SR;
+use crate::dsp::{Clip, SR};
 use crate::engine::{open_stream_with_fallback, stream_buffer};
-use crate::resample::Resampler;
+use crate::resample::hermite;
 
 /// A clip playing on an output device; stops when dropped.
 pub struct Player {
@@ -59,10 +58,10 @@ fn validate_output(name: &str, processed_output: &str) -> Result<()> {
 }
 
 impl Player {
-    /// Play `samples` (mono at the DSP rate) on the output named `device`,
+    /// Play the selected clip (mono at the DSP rate) on the output named `device`,
     /// or the Windows default output when it's empty. The resolved device
     /// must differ from the processed output and must not be VB-Cable.
-    pub fn play(device: &str, processed_output: &str, samples: &[f32]) -> Result<Self> {
+    pub fn play(device: &str, processed_output: &str, clip: Clip) -> Result<Self> {
         let host = cpal::default_host();
         let device = if device.is_empty() {
             host.default_output_device()
@@ -83,9 +82,9 @@ impl Player {
             sample_rate: supported.sample_rate(),
             buffer_size: stream_buffer(supported.sample_rate(), supported.buffer_size()),
         };
-        let audio = Arc::new(resample(samples, config.sample_rate));
+        let audio = PreviewAudio::new(clip, config.sample_rate);
         let progress = Arc::new(PlaybackProgress::default());
-        let len = audio.len();
+        let len = audio.frames;
         let (report, errors) = crossbeam_channel::bounded(1);
         let stream =
             open_stream_with_fallback(&mut config, |config| match supported.sample_format() {
@@ -136,34 +135,49 @@ impl Player {
     }
 }
 
-fn resample(samples: &[f32], rate: u32) -> Vec<f32> {
-    if samples.is_empty() || rate == SR {
-        return samples.to_vec();
+/// A view of the shared selection. Convert only the frames requested by the device,
+/// so previewing a long pad takes constant setup time and memory.
+#[derive(Clone)]
+struct PreviewAudio {
+    clip: Clip,
+    frames: usize,
+    step: f64,
+}
+
+impl PreviewAudio {
+    fn new(clip: Clip, rate: u32) -> Self {
+        let len = clip.samples().len();
+        let step = f64::from(SR) / f64::from(rate);
+        let frames = if len == 0 {
+            0
+        } else {
+            ((len as f64 / step).round() as usize).max(1)
+        };
+        Self { clip, frames, step }
     }
-    let mut resampler = Resampler::new(SR, rate);
-    let expected = (samples.len() as f64 * f64::from(rate) / f64::from(SR))
-        .round()
-        .max(1.0) as usize;
-    let mut out = Vec::with_capacity(expected);
-    let mut buf = [0.0f32; 1024];
-    // A streaming converter waits for two future samples. At the end of a
-    // finite clip, hold its last value and emit only the intended duration.
-    let padding = [samples[samples.len() - 1]; 2];
-    for chunk in samples
-        .chunks(4096)
-        .chain(std::iter::once(padding.as_slice()))
-    {
-        resampler.push(chunk);
-        while out.len() < expected {
-            let room = (expected - out.len()).min(buf.len());
-            let n = resampler.pull(&mut buf[..room]);
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
+
+    fn sample(&self, frame: usize) -> f32 {
+        if frame >= self.frames {
+            return 0.0;
         }
+        let samples = self.clip.samples();
+        let value = if self.step == 1.0 {
+            samples[frame]
+        } else {
+            let position = frame as f64 * self.step;
+            let i = position as usize;
+            let last = samples.len() - 1;
+            hermite(
+                i.checked_sub(1)
+                    .map_or(0.0, |previous| samples[previous.min(last)]),
+                samples[i.min(last)],
+                samples[(i + 1).min(last)],
+                samples[(i + 2).min(last)],
+                position.fract() as f32,
+            )
+        };
+        value * self.clip.gain
     }
-    out
 }
 
 fn error_callback(report: Sender<String>) -> impl FnMut(cpal::Error) + Send + 'static {
@@ -176,7 +190,7 @@ fn error_callback(report: Sender<String>) -> impl FnMut(cpal::Error) + Send + 's
 }
 
 fn output_callback<T>(
-    audio: Arc<Vec<f32>>,
+    audio: PreviewAudio,
     channels: usize,
     rate: u32,
     progress: Arc<PlaybackProgress>,
@@ -190,11 +204,11 @@ where
         let mut at = start;
         for frame in data.chunks_mut(channels) {
             // Resampling can overshoot full scale even for clipped input.
-            let s = audio.get(at).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
-            at = (at + 1).min(audio.len());
+            let s = audio.sample(at).clamp(-1.0, 1.0);
+            at = (at + 1).min(audio.frames);
             frame.fill(T::from_sample(s));
         }
-        if at == audio.len() && progress.ends_at.get().is_none() {
+        if at == audio.frames && progress.ends_at.get().is_none() {
             // Queued is not yet audible. Include the device's latency and
             // only the audio frames in this buffer, not its trailing silence.
             let tail = Duration::from_secs_f64((at - start) as f64 / f64::from(rate));
@@ -207,7 +221,7 @@ where
 fn build<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    audio: &Arc<Vec<f32>>,
+    audio: &PreviewAudio,
     progress: &Arc<PlaybackProgress>,
     report: &Sender<String>,
 ) -> Result<Stream>
@@ -217,7 +231,7 @@ where
     Ok(device.build_output_stream(
         *config,
         output_callback::<T>(
-            Arc::clone(audio),
+            audio.clone(),
             usize::from(config.channels),
             config.sample_rate,
             Arc::clone(progress),
@@ -329,6 +343,33 @@ mod tests {
         callback(ErrorKind::StreamInvalidated.into()); // the UI already stopped playback
     }
 
+    fn native_audio(samples: Vec<f32>) -> PreviewAudio {
+        PreviewAudio::new(Clip::new(0, Arc::new(samples), 1.0), SR)
+    }
+
+    #[test]
+    fn trim_preview_uses_only_selected_samples_at_the_pad_gain() {
+        let source = Arc::new(vec![-1.0, 0.125, 0.25, -1.0]);
+        let clip = Clip::new(1, source, 2.0).with_trim(1.0 / SR as f32, Some(3.0 / SR as f32));
+        for rate in [SR, 2 * SR] {
+            let audio = PreviewAudio::new(clip.clone(), rate);
+            let expected = resample(&[0.25, 0.5], rate);
+            let mut buffer = vec![1.0; (expected.len() + 1) * 2];
+            output_callback::<f32>(audio, 2, rate, Arc::default())(&mut buffer, &output_time(0, 0));
+            let frames: Vec<_> = expected
+                .into_iter()
+                .chain([0.0])
+                .flat_map(|s| [s; 2])
+                .collect();
+            assert_eq!(buffer, frames);
+        }
+    }
+
+    fn resample(samples: &[f32], rate: u32) -> Vec<f32> {
+        let audio = PreviewAudio::new(Clip::new(0, Arc::new(samples.to_vec()), 1.0), rate);
+        (0..audio.frames).map(|i| audio.sample(i)).collect()
+    }
+
     fn output_time(callback_ms: u64, playback_ms: u64) -> cpal::OutputCallbackInfo {
         cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp {
             callback: cpal::StreamInstant::from_millis(callback_ms),
@@ -348,7 +389,7 @@ mod tests {
             .flat_map(|s| [s.clamp(-1.0, 1.0); 2])
             .collect();
         let mut output = vec![0.0f32; expected.len()];
-        output_callback::<f32>(Arc::new(converted), 2, 96_000, Arc::default())(
+        output_callback::<f32>(native_audio(converted), 2, 96_000, Arc::default())(
             &mut output,
             &output_time(0, 20),
         );
@@ -358,9 +399,9 @@ mod tests {
 
     #[test]
     fn integer_preview_formats_keep_levels_channels_and_trailing_silence() {
-        let audio = Arc::new(vec![-1.0, 0.0, 1.0]);
+        let audio = native_audio(vec![-1.0, 0.0, 1.0]);
         let mut signed = [1i8; 8];
-        output_callback::<i8>(Arc::clone(&audio), 2, 48_000, Arc::default())(
+        output_callback::<i8>(audio.clone(), 2, 48_000, Arc::default())(
             &mut signed,
             &output_time(0, 20),
         );
@@ -378,8 +419,12 @@ mod tests {
     #[test]
     fn finishing_waits_until_the_device_plays_the_final_audio_frame() {
         let progress = Arc::new(PlaybackProgress::default());
-        let mut callback =
-            output_callback::<f32>(Arc::new(vec![0.25; 300]), 2, 1_000, Arc::clone(&progress));
+        let mut callback = output_callback::<f32>(
+            native_audio(vec![0.25; 300]),
+            2,
+            1_000,
+            Arc::clone(&progress),
+        );
         let mut buffer = [0.0; 400]; // 200 stereo frames
         callback(&mut buffer, &output_time(0, 30));
         assert_eq!(buffer, [0.25; 400]);
@@ -413,8 +458,12 @@ mod tests {
     #[test]
     fn a_short_preview_is_not_finished_when_its_first_buffer_is_submitted() {
         let progress = Arc::new(PlaybackProgress::default());
-        let mut callback =
-            output_callback::<f32>(Arc::new(vec![0.5; 48]), 1, 48_000, Arc::clone(&progress));
+        let mut callback = output_callback::<f32>(
+            native_audio(vec![0.5; 48]),
+            1,
+            48_000,
+            Arc::clone(&progress),
+        );
         let mut buffer = [1.0; 480];
         callback(&mut buffer, &output_time(0, 20));
         assert_eq!(buffer[..48], [0.5; 48]);
