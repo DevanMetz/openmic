@@ -1393,6 +1393,7 @@ mod tests {
         let path = dir.path().join("tone.wav");
         let tone: Vec<_> = (0..dsp::SR)
             .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / dsp::SR as f32).sin() * 0.08)
+            .flat_map(|sample| [sample; 2])
             .collect();
         crate::record::Recorder::from_samples_for_test(&tone)
             .finish()
@@ -7950,7 +7951,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trim.wav");
         for (state, count, start, end) in [
-            ("selection", 96_000, 0.25, Some(1.5)),
+            ("selection", 192_000, 0.25, Some(1.5)),
             ("shorter", 96_000, 2.0, Some(3.0)),
             ("tiny", 1_920, 0.003, Some(0.019)),
             ("sub-millisecond", 2, 0.0, None),
@@ -7970,11 +7971,21 @@ mod tests {
                     CachedClip::read(&path, &AtomicBool::new(false)).unwrap(),
                 );
                 let ctx = egui::Context::default();
-                let pos = pad_icon_position(&mut app, &ctx, "trim");
+                let (pos, button) = if state == "selection" {
+                    (
+                        text_rect(&draw_board(&mut app, &ctx, Vec::new()), "Edit").center(),
+                        egui::PointerButton::Primary,
+                    )
+                } else {
+                    (
+                        pad_icon_position(&mut app, &ctx, "trim"),
+                        egui::PointerButton::Secondary,
+                    )
+                };
                 let events = vec![
                     Vec::new(),
-                    click(pos, egui::PointerButton::Secondary, true),
-                    click(pos, egui::PointerButton::Secondary, false),
+                    click(pos, button, true),
+                    click(pos, button, false),
                 ];
                 let theme = if dark { "dark" } else { "light" };
                 let image = super::super::snapshot::snapshot_with_events(
