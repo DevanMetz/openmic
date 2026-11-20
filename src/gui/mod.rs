@@ -75,6 +75,16 @@ impl Page {
             Page::Settings => "Settings",
         }
     }
+
+    fn icon(self) -> widgets::NavIcon {
+        match self {
+            Page::Voice => widgets::NavIcon::Voice,
+            Page::Soundboard => widgets::NavIcon::Soundboard,
+            Page::Record => widgets::NavIcon::Record,
+            Page::Dictation => widgets::NavIcon::Dictation,
+            Page::Settings => widgets::NavIcon::Settings,
+        }
+    }
 }
 
 type Status = (String, Color32);
@@ -90,10 +100,18 @@ struct DefaultMicSync {
 }
 
 impl DefaultMicSync {
-    fn begin(&mut self, key: &DefaultMicState, now: Instant) -> bool {
-        if self.synced.as_ref() == Some(key)
+    fn matches(saved: &DefaultMicState, running: bool, output: &str, default_mic: bool) -> bool {
+        saved.0 == running && saved.1 == output && saved.2 == default_mic
+    }
+
+    fn begin(&mut self, running: bool, output: &str, default_mic: bool, now: Instant) -> bool {
+        if self
+            .synced
+            .as_ref()
+            .is_some_and(|s| Self::matches(s, running, output, default_mic))
             || self.attempted.as_ref().is_some_and(|(attempted, at)| {
-                attempted == key && now.duration_since(*at) < DEVICE_POLL
+                Self::matches(attempted, running, output, default_mic)
+                    && now.duration_since(*at) < DEVICE_POLL
             })
         {
             return false;
@@ -101,12 +119,12 @@ impl DefaultMicSync {
         // A failed transition can have changed one Windows role already, so
         // the previously successful state must also be reconciled on return.
         self.synced = None;
-        self.attempted = Some((key.clone(), now));
+        self.attempted = Some(((running, output.to_owned(), default_mic), now));
         true
     }
 
-    fn complete(&mut self, key: DefaultMicState) {
-        self.synced = Some(key);
+    fn complete(&mut self, running: bool, output: &str, default_mic: bool) {
+        self.synced = Some((running, output.to_owned(), default_mic));
         self.attempted = None;
     }
 }
@@ -153,6 +171,7 @@ struct CachedClip {
     peaks: Arc<Vec<f32>>,
     bytes: u64,
     modified: Option<SystemTime>,
+    last_used: u64,
 }
 
 struct DictationRecording {
@@ -192,6 +211,12 @@ pub struct App {
     clip_errors: HashMap<PathBuf, String>,
     /// Decoded clips, so a pad (or its hotkey) plays without a decode delay.
     clip_cache: HashMap<PathBuf, CachedClip>,
+    /// Monotonic counter for LRU clip cache eviction.
+    clip_cache_tick: u64,
+    /// Reusable buffer for scope history (avoids allocating every GUI frame).
+    scope_buf: Vec<crate::engine::ScopeFrame>,
+    /// Reusable buffer for mixer playback snapshots.
+    clip_progress_buf: Vec<dsp::ClipProgress>,
     /// Files being imported in the background, one decoder at a time.
     clip_import: Option<sound_tab::ClipImport>,
     /// Pending playback and trim previews, decoded one clip at a time.
@@ -374,6 +399,9 @@ impl App {
             trim_preview: None,
             clip_errors: HashMap::new(),
             clip_cache: HashMap::new(),
+            clip_cache_tick: 0,
+            scope_buf: Vec::with_capacity(crate::engine::SCOPE_FRAMES),
+            clip_progress_buf: Vec::new(),
             clip_import: None,
             clip_loads: None,
             record_source: Source::Microphone,
@@ -784,20 +812,20 @@ impl App {
         // A brief reconnect keeps VB-Cable as the default rather than
         // flipping Discord's input back and forth.
         let running = self.engine.is_some() || self.reconnecting;
-        let key = (
-            running,
-            self.settings.output.clone(),
-            self.settings.default_mic,
-        );
-        if !self.default_mic_sync.begin(&key, Instant::now()) {
+        let default_mic = self.settings.default_mic;
+        if !self
+            .default_mic_sync
+            .begin(running, &self.settings.output, default_mic, Instant::now())
+        {
             return;
         }
 
         let want = running
-            && self.settings.default_mic
+            && default_mic
             && cable_input(&self.outputs) == Some(&self.settings.output);
         if !want && self.settings.saved_default_mic.is_none() {
-            self.default_mic_sync.complete(key);
+            self.default_mic_sync
+                .complete(running, &self.settings.output, default_mic);
             return;
         }
         let Ok(Some(cable_mic)) = default_mic::cable_capture_id() else {
@@ -810,7 +838,8 @@ impl App {
                         return;
                     };
                     if before.console == cable_mic && before.communications == cable_mic {
-                        self.default_mic_sync.complete(key);
+                        self.default_mic_sync
+                            .complete(running, &self.settings.output, default_mic);
                         return; // already the default; nothing to restore later
                     }
                     // Persist first so a crash can't lose the user's default.
@@ -847,7 +876,8 @@ impl App {
             }
             _ => {}
         }
-        self.default_mic_sync.complete(key);
+        self.default_mic_sync
+            .complete(running, &self.settings.output, default_mic);
     }
 
     // ---- tray, hotkeys and window ------------------------------------------
@@ -1144,11 +1174,39 @@ impl App {
         .collect()
     }
 
+    fn hotkeys_up_to_date(&self, hotkeys: &Hotkeys) -> bool {
+        if self.capturing.is_some() || self.settings.load_error.is_some() {
+            return hotkeys.matches(std::iter::empty());
+        }
+        let h = &self.settings.hotkeys;
+        let globals = [
+            (h.mute.as_deref(), 0u8),
+            (h.bypass.as_deref(), 1u8),
+            (h.stop_clips.as_deref(), 2u8),
+            (h.dictate.as_deref(), 3u8),
+        ]
+        .into_iter()
+        .filter_map(|(key, tag)| Some((key?, None, tag)));
+        let pads = self
+            .settings
+            .sounds
+            .iter()
+            .filter_map(|pad| Some((pad.hotkey.as_deref()?, Some(pad.path.as_path()), 4u8)));
+        hotkeys.matches(globals.chain(pads))
+    }
+
     fn sync_hotkeys(&mut self, ctx: &egui::Context) {
         // Capture temporarily frees every global shortcut. Restore them
         // when the full window can no longer receive the replacement key.
         if self.hidden || ctx.input(|i| !i.focused || i.viewport().minimized == Some(true)) {
             self.cancel_capture();
+        }
+        if self
+            .hotkeys
+            .as_ref()
+            .is_none_or(|hotkeys| self.hotkeys_up_to_date(hotkeys))
+        {
+            return;
         }
         let bindings = self.hotkey_bindings();
         let Some(hotkeys) = &mut self.hotkeys else {
@@ -1622,16 +1680,36 @@ impl eframe::App for App {
         self.minimize_to_strip(ctx);
         self.remember_window(ctx);
         self.show_overlay(ctx);
-        // The live scope, the recorder and the pinned meter animate at ~30
-        // fps. Hidden, a slow tick still handles device loss and the default
-        // mic; tray and hotkey commands wake it immediately.
-        let animating = self.engine.is_some() || self.recorder.is_some();
-        let meter_live = self.strip_visible() && self.engine.is_some();
-        let frame_time = match (self.hidden, animating) {
-            (true, _) if meter_live => 33,
-            (true, _) => 250,
-            (false, true) => 33,
-            (false, false) => 100,
+        // Adaptive repaint cadence: 30 fps only when a live scope, waveform,
+        // meter strip, progress bar, or spinner is actually visible; slower
+        // ticks on static pages and when idle so CPU/GPU stay near zero.
+        let active_job = self.recorder.is_some()
+            || self.mic_test.busy()
+            || self.trim_preview.is_some()
+            || !self.playing.is_empty()
+            || self.clip_import.is_some()
+            || self.recording_save.is_some()
+            || self.dictating.is_some()
+            || self.dictation.busy()
+            || self.dictation.download_progress().is_some()
+            || matches!(
+                self.updater.status(),
+                crate::update::Status::Checking | crate::update::Status::Downloading(_)
+            );
+        let live_scope_visible = !self.hidden && self.page == Page::Voice && self.engine.is_some();
+        let meter_live = self.strip_visible() && (self.engine.is_some() || !self.playing.is_empty());
+        let frame_time = if live_scope_visible || (!self.hidden && active_job) || meter_live {
+            33
+        } else if !self.hidden && self.engine.is_some() {
+            // Static pages (Settings, idle Soundboard/Dictation/Record): keep
+            // the sidebar output meter smooth without burning 30 fps GPU work.
+            100
+        } else if self.dirty_since.is_some() || active_job {
+            150
+        } else {
+            // Completely idle (visible or hidden in tray): user input, hotkeys,
+            // tray clicks and background workers still wake immediately.
+            500
         };
         ctx.request_repaint_after(Duration::from_millis(frame_time));
     }
@@ -1663,13 +1741,19 @@ impl eframe::App for App {
         self.capture_hotkey(&ctx);
         self.update_running_status();
 
+        let dark = ui.visuals().dark_mode;
+        let sidebar_frame = egui::Frame::side_top_panel(ui.style())
+            .fill(widgets::sidebar_fill(dark))
+            .inner_margin(egui::Margin::symmetric(8, 8))
+            .stroke(egui::Stroke::new(1.0, widgets::hairline(dark)));
         egui::Panel::left("sidebar")
             .resizable(false)
             .exact_size(SIDEBAR_WIDTH)
+            .frame(sidebar_frame)
             .show(ui, |ui| self.draw_sidebar(ui));
 
         CentralPanel::default().show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.heading(self.page.title());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1679,19 +1763,17 @@ impl eframe::App for App {
             ui.separator();
             // The window can be shorter than a page (a small laptop
             // screen): pages scroll, the sidebar stays put.
-            let mut scroll = ScrollArea::vertical()
+            ScrollArea::vertical()
                 .id_salt(self.page.title())
-                .auto_shrink([false; 2]);
-            if self.page == Page::Soundboard && self.pad_to_reveal.is_some() {
-                scroll = scroll.vertical_scroll_offset(0.0);
-            }
-            scroll.show(ui, |ui| match self.page {
-                Page::Voice => self.draw_mic_tab(ui),
-                Page::Soundboard => self.draw_sound_tab(ui),
-                Page::Record => self.draw_record_page(ui),
-                Page::Dictation => self.draw_dictation_page(ui),
-                Page::Settings => self.draw_settings_tab(ui),
-            });
+                .auto_shrink([false; 2])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| match self.page {
+                    Page::Voice => self.draw_mic_tab(ui),
+                    Page::Soundboard => self.draw_sound_tab(ui),
+                    Page::Record => self.draw_record_page(ui),
+                    Page::Dictation => self.draw_dictation_page(ui),
+                    Page::Settings => self.draw_settings_tab(ui),
+                });
         });
         if self.page != Page::Soundboard {
             self.close_trim_editor();
@@ -1716,13 +1798,105 @@ impl eframe::App for App {
 /// Width of the sidebar, points.
 const SIDEBAR_WIDTH: f32 = 176.0;
 
+fn sidebar_nav_item(
+    ui: &mut egui::Ui,
+    selected: bool,
+    icon: widgets::NavIcon,
+    label: &str,
+    accent_override: Option<Color32>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 28.0),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    let visuals = ui.visuals();
+    let dark = visuals.dark_mode;
+    let accent = accent_override.unwrap_or(CYAN);
+    let fill = if selected {
+        if dark {
+            accent.gamma_multiply(0.15)
+        } else {
+            accent.gamma_multiply(0.14)
+        }
+    } else if response.hovered() {
+        visuals.widgets.hovered.weak_bg_fill
+    } else {
+        Color32::TRANSPARENT
+    };
+    let painter = ui.painter();
+    if fill != Color32::TRANSPARENT {
+        painter.rect_filled(rect, 7.0, fill);
+    }
+    if selected {
+        let bar = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 3.5, rect.center().y),
+            egui::vec2(3.0, 14.0),
+        );
+        painter.rect_filled(bar, 1.5, accent);
+    }
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            7.0,
+            visuals.selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    let icon_color = if selected || accent_override.is_some() {
+        widgets::text_color(ui, accent)
+    } else if response.hovered() {
+        visuals.text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    widgets::paint_nav_icon(
+        painter,
+        egui::pos2(rect.left() + 18.0, rect.center().y),
+        icon,
+        icon_color,
+    );
+    let text_color = if selected {
+        visuals.strong_text_color()
+    } else if response.hovered() {
+        visuals.text_color()
+    } else {
+        visuals.text_color().gamma_multiply(0.88)
+    };
+    let text_area = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 33.0, rect.top()),
+        egui::pos2(rect.right() - 4.0, rect.bottom()),
+    );
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(text_area.width().max(1.0));
+    let galley = painter.layout_job(job);
+    painter.galley(
+        egui::pos2(text_area.left(), rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_color,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 impl App {
     /// Navigation above; below, what matters on every page: whether Discord
     /// hears you, your level, Mute and Start/Stop.
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("OpenMic").strong().size(17.0));
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+            let accent = if self.engine.is_some() {
+                if self.settings.mute { RED } else { GREEN }
+            } else {
+                CYAN
+            };
+            widgets::paint_brand_mark(ui.painter(), mark, accent);
+            ui.label(RichText::new("OpenMic").strong().size(16.0));
             self.draw_version(ui);
         });
         if cfg!(debug_assertions) {
@@ -1733,7 +1907,7 @@ impl App {
             )
             .on_hover_text("Built without --release: slower, and never updates itself");
         }
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         let navigation_height =
             (ui.available_height() - self.status_panel_height(ui) - ui.spacing().item_spacing.y)
                 .max(0.0);
@@ -1750,38 +1924,34 @@ impl App {
             .max_height(navigation_height)
             .min_scrolled_height(0.0)
             .auto_shrink([false, true])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 for page in Page::ALL {
-                    let label = match page {
+                    let (label, dot_accent) = match page {
                         Page::Record
                             if self.recorder.as_ref().is_some_and(Recorder::is_stopping) =>
                         {
-                            "Record  • finishing".to_owned()
+                            ("Record  • finishing".to_owned(), Some(CYAN))
                         }
-                        Page::Record if self.recorder.is_some() => "Record  ⏺ REC".to_owned(),
+                        Page::Record if self.recorder.is_some() => {
+                            ("Record  ⏺ REC".to_owned(), Some(RED))
+                        }
                         Page::Dictation
                             if self
                                 .dictating
                                 .as_ref()
                                 .is_some_and(|recording| recording.recorder.is_stopping()) =>
                         {
-                            "Dictation  • finishing".to_owned()
+                            ("Dictation  • finishing".to_owned(), Some(CYAN))
                         }
                         Page::Dictation if self.dictating.is_some() => {
-                            "Dictation  • listening".to_owned()
+                            ("Dictation  • listening".to_owned(), Some(AMBER))
                         }
-                        _ => page.title().to_owned(),
+                        _ => (page.title().to_owned(), None),
                     };
                     let selected = self.page == page;
-                    let text = if selected {
-                        RichText::new(label).strong()
-                    } else {
-                        RichText::new(label)
-                    };
-                    let response = ui.add_sized(
-                        [ui.available_width(), 28.0],
-                        egui::Button::selectable(selected, text),
-                    );
+                    let response = sidebar_nav_item(ui, selected, page.icon(), &label, dot_accent);
                     widgets::scroll_on_focus(&response);
                     if navigation_reflowed
                         && response.has_focus()
@@ -1803,7 +1973,7 @@ impl App {
                 ui.add_space(1.0);
             });
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(8.0);
+            ui.add_space(2.0);
             self.draw_status_panel(ui);
         });
     }
@@ -1817,88 +1987,123 @@ impl App {
                 .invisible()
                 .sizing_pass(),
         );
-        measure.add_space(8.0);
-        measure.allocate_exact_size(
-            egui::vec2(measure.available_width(), 26.0),
-            egui::Sense::hover(),
-        );
-        measure.add_space(4.0);
-        measure.allocate_exact_size(
-            egui::vec2(measure.available_width(), 6.0),
-            egui::Sense::hover(),
-        );
-        measure.add_space(4.0);
-        self.draw_status_details(&mut measure);
+        measure.add_space(2.0);
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(6, 5))
+            .show(&mut measure, |ui| {
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 26.0),
+                    egui::Sense::hover(),
+                );
+                ui.add_space(4.0);
+                ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 6.0),
+                    egui::Sense::hover(),
+                );
+                ui.add_space(4.0);
+                self.draw_status_details(ui);
+            });
         measure.min_rect().height()
     }
 
     fn draw_status_panel(&mut self, ui: &mut egui::Ui) {
-        // Laid out bottom-up: the last widget added is the top one.
-        ui.horizontal(|ui| {
-            let running = self.running();
-            let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
-            let start = egui::Button::new(
-                RichText::new(if running { "Stop" } else { "Start" }).color(Color32::BLACK),
-            )
-            .fill(if running { RED } else { GREEN });
-            let start = ui.add_sized([width, 26.0], start);
-            self.restore_settings_retry_focus(&start, true);
-            if start.clicked() {
-                widgets::finish_keyboard_activation(ui.ctx());
-                self.toggle_running();
-                ui.ctx().request_repaint();
-            }
-            let muted = self.settings.mute;
-            let mute = egui::Button::new(
-                RichText::new(if muted { "Unmute" } else { "Mute" }).color(if muted {
-                    Color32::BLACK
-                } else {
-                    ui.visuals().text_color()
-                }),
-            )
-            .fill(if muted {
-                RED
-            } else {
-                ui.visuals().widgets.inactive.weak_bg_fill
+        let dark = ui.visuals().dark_mode;
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(egui::Stroke::new(1.0, widgets::hairline(dark)))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(6, 5))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // Laid out bottom-up: the last widget added is the top one.
+                ui.horizontal(|ui| {
+                    let running = self.running();
+                    let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                    let start = egui::Button::new(
+                        RichText::new(if running { "Stop" } else { "Start" })
+                            .strong()
+                            .color(Color32::from_gray(16)),
+                    )
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .fill(if running { RED } else { GREEN });
+                    let start = ui.add_sized([width, 26.0], start);
+                    self.restore_settings_retry_focus(&start, true);
+                    if start.clicked() {
+                        widgets::finish_keyboard_activation(ui.ctx());
+                        self.toggle_running();
+                        ui.ctx().request_repaint();
+                    }
+                    let muted = self.settings.mute;
+                    let mute = egui::Button::new(
+                        RichText::new(if muted { "Unmute" } else { "Mute" })
+                            .strong()
+                            .color(if muted {
+                                Color32::from_gray(16)
+                            } else {
+                                ui.visuals().text_color()
+                            }),
+                    )
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .fill(if muted {
+                        RED
+                    } else {
+                        ui.visuals().widgets.inactive.weak_bg_fill
+                    });
+                    if ui
+                        .add_sized([width, 26.0], mute)
+                        .on_hover_text("Silence your voice; the soundboard still plays")
+                        .clicked()
+                    {
+                        widgets::finish_keyboard_activation(ui.ctx());
+                        self.settings.mute = !muted;
+                        self.apply_live();
+                        ui.ctx().request_repaint();
+                    }
+                });
+                ui.add_space(4.0);
+                // What Discord hears.
+                let level = self.engine.as_ref().map(|e| e.stats().out_peak);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 6.0),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                painter.rect(
+                    rect,
+                    3.0,
+                    ui.visuals().extreme_bg_color,
+                    egui::Stroke::new(1.0, widgets::hairline(dark)),
+                    egui::StrokeKind::Inside,
+                );
+                let inner = rect.shrink(1.0);
+                if let Some(peak) = level {
+                    let db = (20.0 * peak.max(1e-6).log10()).clamp(-60.0, 0.0);
+                    let frac = (db + 60.0) / 60.0;
+                    if frac > 0.005 {
+                        let fill = egui::Rect::from_min_max(
+                            inner.min,
+                            egui::pos2(inner.left() + inner.width() * frac, inner.bottom()),
+                        );
+                        let color = if db > -6.0 {
+                            RED
+                        } else if db > -18.0 {
+                            AMBER
+                        } else {
+                            GREEN
+                        };
+                        painter.rect_filled(fill, 2.0, color);
+                    }
+                }
+                for tick in [0.7, 0.9] {
+                    let x = inner.left() + inner.width() * tick;
+                    painter.line_segment(
+                        [egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())],
+                        egui::Stroke::new(1.0, ui.visuals().faint_bg_color.gamma_multiply(0.7)),
+                    );
+                }
+                ui.add_space(4.0);
+                self.draw_status_details(ui);
             });
-            if ui
-                .add_sized([width, 26.0], mute)
-                .on_hover_text("Silence your voice; the soundboard still plays")
-                .clicked()
-            {
-                widgets::finish_keyboard_activation(ui.ctx());
-                self.settings.mute = !muted;
-                self.apply_live();
-                ui.ctx().request_repaint();
-            }
-        });
-        ui.add_space(4.0);
-        // What Discord hears.
-        let level = self.engine.as_ref().map(|e| e.stats().out_peak);
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
-        ui.painter()
-            .rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
-        if let Some(peak) = level {
-            let db = (20.0 * peak.max(1e-6).log10()).clamp(-60.0, 0.0);
-            let fill = egui::Rect::from_min_max(
-                rect.min,
-                egui::pos2(
-                    rect.left() + rect.width() * (db + 60.0) / 60.0,
-                    rect.bottom(),
-                ),
-            );
-            let color = if db > -6.0 {
-                RED
-            } else if db > -18.0 {
-                AMBER
-            } else {
-                GREEN
-            };
-            ui.painter().rect_filled(fill, 3.0, color);
-        }
-        ui.add_space(4.0);
-        self.draw_status_details(ui);
     }
 
     fn draw_status_details(&self, ui: &mut egui::Ui) {
@@ -3374,29 +3579,26 @@ mod tests {
     fn failed_default_mic_sync_retries_without_blocking_state_changes() {
         let mut sync = DefaultMicSync::default();
         let now = Instant::now();
-        let stopped = (false, "CABLE Input".into(), true);
-        let running = (true, "CABLE Input".into(), true);
-        assert!(sync.begin(&stopped, now));
-        sync.complete(stopped.clone());
-        assert!(!sync.begin(&stopped, now + DEVICE_POLL));
+        assert!(sync.begin(false, "CABLE Input", true, now));
+        sync.complete(false, "CABLE Input", true);
+        assert!(!sync.begin(false, "CABLE Input", true, now + DEVICE_POLL));
 
-        assert!(sync.begin(&running, now));
-        assert!(!sync.begin(&running, now + Duration::from_millis(250)));
-        assert!(sync.begin(&running, now + DEVICE_POLL));
+        assert!(sync.begin(true, "CABLE Input", true, now));
+        assert!(!sync.begin(true, "CABLE Input", true, now + Duration::from_millis(250)));
+        assert!(sync.begin(true, "CABLE Input", true, now + DEVICE_POLL));
         // A partial start failure may have changed a role. Stop must restore
         // it immediately even though the stopped state once succeeded.
-        assert!(sync.begin(&stopped, now + DEVICE_POLL));
+        assert!(sync.begin(false, "CABLE Input", true, now + DEVICE_POLL));
     }
 
     #[test]
     fn exiting_can_force_a_final_default_mic_restore() {
-        let stopped = (false, "CABLE Input".into(), true);
         let now = Instant::now();
         let mut sync = DefaultMicSync::default();
-        assert!(sync.begin(&stopped, now));
-        assert!(!sync.begin(&stopped, now));
+        assert!(sync.begin(false, "CABLE Input", true, now));
+        assert!(!sync.begin(false, "CABLE Input", true, now));
         sync = DefaultMicSync::default();
-        assert!(sync.begin(&stopped, now));
+        assert!(sync.begin(false, "CABLE Input", true, now));
     }
 
     #[test]
@@ -4437,7 +4639,7 @@ mod tests {
             run(&mut app, events);
         }
         let noisy = crate::config::builtin_presets()
-            .into_iter()
+            .iter()
             .find(|p| p.name == "Noisy room")
             .unwrap();
         assert_eq!(app.settings.processing(), noisy.processing);

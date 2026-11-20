@@ -14,6 +14,7 @@ use eframe::egui::{self, Color32};
 use super::{AMBER, App, CYAN, CachedClip, GREEN, MUTED, RED, clip_key, short};
 use crate::config::Pad;
 use crate::dsp::{self, Clip};
+#[cfg(test)]
 use crate::engine::Engine;
 
 struct ClipRequest {
@@ -67,6 +68,7 @@ impl CachedClip {
             peaks: Arc::new(peaks),
             bytes: metadata.len(),
             modified: metadata.modified().ok(),
+            last_used: 0,
         })
     }
 
@@ -84,17 +86,28 @@ impl CachedClip {
 
 impl App {
     pub(super) fn sync_clip_progress(&mut self) {
-        let progress = self
-            .engine
-            .as_ref()
-            .map(Engine::clip_progress)
-            .unwrap_or_default();
-        self.playing = progress
-            .iter()
-            .filter(|clip| !clip.paused)
-            .map(|clip| clip.key)
-            .collect();
-        self.pad_progress = progress.into_iter().map(|clip| (clip.key, clip)).collect();
+        if let Some(engine) = &self.engine {
+            engine.clip_progress_into(&mut self.clip_progress_buf);
+        } else {
+            self.clip_progress_buf.clear();
+        }
+        if self.clip_progress_buf.is_empty() {
+            if !self.playing.is_empty() {
+                self.playing.clear();
+            }
+            if !self.pad_progress.is_empty() {
+                self.pad_progress.clear();
+            }
+        } else {
+            self.playing.clear();
+            self.pad_progress.clear();
+            for clip in &self.clip_progress_buf {
+                if !clip.paused {
+                    self.playing.push(clip.key);
+                }
+                self.pad_progress.insert(clip.key, *clip);
+            }
+        }
         if self.pad_progress.is_empty()
             && (self.sound_status.0.starts_with("Playing")
                 || self.sound_status.0.starts_with("Paused"))
@@ -104,11 +117,19 @@ impl App {
     }
 
     pub(super) fn cached_clip(&mut self, path: &Path) -> Option<&CachedClip> {
-        let cached = self.clip_cache.get(path)?;
-        if cached.validate_source(path).is_err() {
+        let valid = self
+            .clip_cache
+            .get(path)
+            .map(|cached| cached.validate_source(path).is_ok())?;
+        if !valid {
             self.forget_clip(path);
+            return None;
         }
-        self.clip_cache.get(path)
+        self.clip_cache_tick = self.clip_cache_tick.wrapping_add(1);
+        let tick = self.clip_cache_tick;
+        let cached = self.clip_cache.get_mut(path)?;
+        cached.last_used = tick;
+        Some(cached)
     }
 
     pub(super) fn trim_waveform(
@@ -156,17 +177,31 @@ impl App {
         self.prune_clip_loads();
     }
 
-    pub(super) fn cache_clip(&mut self, path: PathBuf, clip: CachedClip) {
+    pub(super) fn cache_clip(&mut self, path: PathBuf, mut clip: CachedClip) {
         self.forget_clip(&path);
-        // Keep the cache to about ten minutes of audio (~110 MB).
-        let cached: usize = self
+        // Keep the cache to about ten minutes of audio (~110 MB) via LRU eviction
+        // instead of discarding every hot clip at once.
+        const MAX_CACHED_SAMPLES: usize = dsp::SR as usize * 600;
+        let mut cached: usize = self
             .clip_cache
             .values()
-            .map(|clip| clip.samples.len())
+            .map(|entry| entry.samples.len())
             .sum();
-        if cached + clip.samples.len() > dsp::SR as usize * 600 {
-            self.clip_cache.clear();
+        while cached + clip.samples.len() > MAX_CACHED_SAMPLES && !self.clip_cache.is_empty() {
+            let Some(oldest) = self
+                .clip_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.clip_cache.remove(&oldest) {
+                cached = cached.saturating_sub(removed.samples.len());
+            }
         }
+        self.clip_cache_tick = self.clip_cache_tick.wrapping_add(1);
+        clip.last_used = self.clip_cache_tick;
         self.clip_cache.insert(path, clip);
     }
 
@@ -780,7 +815,7 @@ mod tests {
         let paths: Vec<_> = (0..33)
             .map(|index| wav(dir.path(), &format!("playback-keyboard-{index}.wav")))
             .collect();
-        let size = egui::vec2(700.0, 420.0);
+        let size = egui::vec2(700.0, 280.0);
         let key = |key, modifiers| {
             vec![egui::Event::Key {
                 key,
@@ -936,7 +971,7 @@ mod tests {
                             _ => None,
                         })
                         .unwrap();
-                    for (delta, visible) in [(1000.0, false), (-1000.0, true)] {
+                    for (delta, visible) in [(-1000.0, false), (1000.0, true)] {
                         draw_board_size(
                             &mut app,
                             &ctx,
@@ -1029,7 +1064,7 @@ mod tests {
             &ctx,
             size,
             vec![
-                egui::Event::PointerMoved(egui::pos2(300.0, 55.0)),
+                egui::Event::PointerMoved(egui::pos2(300.0, 350.0)),
                 egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -100.0),
@@ -1096,7 +1131,18 @@ mod tests {
 
     fn pad_icon_position(app: &mut App, ctx: &egui::Context, name: &str) -> egui::Pos2 {
         draw_board(app, ctx, Vec::new());
-        let title = text_rect(&draw_board(app, ctx, Vec::new()), name);
+        let output = draw_board(app, ctx, Vec::new());
+        let title = output
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == name => {
+                    Some(text.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} not drawn"));
         egui::pos2(title.left() - 26.0, title.center().y)
     }
 
@@ -8389,13 +8435,14 @@ mod tests {
                 paths[32].clone(),
                 "Reconnect the audio drive before retrying".into(),
             );
+            let board_size = egui::vec2(700.0, 280.0);
             for _ in 0..2 {
-                draw_board_size(&mut app, &ctx, egui::vec2(700.0, 420.0), Vec::new());
+                draw_board_size(&mut app, &ctx, board_size, Vec::new());
             }
             draw_board_size(
                 &mut app,
                 &ctx,
-                egui::vec2(700.0, 420.0),
+                board_size,
                 vec![
                     egui::Event::PointerMoved(egui::pos2(300.0, 55.0)),
                     egui::Event::MouseWheel {
@@ -8407,11 +8454,11 @@ mod tests {
                 ],
             );
             for _ in 0..3 {
-                draw_board_size(&mut app, &ctx, egui::vec2(700.0, 420.0), Vec::new());
+                draw_board_size(&mut app, &ctx, board_size, Vec::new());
             }
-            let scrolled = draw_board_size(&mut app, &ctx, egui::vec2(700.0, 420.0), Vec::new());
+            let scrolled = draw_board_size(&mut app, &ctx, board_size, Vec::new());
             assert!(!scrolled.shapes.iter().any(|shape| matches!(&shape.shape,
-                egui::Shape::Text(text) if text.galley.text() == "Click a name to rename; drag to reorder."
+                egui::Shape::Text(text) if text.galley.text() == "PLAYBACK"
                     && shape.clip_rect.contains(text.visual_bounding_rect().center()))), "the board was already scrolled away before revealing the pad");
             app.begin_pad_rename(&app.settings.sounds[0].clone());
             app.capturing = Some(super::super::Binding::Pad(paths[0].clone()));
@@ -8442,7 +8489,7 @@ mod tests {
                     && app.trim_clip.is_none()
             );
             let mut target = None;
-            let mut output = draw_board_size(&mut app, &ctx, egui::vec2(700.0, 420.0), Vec::new());
+            let mut output = draw_board_size(&mut app, &ctx, board_size, Vec::new());
             for _ in 0..5 {
                 let update = output.platform_output.accesskit_update.as_ref().unwrap();
                 if let Some((id, _)) = update
@@ -8452,7 +8499,7 @@ mod tests {
                 {
                     target = Some(*id);
                 }
-                output = draw_board_size(&mut app, &ctx, egui::vec2(700.0, 420.0), Vec::new());
+                output = draw_board_size(&mut app, &ctx, board_size, Vec::new());
             }
             assert_eq!(
                 Some(output.platform_output.accesskit_update.unwrap().focus),
@@ -8476,7 +8523,7 @@ mod tests {
                     "the requested pad is visible, even with another pad of the same name above it",
                 );
             assert!(
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 420.0))
+                egui::Rect::from_min_size(egui::Pos2::ZERO, board_size)
                     .contains_rect(visible)
             );
             assert!(app.pad_to_reveal.is_none());

@@ -232,8 +232,9 @@ impl App {
         }
         egui::Frame::new()
             .fill(tone.gamma_multiply(0.08))
-            .corner_radius(6)
-            .inner_margin(egui::Margin::symmetric(10, 6))
+            .stroke(egui::Stroke::new(1.0, tone.gamma_multiply(0.26)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 7))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 match cable {
@@ -363,7 +364,7 @@ impl App {
             .unwrap_or(false);
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Preset").weak());
-            for preset in &builtins {
+            for preset in builtins {
                 let chip = preset_chip(ui, preset, &current, false, 0);
                 if chip.clicked() {
                     apply = Some(preset.processing.clone());
@@ -504,12 +505,19 @@ impl App {
 
     /// The settings, one row each, in the order your voice passes through them.
     fn draw_voice_rows(&mut self, ui: &mut egui::Ui) {
-        #[allow(unused_mut)]
-        let mut frames = self.engine.as_ref().map(Engine::scope).unwrap_or_default();
-        #[cfg(test)]
-        if frames.is_empty() {
-            frames = self.demo_frames.clone();
+        if let Some(engine) = &self.engine {
+            engine.scope_into(&mut self.scope_buf);
+        } else {
+            self.scope_buf.clear();
         }
+        #[cfg(test)]
+        let frames: &[crate::engine::ScopeFrame] = if self.scope_buf.is_empty() {
+            &self.demo_frames
+        } else {
+            &self.scope_buf
+        };
+        #[cfg(not(test))]
+        let frames: &[crate::engine::ScopeFrame] = &self.scope_buf;
         let bypassed = self.settings.bypass;
         let mut changed = viz::Changed::default();
         widgets::card(
@@ -536,7 +544,7 @@ impl App {
                         |ui| {
                             viz::voice_rows(
                                 ui,
-                                &frames,
+                                frames,
                                 &mut self.settings,
                                 &mut self.strength_before_off,
                             )
@@ -668,17 +676,28 @@ fn preset_chip(
         + ui.spacing().button_padding * 2.0;
     size.x = size.x.min(ui.max_rect().width());
     size.y = size.y.max(ui.spacing().interact_size.y);
+    let visuals = ui.visuals().clone();
     let chip = ui
         .allocate_ui_with_layout(
             size,
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.scope_builder(egui::UiBuilder::new().id(id), |ui| {
-                    ui.add(
-                        egui::Button::selectable(selected, &preset.name)
-                            .truncate()
-                            .min_size(size),
-                    )
+                    let mut button = egui::Button::selectable(selected, &preset.name)
+                        .frame(true)
+                        .truncate()
+                        .corner_radius(egui::CornerRadius::same(13))
+                        .min_size(size);
+                    if selected {
+                        button = button
+                            .fill(CYAN.gamma_multiply(if visuals.dark_mode { 0.22 } else { 0.18 }))
+                            .stroke(egui::Stroke::new(1.0, CYAN.gamma_multiply(0.75)));
+                    } else {
+                        button = button
+                            .fill(visuals.widgets.inactive.weak_bg_fill)
+                            .stroke(visuals.widgets.inactive.bg_stroke);
+                    }
+                    ui.add(button)
                 })
                 .inner
             },

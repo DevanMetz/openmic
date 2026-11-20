@@ -467,6 +467,7 @@ impl App {
                 let scroll = egui::ScrollArea::vertical()
                     .id_salt(("notes", &release.tag))
                     .max_height((ui.available_height() - footer_height).max(32.0))
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         if release.notes.trim().is_empty() {
                             ui.weak("This release has no notes.");

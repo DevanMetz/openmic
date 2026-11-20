@@ -1,6 +1,6 @@
 [package]
 name = "openmic"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 description = "Native real-time microphone cleaner and soundboard for Windows and Linux"
 license = "MIT"
@@ -36,7 +36,9 @@ serde_json = "1.0"
 # signature made by the release workflow's key.
 ed25519-dalek = "2"
 sha2 = "0.10"
-symphonia = { version = "0.5.5", features = ["all"] }
+# Only the audio formats OpenMic supports (WAV, AIFF, FLAC, OGG/Vorbis, MP3)
+# with runtime-dispatched SIMD decoding enabled, keeping the binary lean.
+symphonia = { version = "0.5.5", default-features = false, features = ["wav", "aiff", "flac", "ogg", "vorbis", "mp3", "pcm", "adpcm", "opt-simd"] }
 tempfile = "3"
 # Downloads the dictation model on first use (Windows' own TLS stack).
 ureq = { version = "3", default-features = false, features = ["native-tls"] }

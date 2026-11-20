@@ -22,9 +22,9 @@ const VOICE_RANGE: std::ops::RangeInclusive<f32> = 0.05..=0.95;
 const FLOOR_DB: f32 = -70.0;
 const PICTURE_HEIGHT: f32 = 34.0;
 const MIN_PICTURE_WIDTH: f32 = 80.0;
-const SWITCH_WIDTH: f32 = 30.0;
+const SWITCH_WIDTH: f32 = 32.0;
 const TITLE_WIDTH: f32 = 176.0;
-const VALUE_WIDTH: f32 = 92.0;
+const VALUE_WIDTH: f32 = 94.0;
 /// Rumble picture's frequency span, Hz.
 const RUMBLE_SPAN: (f32, f32) = (20.0, 500.0);
 
@@ -139,15 +139,28 @@ fn draw_row(
                 .interact(rect, picture_id, Sense::click_and_drag())
                 .on_hover_cursor(row.cursor);
             let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 5.0, ui.visuals().extreme_bg_color);
-            paint(&painter, rect.shrink2(Vec2::new(4.0, 2.0)), active);
+            let well_border = if picture.dragged() {
+                CYAN
+            } else if picture.hovered() {
+                ui.visuals().widgets.hovered.bg_stroke.color
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke.color
+            };
+            painter.rect(
+                rect,
+                6.0,
+                ui.visuals().extreme_bg_color,
+                Stroke::new(1.0, well_border),
+                egui::StrokeKind::Inside,
+            );
+            paint(&painter, rect.shrink2(Vec2::new(5.0, 3.0)), active);
             if !active {
-                painter.rect_filled(rect, 5.0, ui.visuals().panel_fill.gamma_multiply(0.55));
+                painter.rect_filled(rect, 6.0, ui.visuals().panel_fill.gamma_multiply(0.55));
             }
             if picture.has_focus() {
                 painter.rect_stroke(
                     rect,
-                    5.0,
+                    6.0,
                     Stroke::new(2.0, ui.visuals().selection.stroke.color),
                     egui::StrokeKind::Inside,
                 );
@@ -155,7 +168,7 @@ fn draw_row(
             widgets::scroll_on_focus(&picture);
             ui.vertical(|ui| {
                 ui.set_width(VALUE_WIDTH);
-                let value = RichText::new(&row.value).monospace();
+                let value = RichText::new(&row.value).monospace().strong();
                 ui.label(if active { value } else { value.weak() });
                 if let Some(text) = row.value_link {
                     // egui's text selection overwrites the link's assistive role.
@@ -190,7 +203,7 @@ fn draw_row(
 
 /// An on/off switch drawn in `rect`.
 fn switch(ui: &egui::Ui, rect: Rect, on: bool, hovered: bool) {
-    let track = Rect::from_center_size(rect.center(), Vec2::new(26.0, 14.0));
+    let track = Rect::from_center_size(rect.center(), Vec2::new(28.0, 16.0));
     let visuals = ui.visuals();
     let fill = if on {
         GREEN
@@ -198,18 +211,31 @@ fn switch(ui: &egui::Ui, rect: Rect, on: bool, hovered: bool) {
         visuals.widgets.inactive.bg_fill
     };
     let fill = if hovered {
-        fill.gamma_multiply(0.85)
+        fill.gamma_multiply(0.88)
     } else {
         fill
     };
-    ui.painter().rect_filled(track, 7.0, fill);
-    let knob = if on {
-        track.right() - 7.0
+    let border = if on {
+        GREEN
+    } else if hovered {
+        visuals.widgets.hovered.bg_stroke.color
     } else {
-        track.left() + 7.0
+        visuals.widgets.inactive.bg_stroke.color
+    };
+    ui.painter().rect(
+        track,
+        8.0,
+        fill,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    let knob = if on {
+        track.right() - 8.0
+    } else {
+        track.left() + 8.0
     };
     ui.painter()
-        .circle_filled(Pos2::new(knob, track.center().y), 5.0, Color32::WHITE);
+        .circle_filled(Pos2::new(knob, track.center().y), 5.5, Color32::WHITE);
 }
 
 /// x for history frame `i` of `len`, newest at the right edge.
@@ -221,6 +247,15 @@ fn frame_x(rect: Rect, i: usize, len: usize) -> f32 {
 /// y for a level in dBFS: the floor at the bottom, 0 dBFS at the top.
 fn level_y(rect: Rect, db: f32) -> f32 {
     rect.bottom() - ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * rect.height()
+}
+
+/// Faint studio gridlines inside dB scopes (-18 dB and -40 dB).
+fn db_grid(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(1.0, color.gamma_multiply(0.16));
+    for db in [-18.0, -40.0] {
+        let y = level_y(rect, db);
+        painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], stroke);
+    }
 }
 
 fn trace(
@@ -235,10 +270,50 @@ fn trace(
         .enumerate()
         .map(|(i, f)| Pos2::new(frame_x(rect, i, frames.len()), value(f)))
         .collect();
-    painter.add(Shape::line(points, Stroke::new(1.5, color)));
+    painter.add(Shape::line(points, Stroke::new(1.6, color)));
 }
 
-/// Shade the stretches of history where `when` holds.
+/// Fill the area between a trace and the bottom of `rect` using a single GPU
+/// triangle-strip `Mesh` (1 draw call, zero vertical seams between samples).
+fn area_fill(
+    painter: &egui::Painter,
+    rect: Rect,
+    frames: &[ScopeFrame],
+    value: impl Fn(&ScopeFrame) -> f32,
+    color: Color32,
+) {
+    let n = frames.len();
+    if n < 2 {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.reserve(n * 2);
+    mesh.indices.reserve((n - 1) * 6);
+    let bottom = rect.bottom();
+    let uv = egui::epaint::WHITE_UV;
+    for (i, f) in frames.iter().enumerate() {
+        let x = frame_x(rect, i, n);
+        let y = value(f);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(x, y),
+            uv,
+            color,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(x, bottom),
+            uv,
+            color: color.gamma_multiply(0.35),
+        });
+    }
+    for i in 0..(n - 1) as u32 {
+        let v = i * 2;
+        mesh.indices.extend_from_slice(&[v, v + 1, v + 2, v + 2, v + 1, v + 3]);
+    }
+    painter.add(Shape::mesh(mesh));
+}
+
+/// Shade contiguous stretches of history where `when` holds, merging adjacent
+/// frames into single rectangles so there are no vertical seams or draw bloat.
 fn shade(
     painter: &egui::Painter,
     rect: Rect,
@@ -247,14 +322,24 @@ fn shade(
     color: Color32,
 ) {
     let n = frames.len();
-    for (i, _) in frames.iter().enumerate().filter(|(_, f)| when(f)) {
-        let right = if i + 1 < n {
-            frame_x(rect, i + 1, n)
+    let mut i = 0;
+    while i < n {
+        if !when(&frames[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && when(&frames[i]) {
+            i += 1;
+        }
+        let left = frame_x(rect, start, n);
+        let right = if i < n {
+            frame_x(rect, i, n)
         } else {
             rect.right()
         };
         painter.rect_filled(
-            Rect::from_x_y_ranges(frame_x(rect, i, n)..=right, rect.y_range()),
+            Rect::from_x_y_ranges(left..=right, rect.y_range()),
             0.0,
             color,
         );
@@ -478,6 +563,7 @@ pub fn voice_rows(
         cursor: CursorIcon::ResizeVertical,
     };
     let input = draw_row(ui, &row, |p, r, _| {
+        db_grid(p, r, weak);
         // Near the top is too loud.
         p.rect_filled(
             Rect::from_x_y_ranges(r.x_range(), r.top()..=level_y(r, -6.0)),
@@ -485,6 +571,7 @@ pub fn voice_rows(
             RED.gamma_multiply(0.12),
         );
         if live {
+            area_fill(p, r, frames, |f| level_y(r, f.input_db), CYAN.gamma_multiply(0.16));
             trace(p, r, frames, |f| level_y(r, f.input_db), CYAN);
         } else {
             idle(p, r, "Start OpenMic to see your voice live", weak);
@@ -550,21 +637,16 @@ pub fn voice_rows(
         cursor: CursorIcon::ResizeHorizontal,
     };
     let input = draw_row(ui, &row, |p, r, _| {
+        db_grid(p, r, weak);
         if live {
-            // What came in, shaded; what went out, the line: the gap is the noise removed.
-            let n = frames.len();
-            for (i, f) in frames.iter().enumerate() {
-                let right = if i + 1 < n {
-                    frame_x(r, i + 1, n)
-                } else {
-                    r.right()
-                };
-                let band = Rect::from_x_y_ranges(
-                    frame_x(r, i, n)..=right,
-                    level_y(r, f.input_db)..=r.bottom(),
-                );
-                p.rect_filled(band, 0.0, CYAN.gamma_multiply(0.22));
-            }
+            // What came in, shaded smoothly; what went out, the line: the gap is the noise removed.
+            area_fill(
+                p,
+                r,
+                frames,
+                |f| level_y(r, f.input_db),
+                CYAN.gamma_multiply(0.28),
+            );
             trace(p, r, frames, |f| level_y(r, f.output_db), GREEN);
         } else {
             idle(
@@ -712,12 +794,14 @@ pub fn voice_rows(
         cursor: CursorIcon::ResizeVertical,
     };
     let input = draw_row(ui, &row, |p, r, _| {
+        db_grid(p, r, weak);
         p.rect_filled(
             Rect::from_x_y_ranges(r.x_range(), r.top()..=level_y(r, -6.0)),
             0.0,
             RED.gamma_multiply(0.12),
         );
         if live {
+            area_fill(p, r, frames, |f| level_y(r, f.output_db), GREEN.gamma_multiply(0.16));
             trace(p, r, frames, |f| level_y(r, f.output_db), GREEN);
         } else {
             idle(p, r, "what Discord hears, after everything above", weak);
@@ -752,15 +836,16 @@ pub fn voice_rows(
     let volume = s.monitor_volume;
     let input = draw_row(ui, &row, |p, r, _| {
         let bar = Rect::from_center_size(r.center(), Vec2::new(r.width(), 8.0));
-        p.rect_filled(bar, 4.0, weak.gamma_multiply(0.25));
+        p.rect_filled(bar, 4.0, weak.gamma_multiply(0.22));
+        let fill_right = bar.left() + bar.width() * volume;
         p.rect_filled(
-            Rect::from_min_max(
-                bar.min,
-                Pos2::new(bar.left() + bar.width() * volume, bar.bottom()),
-            ),
+            Rect::from_min_max(bar.min, Pos2::new(fill_right, bar.bottom())),
             4.0,
             CYAN,
         );
+        if volume > 0.0 {
+            p.circle_filled(Pos2::new(fill_right.clamp(bar.left() + 5.0, bar.right() - 5.0), bar.center().y), 5.0, Color32::WHITE);
+        }
     });
     if toggle(input.switched, &mut s.monitor) {
         changed.monitor = true;

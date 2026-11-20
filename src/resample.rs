@@ -1,8 +1,14 @@
 //! Streaming cubic-interpolation rate converter (48 kHz DSP core <-> native
 //! device rates), with a fine rate trim for clock-drift correction.
 
+/// Initial ring buffer capacity (power of two); grows up to [`MAX_CAPACITY`] on demand.
+const INITIAL_CAPACITY: usize = 2048;
+/// Hard ceiling on buffered source samples (power of two, ~1.36 s at 48 kHz).
+const MAX_CAPACITY: usize = 65_536;
+
 /// Converts samples pulled from a queue between two rates. Keeps a small
-/// backlog of unconsumed source samples plus a fractional read position.
+/// ring buffer of unconsumed source samples plus a fractional read position,
+/// avoiding allocations and `Vec::drain` shifts on the audio thread.
 pub struct Resampler {
     from: u32,
     to: u32,
@@ -11,11 +17,15 @@ pub struct Resampler {
     /// Multiplies the read step; >1 consumes source faster (fewer output
     /// samples). Only an adaptive resampler moves it off 1.0.
     trim: f64,
+    /// Power-of-two circular buffer.
     buf: Vec<f32>,
-    /// Read position in `buf`, in source-sample units. Interpolation reads
-    /// one sample behind it, so it never drops below 1.
+    /// Monotonic index of the oldest retained sample in `buf`.
+    head: usize,
+    /// Monotonic index one past the newest sample in `buf` (`tail - head <= buf.len()`).
+    tail: usize,
+    /// Read position relative to `head`, in source-sample units. Interpolation
+    /// reads one sample behind it, so it stays in `[1.0, 2.0)` after each pull.
     pos: f64,
-    max_backlog: usize,
 }
 
 impl Resampler {
@@ -36,10 +46,11 @@ impl Resampler {
             to,
             passthrough,
             trim: 1.0,
-            // One sample of history for the interpolator's first point.
-            buf: if passthrough { Vec::new() } else { vec![0.0] },
+            buf: vec![0.0; INITIAL_CAPACITY],
+            head: 0,
+            // One sample of zero history for the interpolator's first point.
+            tail: usize::from(!passthrough),
             pos: if passthrough { 0.0 } else { 1.0 },
-            max_backlog: 65_536,
         }
     }
 
@@ -52,59 +63,111 @@ impl Resampler {
         }
     }
 
-    pub fn push(&mut self, samples: &[f32]) {
-        self.buf.extend_from_slice(samples);
-
-        if self.buf.len() > self.max_backlog {
-            let history = if self.passthrough { 0 } else { 1 };
-            let consumed = (self.pos.floor() as usize).saturating_sub(history);
-            let drop = (self.buf.len() - 16_384).min(consumed);
-            self.buf.drain(..drop);
-            self.pos -= drop as f64;
+    fn grow_to(&mut self, needed: usize) {
+        let mut new_cap = self.buf.len();
+        while new_cap < needed && new_cap < MAX_CAPACITY {
+            new_cap *= 2;
         }
+        if new_cap == self.buf.len() {
+            return;
+        }
+        let count = self.tail - self.head;
+        let old_mask = self.buf.len() - 1;
+        let mut next = vec![0.0; new_cap];
+        let start = self.head & old_mask;
+        let first = count.min(self.buf.len() - start);
+        next[..first].copy_from_slice(&self.buf[start..start + first]);
+        if first < count {
+            next[first..count].copy_from_slice(&self.buf[..count - first]);
+        }
+        self.buf = next;
+        self.head = 0;
+        self.tail = count;
+    }
+
+    pub fn push(&mut self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let count = self.tail - self.head;
+        if count + samples.len() > self.buf.len() {
+            self.grow_to(count + samples.len());
+        }
+        let cap = self.buf.len();
+        // If a burst exceeds the hard ceiling, drop the oldest samples to fit.
+        let samples = if samples.len() >= cap {
+            self.head = 0;
+            self.tail = 0;
+            self.pos = if self.passthrough { 0.0 } else { 1.0 };
+            &samples[samples.len() - cap..]
+        } else {
+            let overflow = (self.tail - self.head + samples.len()).saturating_sub(cap);
+            if overflow > 0 {
+                let min_pos = if self.passthrough { 0.0 } else { 1.0 };
+                self.head += overflow;
+                self.pos = (self.pos - overflow as f64).max(min_pos);
+            }
+            samples
+        };
+        let mask = cap - 1;
+        let write = self.tail & mask;
+        let first = samples.len().min(cap - write);
+        self.buf[write..write + first].copy_from_slice(&samples[..first]);
+        if first < samples.len() {
+            self.buf[..samples.len() - first].copy_from_slice(&samples[first..]);
+        }
+        self.tail += samples.len();
     }
 
     /// Unconsumed source samples currently buffered.
     pub fn backlog(&self) -> usize {
-        self.buf.len().saturating_sub(self.pos.floor() as usize)
+        (self.tail - self.head).saturating_sub(self.pos.floor() as usize)
     }
 
     /// Fill `out` with as many converted samples as the backlog allows and
     /// return how many were written (0 = push more source and retry).
     /// Never consumes samples without emitting them.
     pub fn pull(&mut self, out: &mut [f32]) -> usize {
+        let count = self.tail - self.head;
+        let mask = self.buf.len() - 1;
         if self.passthrough {
-            let n = out.len().min(self.buf.len());
-            out[..n].copy_from_slice(&self.buf[..n]);
-            self.buf.drain(..n);
+            let n = out.len().min(count);
+            if n == 0 {
+                return 0;
+            }
+            let read = self.head & mask;
+            let first = n.min(self.buf.len() - read);
+            out[..first].copy_from_slice(&self.buf[read..read + first]);
+            if first < n {
+                out[first..n].copy_from_slice(&self.buf[..n - first]);
+            }
+            self.head += n;
             return n;
         }
         let step = f64::from(self.from) / f64::from(self.to) * self.trim;
         let mut n = 0;
+        let mut pos = self.pos;
+        let head = self.head;
+        let buf = &self.buf;
         while n < out.len() {
-            let i = self.pos.floor() as usize;
-            if i + 2 >= self.buf.len() {
+            let i = pos.floor() as usize;
+            if i + 2 >= count {
                 break;
             }
-            let t = (self.pos - i as f64) as f32;
-            let [y0, y1, y2, y3] = [
-                self.buf[i - 1],
-                self.buf[i],
-                self.buf[i + 1],
-                self.buf[i + 2],
-            ];
+            let t = (pos - i as f64) as f32;
+            let base = head + i;
+            let y0 = buf[(base - 1) & mask];
+            let y1 = buf[base & mask];
+            let y2 = buf[(base + 1) & mask];
+            let y3 = buf[(base + 2) & mask];
             out[n] = hermite(y0, y1, y2, y3, t);
-            self.pos += step;
+            pos += step;
             n += 1;
         }
-        // Release consumed samples, keeping one behind the read position.
-        let keep_from = (self.pos.floor() as usize)
-            .saturating_sub(1)
-            .min(self.buf.len());
-        if keep_from > 4096 {
-            self.buf.drain(..keep_from);
-            self.pos -= keep_from as f64;
-        }
+        // Release consumed samples immediately, keeping one behind `pos`.
+        let advance = (pos.floor() as usize).saturating_sub(1).min(count);
+        self.head += advance;
+        self.pos = pos - advance as f64;
         n
     }
 }
@@ -262,5 +325,28 @@ mod tests {
         let rms = (body.iter().map(|s| s * s).sum::<f32>() / body.len() as f32).sqrt();
         let gain = rms / std::f32::consts::FRAC_1_SQRT_2;
         assert!((0.85..0.92).contains(&gain), "gain {gain}");
+    }
+
+    #[test]
+    fn ring_buffer_wraps_cleanly_without_reallocating() {
+        let mut r = Resampler::adaptive(44_100, 48_000);
+        let initial_cap = r.buf.len();
+        let mut out = [0.0f32; 480];
+        let mut emitted = 0usize;
+        for _ in 0..50 {
+            r.push(&[0.4; 441]);
+            while let n @ 1.. = r.pull(&mut out) {
+                if emitted > 10 {
+                    assert!(out[..n].iter().all(|&s| (s - 0.4).abs() < 1e-5));
+                }
+                emitted += n;
+            }
+        }
+        assert!(emitted > 23_000, "emitted {emitted}");
+        assert_eq!(
+            r.buf.len(),
+            initial_cap,
+            "steady-state streaming should never reallocate the ring buffer"
+        );
     }
 }

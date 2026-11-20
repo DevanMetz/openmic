@@ -95,6 +95,36 @@ impl Hotkeys {
         })
     }
 
+    /// Fast zero-allocation check for whether `expected` matches the currently
+    /// registered bindings in order, so the GUI tick avoids allocating a `Vec`
+    /// of cloned `String`/`PathBuf` pairs on every frame.
+    pub fn matches<'a>(
+        &self,
+        expected: impl IntoIterator<Item = (&'a str, Option<&'a std::path::Path>, u8)>,
+    ) -> bool {
+        let mut iter = expected.into_iter();
+        for (key, cmd) in &self.bindings {
+            let Some((exp_key, exp_path, exp_tag)) = iter.next() else {
+                return false;
+            };
+            if key != exp_key {
+                return false;
+            }
+            let same_cmd = match (cmd, exp_tag, exp_path) {
+                (Command::ToggleMute, 0, None)
+                | (Command::ToggleBypass, 1, None)
+                | (Command::StopClips, 2, None)
+                | (Command::Dictate, 3, None) => true,
+                (Command::PlayPad(path), 4, Some(exp)) => path.as_path() == exp,
+                _ => false,
+            };
+            if !same_cmd {
+                return false;
+            }
+        }
+        iter.next().is_none()
+    }
+
     /// Register exactly `bindings` (if they changed since the last call).
     /// Returns the shortcuts the system refused, usually because another app
     /// already owns them. A Wayland portal refusal arrives later and is only

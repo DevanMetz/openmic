@@ -176,7 +176,20 @@ impl App {
         let mut controls = Vec::new();
         ui.scope_builder(egui::UiBuilder::new().id(id), |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(label).weak());
+                let target_w = if label == "Shortcut" {
+                    64.0
+                } else {
+                    124.0
+                };
+                let label_w = ui.available_width().min(target_w);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(label_w, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_width(label_w);
+                        ui.label(RichText::new(label).weak());
+                    },
+                );
                 let value = if waiting {
                     "Press keys…"
                 } else {
@@ -184,17 +197,37 @@ impl App {
                 };
                 let text = if waiting {
                     RichText::new(value).color(widgets::text_color(ui, CYAN))
+                } else if current.is_some() {
+                    RichText::new(value).monospace().strong()
                 } else {
-                    RichText::new(value).monospace()
+                    RichText::new(value).monospace().weak()
                 };
-                ui.add_sized(
-                    [
-                        ui.max_rect().width().min(150.0),
-                        ui.spacing().interact_size.y,
-                    ],
-                    egui::Label::new(text).truncate(),
-                )
-                .on_hover_text(value);
+                let pill_w = ui.max_rect().width().min(144.0);
+                let inner_w = (pill_w - 16.0).max(40.0);
+                let dark = ui.visuals().dark_mode;
+                egui::Frame::new()
+                    .fill(if waiting {
+                        CYAN.gamma_multiply(0.12)
+                    } else {
+                        ui.visuals().extreme_bg_color
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if waiting {
+                            CYAN.gamma_multiply(0.6)
+                        } else {
+                            widgets::hairline(dark)
+                        },
+                    ))
+                    .corner_radius(6)
+                    .inner_margin(egui::Margin::symmetric(8, 2))
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [inner_w, ui.spacing().interact_size.y - 2.0],
+                            egui::Label::new(text).truncate(),
+                        )
+                        .on_hover_text(value);
+                    });
                 let edit = ui
                     .add_enabled(
                         waiting || available,
@@ -269,31 +302,42 @@ impl App {
     /// Speech to text: the model, how the shortcut works, and the result.
     pub(super) fn draw_dictation_page(&mut self, ui: &mut egui::Ui) {
         let current = self.settings.hotkeys.dictate.clone();
-        self.draw_shortcut_row(
-            ui,
-            Binding::Dictate,
-            "Shortcut",
-            current.as_deref(),
-            self.hotkeys.is_some(),
-        );
-        if (self.capturing.as_ref() == Some(&Binding::Dictate) || self.hotkeys.is_none())
-            && !self.hotkey_status.0.is_empty()
-        {
-            ui.label(
-                RichText::new(&self.hotkey_status.0)
-                    .color(widgets::text_color(ui, self.hotkey_status.1)),
-            );
-        }
-        if self.capturing.is_none()
-            && let Some(shortcut) = &self.settings.hotkeys.dictate
-            && let Some(hotkeys) = &self.hotkeys
-            && hotkeys.was_refused(shortcut, &Command::Dictate)
-        {
-            ui.colored_label(
-                widgets::text_color(ui, AMBER),
-                "This shortcut is unavailable. Choose another combination.",
-            );
-        }
+        let dark = ui.visuals().dark_mode;
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(egui::Stroke::new(1.0, widgets::hairline(dark)))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(12, 7))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.draw_shortcut_row(
+                    ui,
+                    Binding::Dictate,
+                    "Shortcut",
+                    current.as_deref(),
+                    self.hotkeys.is_some(),
+                );
+                if (self.capturing.as_ref() == Some(&Binding::Dictate) || self.hotkeys.is_none())
+                    && !self.hotkey_status.0.is_empty()
+                {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(&self.hotkey_status.0)
+                            .color(widgets::text_color(ui, self.hotkey_status.1)),
+                    );
+                }
+                if self.capturing.is_none()
+                    && let Some(shortcut) = &self.settings.hotkeys.dictate
+                    && let Some(hotkeys) = &self.hotkeys
+                    && hotkeys.was_refused(shortcut, &Command::Dictate)
+                {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        widgets::text_color(ui, AMBER),
+                        "This shortcut is unavailable. Choose another combination.",
+                    );
+                }
+            });
         ui.add_space(8.0);
         // Shortcut warnings must not change the speech controls' identities.
         ui.scope_builder(

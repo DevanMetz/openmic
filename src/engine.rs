@@ -768,8 +768,16 @@ impl Engine {
     }
 
     /// Progress, paused state, and loaded durations from one mixer snapshot.
+    #[cfg(test)]
     pub fn clip_progress(&self) -> Vec<ClipProgress> {
         self.mixer.lock().progress()
+    }
+
+    /// Progress, paused state, and loaded durations from one mixer snapshot,
+    /// reusing `dst` to avoid per-frame allocations on the UI thread.
+    pub fn clip_progress_into(&self, dst: &mut Vec<ClipProgress>) {
+        dst.clear();
+        self.mixer.lock().progress_into(dst);
     }
 
     /// Playing and paused clips at their playheads (route-switch handoff).
@@ -781,9 +789,14 @@ impl Engine {
         self.mixer.lock().resume(clips);
     }
 
-    /// The last few seconds of processing, oldest first.
-    pub fn scope(&self) -> Vec<ScopeFrame> {
-        self.stats.history.lock().iter().copied().collect()
+    /// Copy the last few seconds of processing, oldest first, into `dst`
+    /// without reallocating on every GUI frame.
+    pub fn scope_into(&self, dst: &mut Vec<ScopeFrame>) {
+        dst.clear();
+        let history = self.stats.history.lock();
+        let (front, back) = history.as_slices();
+        dst.extend_from_slice(front);
+        dst.extend_from_slice(back);
     }
 
     pub fn stats(&self) -> StatsSnapshot {
@@ -880,21 +893,22 @@ fn process_loop(
             });
         }
 
-        // Feed the input resampler until it yields a full 48 kHz frame.
+        // Feed the input resampler in batches until it yields a full 48 kHz frame.
         let mut x = [0.0f32; FRAME];
         let mut filled = 0usize;
         while filled < FRAME {
             filled += in_res.pull(&mut x[filled..]);
             if filled < FRAME {
-                let mut moved = false;
-                while let Some(s) = mic_q.pop() {
-                    in_res.push(&[s]);
-                    moved = true;
-                    if in_res.backlog() >= per_frame {
-                        break;
-                    }
+                let want = per_frame.saturating_sub(in_res.backlog()).clamp(1, FRAME);
+                let mut n = 0usize;
+                while n < want {
+                    let Some(s) = mic_q.pop() else { break };
+                    scratch[n] = s;
+                    n += 1;
                 }
-                if !moved {
+                if n > 0 {
+                    in_res.push(&scratch[..n]);
+                } else {
                     // The mic callback unparks us; the timeout only guards shutdown.
                     thread::park_timeout(Duration::from_millis(20));
                     if stop.load(Ordering::Relaxed) {

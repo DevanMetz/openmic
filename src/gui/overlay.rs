@@ -179,17 +179,24 @@ impl App {
 
     /// Switch to the next preset (built-in, then saved), wrapping around.
     pub(super) fn next_preset(&mut self) {
-        let presets: Vec<config::Preset> = config::builtin_presets()
-            .into_iter()
-            .chain(self.settings.presets.iter().cloned())
-            .collect();
+        let builtins = config::builtin_presets();
+        let total = builtins.len() + self.settings.presets.len();
+        if total == 0 {
+            return;
+        }
         let current = self.settings.processing();
-        let next = presets
+        let next = builtins
             .iter()
+            .chain(&self.settings.presets)
             .position(|p| p.processing == current)
-            .map_or(0, |i| (i + 1) % presets.len());
-        if let Some(preset) = presets.get(next) {
-            self.settings.apply_processing(&preset.processing);
+            .map_or(0, |i| (i + 1) % total);
+        let processing = builtins
+            .iter()
+            .chain(&self.settings.presets)
+            .nth(next)
+            .map(|p| p.processing.clone());
+        if let Some(processing) = processing {
+            self.settings.apply_processing(&processing);
             self.apply_live();
         }
     }
@@ -418,11 +425,12 @@ pub(super) fn draw(ui: &mut egui::Ui, meter: Meter, strip: &Strip) -> Vec<Action
     let mut actions = Vec::new();
     let rect = ui.max_rect();
     let visuals = ui.visuals().clone();
+    let dark = visuals.dark_mode;
     ui.painter().rect(
         rect,
         CornerRadius::ZERO,
-        visuals.panel_fill,
-        Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+        crate::widgets::sidebar_fill(dark),
+        Stroke::new(1.0, crate::widgets::hairline(dark)),
         StrokeKind::Inside,
     );
 
@@ -786,14 +794,20 @@ fn pad_button(
     overflowing: bool,
     position: (f32, f32, f32),
 ) -> Option<Action> {
-    let mut button = egui::Button::new(egui::RichText::new(label).font(label_font())).truncate();
+    let mut button = egui::Button::new(egui::RichText::new(label).font(label_font()))
+        .corner_radius(CornerRadius::same(6))
+        .truncate();
     if pad.loading {
-        button = button.fill(super::CYAN.gamma_multiply(0.35));
+        button = button
+            .fill(super::CYAN.gamma_multiply(0.28))
+            .stroke(Stroke::new(1.0, super::CYAN.gamma_multiply(0.75)));
     } else if pad.playing {
-        button = button.fill(GREEN.gamma_multiply(0.35));
+        button = button
+            .fill(GREEN.gamma_multiply(0.28))
+            .stroke(Stroke::new(1.0, GREEN.gamma_multiply(0.75)));
     } else if pad.paused {
         button = button
-            .fill(AMBER.gamma_multiply(0.25))
+            .fill(AMBER.gamma_multiply(0.22))
             .stroke(Stroke::new(1.0, AMBER));
     } else if pad.failed() {
         button = button

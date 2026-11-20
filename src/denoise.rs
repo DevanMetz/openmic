@@ -100,16 +100,22 @@ impl Cleaner {
         }
 
         // RNNoise operates on int16-scaled samples, on its own copy.
-        let mut rnn_out = dry.map(|s| s * 32768.0);
+        let mut rnn_out = [0.0f32; FRAME];
+        for (dst, &src) in rnn_out.iter_mut().zip(&dry) {
+            *dst = src * 32768.0;
+        }
         let prob = self.rnn.process_frame(&mut rnn_out);
+        const INV_I16_SCALE: f32 = 1.0 / 32768.0;
         for s in &mut rnn_out {
-            *s /= 32768.0;
+            *s *= INV_I16_SCALE;
         }
         let rnn_dry = self.dry_history[0];
         self.dry_history.rotate_left(1);
         self.dry_history[RNNOISE_DELAY_FRAMES - 1] = dry;
 
-        let deep_out = if p.model == Model::DeepFilter {
+        // Skip DeepFilterNet inference while bypassed or muted: its output
+        // would be discarded, while RNNoise stays active for live VAD feedback.
+        let deep_out = if p.model == Model::DeepFilter && !p.bypass && !p.mute {
             self.deep_filter(&dry, p.strength)
         } else {
             None
@@ -501,6 +507,51 @@ mod tests {
         assert!(
             cleaner.deep_filter(&[0.0; FRAME], 1.0).is_none(),
             "keep fallback stable without spawning another worker"
+        );
+    }
+
+    #[test]
+    fn bypass_and_mute_skip_deepfilter_inference() {
+        let (requests, request_rx) = crossbeam_channel::bounded(2);
+        let (_reply_tx, replies) = crossbeam_channel::bounded(2);
+        let mut cleaner = Cleaner::new();
+        cleaner.deep = Some(DeepFilterWorker {
+            requests,
+            replies,
+            seq: 0,
+            ready: true,
+        });
+
+        let (bypassed, _) = cleaner.process(
+            &[0.25; FRAME],
+            &Params {
+                model: Model::DeepFilter,
+                bypass: true,
+                highpass: false,
+                voice_gate: false,
+                ..Params::default()
+            },
+        );
+        assert!(bypassed.iter().all(|&s| (s - 0.25).abs() < 1e-6));
+        assert!(
+            request_rx.try_recv().is_err(),
+            "bypass must not invoke DeepFilterNet"
+        );
+
+        let (muted, _) = cleaner.process(
+            &[0.25; FRAME],
+            &Params {
+                model: Model::DeepFilter,
+                mute: true,
+                highpass: false,
+                voice_gate: false,
+                ..Params::default()
+            },
+        );
+        assert!(muted.iter().all(|&s| s == 0.0));
+        assert!(
+            request_rx.try_recv().is_err(),
+            "mute must not invoke DeepFilterNet"
         );
     }
 

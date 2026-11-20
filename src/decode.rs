@@ -84,6 +84,13 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
         .context("create audio decoder")?;
 
     let mut mono: Vec<f32> = Vec::new();
+    if let Some(frames) = track.codec_params.n_frames
+        && let Ok(cap) = usize::try_from(frames)
+    {
+        // Best-effort preallocation; cap to avoid trusting bogus huge headers.
+        let _ = mono.try_reserve(cap.min(crate::dsp::SR as usize * 600));
+    }
+    let mut scratch: Option<(usize, symphonia::core::audio::SignalSpec, SampleBuffer<f32>)> = None;
     let mut rate = 0u32;
     loop {
         check_cancelled(cancel)?;
@@ -105,7 +112,7 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
                 } else if spec.rate != rate {
                     bail!("audio sample rate changes within the file");
                 }
-                append_mono(&mut mono, decoded)?;
+                append_mono_with_scratch(&mut mono, decoded, &mut scratch)?;
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(e).context("decode audio packet"),
@@ -116,21 +123,39 @@ pub fn load_clip_cancellable(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32
         bail!("audio file is empty");
     }
 
-    resample_linear(mono, rate, crate::dsp::SR, cancel)
+    resample_cubic(mono, rate, crate::dsp::SR, cancel)
 }
 
+#[cfg(test)]
 fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) -> Result<()> {
+    let mut scratch = None;
+    append_mono_with_scratch(mono, decoded, &mut scratch)
+}
+
+fn append_mono_with_scratch(
+    mono: &mut Vec<f32>,
+    decoded: AudioBufferRef<'_>,
+    scratch: &mut Option<(usize, symphonia::core::audio::SignalSpec, SampleBuffer<f32>)>,
+) -> Result<()> {
     let spec = *decoded.spec();
     let channels = spec.channels.count();
     if channels == 0 {
         bail!("audio track has no channels");
     }
     // Packet duration is in container time-base ticks, which need not equal
-    // decoded frames. Size the buffer using the decoder's actual output.
-    let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+    // decoded frames. Reuse the sample buffer across packets of the same spec.
+    let capacity = decoded.capacity();
+    let needs_new = scratch
+        .as_ref()
+        .is_none_or(|(cap, prev_spec, _)| *cap < capacity || *prev_spec != spec);
+    if needs_new {
+        *scratch = Some((capacity, spec, SampleBuffer::<f32>::new(capacity as u64, spec)));
+    }
+    let (_, _, buf) = scratch.as_mut().expect("initialized above");
     buf.copy_interleaved_ref(decoded);
     mono.try_reserve(buf.samples().len() / channels)
         .context("not enough memory to load this clip")?;
+    let inv_channels = 1.0 / channels as f64;
     mono.extend(buf.samples().chunks_exact(channels).map(|frame| {
         // Float WAVs can contain non-finite or over-range samples. Silence
         // invalid channels before interpolation spreads them, and accumulate
@@ -140,15 +165,14 @@ fn append_mono(mono: &mut Vec<f32>, decoded: AudioBufferRef<'_>) -> Result<()> {
             .filter(|s| s.is_finite())
             .map(|&s| f64::from(s))
             .sum();
-        (sum / channels as f64).clamp(-1.0, 1.0) as f32
+        (sum * inv_channels).clamp(-1.0, 1.0) as f32
     }));
     Ok(())
 }
 
-/// Naive linear interpolation resampler (matches the Python np.interp approach).
-// ponytail: linear interp aliases on big downshifts; use symphonia's resampler
-// or rubato if long-form/high-rate clips ever sound dull.
-fn resample_linear(input: Vec<f32>, from: u32, to: u32, cancel: &AtomicBool) -> Result<Vec<f32>> {
+/// Catmull-Rom cubic Hermite resampler (matches the realtime streaming core
+/// and preserves high-frequency detail better than linear interpolation).
+fn resample_cubic(input: Vec<f32>, from: u32, to: u32, cancel: &AtomicBool) -> Result<Vec<f32>> {
     check_cancelled(cancel)?;
     if input.is_empty() || from == to {
         // Most recordings already use the DSP rate. Keep their allocation
@@ -166,10 +190,13 @@ fn resample_linear(input: Vec<f32>, from: u32, to: u32, cancel: &AtomicBool) -> 
         check_cancelled(cancel)?;
         output.extend((start..n.min(start.saturating_add(4096))).map(|i| {
             let pos = i as f64 * ratio;
-            let i0 = (pos.floor() as usize).min(last);
-            let i1 = (i0 + 1).min(last);
-            let frac = (pos - i0 as f64) as f32;
-            input[i0] * (1.0 - frac) + input[i1] * frac
+            let i1 = (pos.floor() as usize).min(last);
+            let i0 = i1.saturating_sub(1);
+            let i2 = (i1 + 1).min(last);
+            let i3 = (i1 + 2).min(last);
+            let frac = (pos - i1 as f64) as f32;
+            crate::resample::hermite(input[i0], input[i1], input[i2], input[i3], frac)
+                .clamp(-1.0, 1.0)
         }));
     }
     Ok(output)
@@ -331,7 +358,7 @@ mod tests {
     #[test]
     fn resample_preserves_constant_and_length() {
         let input = vec![0.5f32; 2400];
-        let out = resample_linear(input, 24_000, 48_000, &AtomicBool::new(false)).unwrap();
+        let out = resample_cubic(input, 24_000, 48_000, &AtomicBool::new(false)).unwrap();
         assert_eq!(out.len(), 4800);
         assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
@@ -340,7 +367,7 @@ mod tests {
     fn cancellation_after_decoding_never_returns_partial_resampled_audio() {
         for rate in [24_000, 48_000, 96_000] {
             let result =
-                resample_linear(vec![0.5; 100], rate, crate::dsp::SR, &AtomicBool::new(true));
+                resample_cubic(vec![0.5; 100], rate, crate::dsp::SR, &AtomicBool::new(true));
             assert_eq!(result.unwrap_err().to_string(), "clip import cancelled");
         }
     }

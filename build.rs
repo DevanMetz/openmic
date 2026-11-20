@@ -7,30 +7,65 @@
 #[path = "src/icon.rs"]
 mod icon;
 
-fn main() {
+fn rnnoise_base_build() -> cc::Build {
     let mut build = cc::Build::new();
     // MSVC can't compile the VLAs in pitch.c; clang (e.g. the one shipped
     // with ROCm) targets the same MSVC ABI and accepts them.
     build.compiler("clang");
     build
+        .opt_level(3)
         .define("_USE_MATH_DEFINES", None)
         .include("vendor/rnnoise/src")
         .include("vendor/rnnoise/include")
-        .files([
-            "vendor/rnnoise/src/celt_lpc.c",
-            "vendor/rnnoise/src/denoise.c",
-            "vendor/rnnoise/src/kiss_fft.c",
-            "vendor/rnnoise/src/parse_lpcnet_weights.c",
-            "vendor/rnnoise/src/pitch.c",
-            "vendor/rnnoise/src/rnn.c",
-            "vendor/rnnoise/src/rnnoise_data.c",
-            "vendor/rnnoise/src/rnnoise_tables.c",
-            "vendor/rnnoise/src/nnet.c",
-            "vendor/rnnoise/src/nnet_default.c",
-        ])
         .warnings(false)
         .flag("-Wno-everything");
+    build
+}
+
+fn main() {
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let x86_rtcd = matches!(target_arch.as_str(), "x86" | "x86_64");
+
+    let mut build = rnnoise_base_build();
+    build.files([
+        "vendor/rnnoise/src/celt_lpc.c",
+        "vendor/rnnoise/src/denoise.c",
+        "vendor/rnnoise/src/kiss_fft.c",
+        "vendor/rnnoise/src/parse_lpcnet_weights.c",
+        "vendor/rnnoise/src/pitch.c",
+        "vendor/rnnoise/src/rnn.c",
+        "vendor/rnnoise/src/rnnoise_data.c",
+        "vendor/rnnoise/src/rnnoise_tables.c",
+        "vendor/rnnoise/src/nnet.c",
+        "vendor/rnnoise/src/nnet_default.c",
+    ]);
+    if x86_rtcd {
+        build
+            .define("RNN_ENABLE_X86_RTCD", None)
+            .define("CPU_INFO_BY_C", None)
+            .files([
+                "vendor/rnnoise/src/x86/x86cpu.c",
+                "vendor/rnnoise/src/x86/x86_dnn_map.c",
+            ]);
+    }
     build.compile("rnnoise");
+
+    if x86_rtcd {
+        rnnoise_base_build()
+            .define("RNN_ENABLE_X86_RTCD", None)
+            .define("OPUS_X86_MAY_HAVE_SSE4_1", None)
+            .flag("-msse4.1")
+            .file("vendor/rnnoise/src/x86/nnet_sse4_1.c")
+            .compile("rnnoise_sse4_1");
+
+        rnnoise_base_build()
+            .define("RNN_ENABLE_X86_RTCD", None)
+            .define("OPUS_X86_MAY_HAVE_AVX2", None)
+            .flag("-mavx2")
+            .flag("-mfma")
+            .file("vendor/rnnoise/src/x86/nnet_avx2.c")
+            .compile("rnnoise_avx2");
+    }
     println!("cargo:rerun-if-changed=vendor/rnnoise/src");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

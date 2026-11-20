@@ -794,7 +794,13 @@ impl App {
             },
             |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Source").weak());
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(54.0, ui.spacing().interact_size.y),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(RichText::new("Source").weak());
+                        },
+                    );
                     ui.add_enabled_ui(!active && !take_ready, |ui| {
                         let microphone = ui.selectable_value(
                             &mut self.record_source,
@@ -813,7 +819,13 @@ impl App {
                     });
                 });
                 ui.horizontal(|ui| {
-                    let device = ui.label(RichText::new("Device").weak());
+                    let device = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(54.0, ui.spacing().interact_size.y),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.label(RichText::new("Device").weak()),
+                        )
+                        .inner;
                     let recorded_device = self
                         .recorder
                         .as_ref()
@@ -821,11 +833,8 @@ impl App {
                         .or_else(|| self.take.as_ref().map(|take| take.device_name()));
                     match (self.record_source, recorded_device) {
                         (_, Some(name)) => {
-                            ui.add_sized(
-                                [ui.available_width().min(520.0), 18.0],
-                                egui::Label::new(name).truncate(),
-                            )
-                            .on_hover_text(name);
+                            ui.add(egui::Label::new(name).truncate())
+                                .on_hover_text(name);
                         }
                         (Source::Microphone, None) => {
                             let name = if self.settings.microphone.is_empty() {
@@ -833,10 +842,8 @@ impl App {
                             } else {
                                 &self.settings.microphone
                             };
-                            ui.add_sized(
-                                [ui.available_width().min(520.0), 18.0],
-                                egui::Label::new(name).truncate(),
-                            );
+                            ui.add(egui::Label::new(name).truncate())
+                                .on_hover_text(name);
                         }
                         (Source::Computer, None) => {
                             let label = if self.record_output.is_empty() {
@@ -1125,6 +1132,7 @@ impl App {
             .id_salt("pad-menu-scroll")
             .min_scrolled_height(max_height)
             .max_height(max_height)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
                 self.pad_menu_contents(ui, index, remove, focus_volume);
                 let layout_id = ui.make_persistent_id("pad-menu-layout");
@@ -1504,6 +1512,8 @@ impl App {
     }
 
     pub(super) fn draw_sound_tab(&mut self, ui: &mut egui::Ui) {
+        let page_top = ui.cursor().top();
+        let viewport_h = ui.clip_rect().height();
         let focus_to_reveal = ui
             .data_mut(|data| {
                 let id = egui::Id::new("soundboard-focus-reveal");
@@ -1583,7 +1593,175 @@ impl App {
                 ),
             );
         }
-        ui.add_space(12.0);
+        ui.add_space(6.0);
+
+        let playing: Vec<String> = self
+            .settings
+            .sounds
+            .iter()
+            .filter(|pad| self.playing.contains(&clip_key(&pad.path)))
+            .map(Pad::display_name)
+            .collect();
+        let engine_running = self.engine.is_some();
+        let loading = self.has_pending_playback();
+        let waiting_for_device = self.waiting_for_device;
+        let paused = self.pad_progress.len().saturating_sub(playing.len());
+        let title = match playing.len() {
+            0 if self.settings.sounds.is_empty() => "Add a clip to get started".to_owned(),
+            0 if loading => "Loading audio…".to_owned(),
+            0 if paused == 1 => "1 clip paused".to_owned(),
+            0 if paused > 1 => format!("{paused} clips paused"),
+            0 => "Choose a pad below".to_owned(),
+            1 => playing[0].clone(),
+            n => format!("{n} clips playing"),
+        };
+        // Header status changes must not replace focused playback controls.
+        ui.scope_builder(
+            egui::UiBuilder::new().id(egui::Id::new("soundboard-playback")),
+            |ui| {
+                let width_id = ui.id().with("width");
+                let width = ui.available_width();
+                let reflowed = ui.data_mut(|data| {
+                    let previous = data.get_temp::<f32>(width_id);
+                    data.insert_temp(width_id, width);
+                    previous.is_some_and(|previous| previous != width)
+                });
+                widgets::card(
+                    ui,
+                    "PLAYBACK",
+                    VIOLET,
+                    |ui| {
+                        if !playing.is_empty() {
+                            widgets::badge(ui, "Playing", GREEN);
+                        } else if loading {
+                            widgets::badge(ui, "Loading", CYAN);
+                        } else if paused > 0 {
+                            widgets::badge(ui, "Paused", AMBER);
+                        } else if engine_running {
+                            widgets::badge(ui, "Ready", GREEN);
+                        } else if waiting_for_device {
+                            widgets::badge(ui, "Waiting for device", AMBER);
+                        } else {
+                            widgets::badge(ui, "OpenMic stopped", AMBER);
+                        }
+                    },
+                    |ui| {
+                        let stop = ui
+                            .horizontal_wrapped(|ui| {
+                                let title_width = (ui.available_width() - 115.0).max(140.0);
+                                ui.vertical(|ui| {
+                                    ui.set_max_width(title_width);
+                                    ui.add(
+                                        egui::Label::new(RichText::new(title).size(15.0).strong())
+                                            .truncate(),
+                                    );
+                                    let (subtitle, subtitle_color) =
+                                        if self.sound_status.0 != "Ready"
+                                            && !self.sound_status.0.starts_with("Playing ·")
+                                        {
+                                            (
+                                                self.sound_status.0.as_str(),
+                                                widgets::text_color(ui, self.sound_status.1),
+                                            )
+                                        } else if self.settings.sounds.is_empty() {
+                                            (
+                                                "WAV, FLAC, OGG, MP3, and AIFF supported",
+                                                ui.visuals().weak_text_color(),
+                                            )
+                                        } else if loading {
+                                            (
+                                                "Click a loading pad to cancel.",
+                                                ui.visuals().weak_text_color(),
+                                            )
+                                        } else {
+                                            (
+                                                "Clips mix directly into your virtual microphone.",
+                                                ui.visuals().weak_text_color(),
+                                            )
+                                        };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(subtitle).color(subtitle_color),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let response = ui.add_enabled(
+                                            !self.pad_progress.is_empty() || loading,
+                                            egui::Button::new("Stop clips"),
+                                        );
+                                        if response.clicked() {
+                                            self.stop_clips();
+                                        }
+                                        response
+                                    },
+                                )
+                                .inner
+                            })
+                            .inner;
+                        ui.add_space(4.0);
+                        let volume = ui
+                            .horizontal_wrapped(|ui| {
+                                let label = ui.label("Clip volume");
+                                let original = self.settings.sound_volume;
+                                let response = volume_slider(ui, &mut self.settings.sound_volume)
+                                    .labelled_by(label.id);
+                                if self.settings.sound_volume != original {
+                                    self.apply_live();
+                                }
+                                ui.weak("Clips only");
+                                response
+                            })
+                            .inner;
+                        let (hear_clips, overlap) = ui
+                            .horizontal_wrapped(|ui| {
+                                let hear_clips = ui
+                                    .checkbox(&mut self.settings.monitor_clips, "Hear soundboard")
+                                    .on_hover_text("Play clips through the monitor output selected on the Voice page. Monitor volume also applies.");
+                                if hear_clips.changed() {
+                                    self.apply_live();
+                                    if self.settings.monitor_clips
+                                        && self
+                                            .engine
+                                            .as_ref()
+                                            .is_some_and(|engine| !engine.has_monitor())
+                                    {
+                                        self.restart_engine();
+                                    }
+                                }
+                                ui.add_space(8.0);
+                                let overlap = ui
+                                    .checkbox(&mut self.settings.overlap_clips, "Let clips overlap")
+                                    .on_hover_text(
+                                        "Play pads over each other instead of replacing the current clip",
+                                    );
+                                if overlap.changed() {
+                                    self.touch();
+                                }
+                                (hear_clips, overlap)
+                            })
+                            .inner;
+                        for response in [&stop, &volume, &hear_clips, &overlap] {
+                            if reflowed
+                                && response.has_focus()
+                                && ui.input(|input| {
+                                    !input.pointer.any_down() && !input.pointer.any_released()
+                                })
+                            {
+                                response.scroll_to_me(Some(egui::Align::Center));
+                            } else {
+                                widgets::scroll_on_focus(response);
+                            }
+                        }
+                    },
+                );
+            },
+        );
+
+        ui.add_space(8.0);
 
         let sounds = self.settings.sounds.clone();
         let mut add_header = None;
@@ -1608,13 +1786,16 @@ impl App {
             },
             |ui| {
                 if sounds.is_empty() {
+                    let remaining = (viewport_h - (ui.cursor().top() - page_top) - 20.0).max(150.0);
+                    let empty_content_h = 112.0;
+                    let pad_y = ((remaining - empty_content_h - 36.0) * 0.5).max(16.0);
                     egui::Frame::new()
                         .fill(CYAN.gamma_multiply(0.08))
                         .corner_radius(8)
                         .inner_margin(egui::Margin::same(18))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.add_space(22.0);
+                            ui.add_space(pad_y);
                             ui.vertical_centered(|ui| {
                                 ui.label(RichText::new("No clips yet").size(17.0).strong());
                                 ui.weak("Drop audio files here, or choose a few below.");
@@ -1628,7 +1809,7 @@ impl App {
                                 ui.add_space(6.0);
                                 ui.weak("WAV, FLAC, OGG, MP3, and AIFF");
                             });
-                            ui.add_space(22.0);
+                            ui.add_space(pad_y);
                         });
                 } else {
                     ui.horizontal_wrapped(|ui| {
@@ -1664,18 +1845,22 @@ impl App {
                     }
                     let mut moved = None;
                     let mut reveal_grid = false;
-                    // Leave room for one full pad and its keyboard focus outline.
+                    // Fill the remaining window height (keeping room for at least one full pad on tiny windows).
+                    let pads_height =
+                        (viewport_h - (ui.cursor().top() - page_top) - 16.0).max(124.0);
                     let pads = ScrollArea::vertical()
                         .id_salt("sound_pads")
-                        .min_scrolled_height(124.0)
-                        .max_height((ui.clip_rect().height() - 16.0).clamp(124.0, 258.0))
+                        .min_scrolled_height(pads_height)
+                        .max_height(pads_height)
+                        .auto_shrink([false; 2])
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             let gap = 8.0;
                             ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
                             // Keep a readable name beside the play and remove controls.
                             let columns = ((ui.available_width() + gap) / (150.0 + gap))
                                 .floor()
-                                .clamp(1.0, 3.0) as usize;
+                                .clamp(1.0, 6.0) as usize;
                             let width = (ui.available_width() - (columns - 1) as f32 * gap)
                                 / columns as f32;
                             for (row_number, row) in shown.chunks(columns).enumerate() {
@@ -1729,6 +1914,7 @@ impl App {
                                         if reveal.as_deref() == Some(pad.path.as_path()) {
                                             play.scroll_to_me(Some(egui::Align::Center));
                                             play.request_focus();
+                                            reveal_grid = true;
                                         }
                                         if name.clicked() {
                                             self.begin_pad_rename(pad);
@@ -1763,7 +1949,12 @@ impl App {
                                                 let max_height = (ui.ctx().content_rect().height()
                                                     - egui::Frame::popup(ui.style()).total_margin().sum().y)
                                                     .max(1.0);
-                                                ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                                                ScrollArea::vertical()
+                                                    .max_height(max_height)
+                                                    .scroll_bar_visibility(
+                                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                                    )
+                                                    .show(ui, |ui| {
                                                     ui.label(
                                                         RichText::new(pad.display_name()).strong(),
                                                     );
@@ -1920,150 +2111,6 @@ impl App {
         if !trim_open {
             self.close_trim_editor();
         }
-
-        ui.add_space(10.0);
-        let playing: Vec<String> = self
-            .settings
-            .sounds
-            .iter()
-            .filter(|pad| self.playing.contains(&clip_key(&pad.path)))
-            .map(Pad::display_name)
-            .collect();
-        let engine_running = self.engine.is_some();
-        let loading = self.has_pending_playback();
-        let waiting_for_device = self.waiting_for_device;
-        let paused = self.pad_progress.len().saturating_sub(playing.len());
-        let title = match playing.len() {
-            0 if self.settings.sounds.is_empty() => "Add a clip to get started".to_owned(),
-            0 if loading => "Loading audio…".to_owned(),
-            0 if paused == 1 => "1 clip paused".to_owned(),
-            0 if paused > 1 => format!("{paused} clips paused"),
-            0 => "Choose a pad above".to_owned(),
-            1 => playing[0].clone(),
-            n => format!("{n} clips playing"),
-        };
-        // Header status changes must not replace focused playback controls.
-        ui.scope_builder(
-            egui::UiBuilder::new().id(egui::Id::new("soundboard-playback")),
-            |ui| {
-                let width_id = ui.id().with("width");
-                let width = ui.available_width();
-                let reflowed = ui.data_mut(|data| {
-                    let previous = data.get_temp::<f32>(width_id);
-                    data.insert_temp(width_id, width);
-                    previous.is_some_and(|previous| previous != width)
-                });
-                widgets::card(
-                    ui,
-                    "PLAYBACK",
-                    VIOLET,
-                    |ui| {
-                        if !playing.is_empty() {
-                            widgets::badge(ui, "Playing", GREEN);
-                        } else if loading {
-                            widgets::badge(ui, "Loading", CYAN);
-                        } else if paused > 0 {
-                            widgets::badge(ui, "Paused", AMBER);
-                        } else if engine_running {
-                            widgets::badge(ui, "Ready", GREEN);
-                        } else if waiting_for_device {
-                            widgets::badge(ui, "Waiting for device", AMBER);
-                        } else {
-                            widgets::badge(ui, "OpenMic stopped", AMBER);
-                        }
-                    },
-                    |ui| {
-                        let stop = ui
-                            .horizontal_wrapped(|ui| {
-                                let title_width = (ui.available_width() - 115.0).max(140.0);
-                                ui.vertical(|ui| {
-                                    ui.set_max_width(title_width);
-                                    ui.add(
-                                        egui::Label::new(RichText::new(title).size(15.0).strong())
-                                            .truncate(),
-                                    );
-                                    ui.weak(if self.settings.sounds.is_empty() {
-                                        "WAV, FLAC, OGG, MP3, and AIFF supported"
-                                    } else if loading {
-                                        "Click a loading pad to cancel."
-                                    } else {
-                                        "Click a pad to play, pause or resume."
-                                    });
-                                });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        let response = ui.add_enabled(
-                                            !self.pad_progress.is_empty() || loading,
-                                            egui::Button::new("Stop clips"),
-                                        );
-                                        if response.clicked() {
-                                            self.stop_clips();
-                                        }
-                                        response
-                                    },
-                                )
-                                .inner
-                            })
-                            .inner;
-                        ui.add_space(8.0);
-                        let volume = ui
-                            .horizontal_wrapped(|ui| {
-                                let label = ui.label("Clip volume");
-                                let original = self.settings.sound_volume;
-                                let response = volume_slider(ui, &mut self.settings.sound_volume)
-                                    .labelled_by(label.id);
-                                if self.settings.sound_volume != original {
-                                    self.apply_live();
-                                }
-                                ui.weak("Clips only");
-                                response
-                            })
-                            .inner;
-                        let hear_clips = ui
-                            .checkbox(&mut self.settings.monitor_clips, "Hear soundboard")
-                            .on_hover_text("Play clips through the monitor output selected on the Voice page. Monitor volume also applies.");
-                        if hear_clips.changed() {
-                            self.apply_live();
-                            if self.settings.monitor_clips
-                                && self.engine.as_ref().is_some_and(|engine| !engine.has_monitor())
-                            {
-                                self.restart_engine();
-                            }
-                        }
-                        let overlap = ui
-                            .checkbox(&mut self.settings.overlap_clips, "Let clips overlap")
-                            .on_hover_text(
-                                "Play pads over each other instead of replacing the current clip",
-                            );
-                        if overlap.changed() {
-                            self.touch();
-                        }
-                        for response in [&stop, &volume, &hear_clips, &overlap] {
-                            if reflowed
-                                && response.has_focus()
-                                && ui.input(|input| {
-                                    !input.pointer.any_down() && !input.pointer.any_released()
-                                })
-                            {
-                                response.scroll_to_me(Some(egui::Align::Center));
-                            } else {
-                                widgets::scroll_on_focus(response);
-                            }
-                        }
-                        if self.sound_status.0 != "Ready"
-                            && !self.sound_status.0.starts_with("Playing ·")
-                        {
-                            ui.add_space(5.0);
-                            ui.label(
-                                RichText::new(&self.sound_status.0)
-                                    .color(widgets::text_color(ui, self.sound_status.1)),
-                            );
-                        }
-                    },
-                );
-            },
-        );
     }
 }
 
@@ -2166,19 +2213,19 @@ fn clip_pad(
         .map(|ext| ext.to_string_lossy().to_ascii_uppercase())
         .unwrap_or_else(|| "AUDIO".into());
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 108.0), egui::Sense::hover());
-    let body = egui::Rect::from_min_size(rect.min, egui::vec2(width, 78.0));
+    let body = egui::Rect::from_min_size(rect.min, egui::vec2(width, 76.0));
     let play_rect =
-        egui::Rect::from_min_max(body.min, egui::pos2(body.right() - 36.0, body.bottom()));
+        egui::Rect::from_min_max(body.min, egui::pos2(body.right() - 28.0, body.bottom()));
     let remove_rect =
-        egui::Rect::from_min_max(egui::pos2(rect.right() - 36.0, rect.top()), body.max);
+        egui::Rect::from_min_max(egui::pos2(rect.right() - 28.0, rect.top()), body.max);
     let play_response = ui.interact(
         play_rect,
         ui.id().with(("sound_play", path)),
         egui::Sense::click_and_drag(),
     );
     let name_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 50.0, rect.top() + 18.0),
-        egui::pos2(play_rect.right() - 4.0, rect.top() + 42.0),
+        egui::pos2(rect.left() + 43.0, rect.top() + 16.0),
+        egui::pos2(play_rect.right() - 2.0, rect.top() + 40.0),
     );
     let name_response = ui
         .interact(
@@ -2332,12 +2379,21 @@ fn clip_pad(
     } else {
         CYAN
     };
-    let fill = if playing || paused || state.loading || failed {
-        accent.gamma_multiply(0.13)
-    } else if play_response.hovered() {
-        CYAN.gamma_multiply(0.06)
+    let pad_base_fill = if visuals.dark_mode {
+        Color32::from_rgb(29, 33, 44)
     } else {
-        visuals.faint_bg_color
+        Color32::from_rgb(246, 248, 252)
+    };
+    let fill = if playing || paused || state.loading || failed {
+        accent.gamma_multiply(0.14)
+    } else if play_response.hovered() {
+        if visuals.dark_mode {
+            Color32::from_rgb(35, 41, 54)
+        } else {
+            Color32::from_rgb(238, 244, 252)
+        }
+    } else {
+        pad_base_fill
     };
     let border = if drop_here {
         AMBER
@@ -2355,7 +2411,7 @@ fn clip_pad(
     let painter = ui.painter();
     painter.rect(
         rect,
-        9.0,
+        10.0,
         fill,
         egui::Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
@@ -2363,32 +2419,32 @@ fn clip_pad(
     if play_response.has_focus() {
         painter.rect_stroke(
             rect.expand(2.0),
-            11.0,
+            12.0,
             visuals.selection.stroke,
             egui::StrokeKind::Outside,
         );
     }
 
-    let center = egui::pos2(rect.left() + 28.0, body.center().y);
-    painter.circle_filled(center, 16.0, accent);
+    let center = egui::pos2(rect.left() + 23.0, body.center().y);
+    painter.circle_filled(center, 13.5, accent);
     if state.loading {
         painter.rect_filled(
-            egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0)),
-            1.0,
+            egui::Rect::from_center_size(center, egui::vec2(8.5, 8.5)),
+            1.5,
             Color32::from_gray(18),
         );
     } else if playing {
-        for dx in [-4.0, 4.0] {
+        for dx in [-3.2, 3.2] {
             let bar =
-                egui::Rect::from_center_size(center + egui::vec2(dx, 0.0), egui::vec2(3.0, 12.0));
-            painter.rect_filled(bar, 0.0, Color32::from_gray(18));
+                egui::Rect::from_center_size(center + egui::vec2(dx, 0.0), egui::vec2(2.6, 10.5));
+            painter.rect_filled(bar, 1.0, Color32::from_gray(18));
         }
     } else {
         painter.add(egui::Shape::convex_polygon(
             vec![
-                egui::pos2(center.x - 3.0, center.y - 6.0),
-                egui::pos2(center.x + 7.0, center.y),
-                egui::pos2(center.x - 3.0, center.y + 6.0),
+                egui::pos2(center.x - 2.5, center.y - 5.2),
+                egui::pos2(center.x + 6.0, center.y),
+                egui::pos2(center.x - 2.5, center.y + 5.2),
             ],
             Color32::from_gray(18),
             egui::Stroke::NONE,
@@ -2396,8 +2452,8 @@ fn clip_pad(
     }
 
     let text_area = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + 52.0, rect.top() + 9.0),
-        egui::pos2(rect.right() - 43.0, body.bottom() - 8.0),
+        egui::pos2(rect.left() + 44.0, rect.top() + 8.0),
+        egui::pos2(rect.right() - 32.0, body.bottom() - 8.0),
     );
     let text_painter = painter.with_clip_rect(text_area);
     let paint_text = |text: String, y: f32, size: f32, color| {
@@ -3078,6 +3134,7 @@ mod tests {
         board_frame(app, ctx, Vec::new())
             .shapes
             .iter()
+            .rev()
             .find_map(|c| match &c.shape {
                 egui::Shape::Text(t) if t.galley.text() == name => {
                     Some(t.visual_bounding_rect().center())

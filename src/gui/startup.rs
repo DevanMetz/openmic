@@ -31,7 +31,9 @@ impl App {
             ui.add_space(8.0);
             ui.heading("OpenMic");
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
                 widgets::card(ui, "SETTINGS NEED ATTENTION", RED, |_| {}, |ui| {
                     ui.label("OpenMic couldn't load your settings. Audio is stopped and your settings file is unchanged.");
                     ui.add_space(8.0);

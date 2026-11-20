@@ -318,48 +318,51 @@ pub struct Preset {
 }
 
 /// Starting points for common setups. Gains are left at 0 dB: they depend
-/// on the microphone, not the room.
-pub fn builtin_presets() -> Vec<Preset> {
-    let base = Processing::default();
-    vec![
-        Preset {
-            name: "Balanced".into(),
-            processing: base.clone(),
-        },
-        Preset {
-            name: "Mechanical keyboard".into(),
-            processing: Processing {
-                voice_threshold: 0.75,
-                highpass_hz: 100.0,
-                ..base.clone()
+/// on the microphone, not the room. Cached once so hot UI loops never allocate.
+pub fn builtin_presets() -> &'static [Preset] {
+    static PRESETS: std::sync::OnceLock<[Preset; 5]> = std::sync::OnceLock::new();
+    PRESETS.get_or_init(|| {
+        let base = Processing::default();
+        [
+            Preset {
+                name: "Balanced".into(),
+                processing: base.clone(),
             },
-        },
-        Preset {
-            name: "Quiet room".into(),
-            processing: Processing {
-                strength: 0.7,
-                voice_gate: false,
-                ..base.clone()
+            Preset {
+                name: "Mechanical keyboard".into(),
+                processing: Processing {
+                    voice_threshold: 0.75,
+                    highpass_hz: 100.0,
+                    ..base.clone()
+                },
             },
-        },
-        Preset {
-            name: "Noisy room".into(),
-            processing: Processing {
-                voice_threshold: 0.7,
-                highpass_hz: 120.0,
-                gate: true,
-                gate_threshold_db: -45.0,
-                ..base.clone()
+            Preset {
+                name: "Quiet room".into(),
+                processing: Processing {
+                    strength: 0.7,
+                    voice_gate: false,
+                    ..base.clone()
+                },
             },
-        },
-        Preset {
-            name: "Low CPU".into(),
-            processing: Processing {
-                model: Model::Rnnoise,
-                ..base
+            Preset {
+                name: "Noisy room".into(),
+                processing: Processing {
+                    voice_threshold: 0.7,
+                    highpass_hz: 120.0,
+                    gate: true,
+                    gate_threshold_db: -45.0,
+                    ..base.clone()
+                },
             },
-        },
-    ]
+            Preset {
+                name: "Low CPU".into(),
+                processing: Processing {
+                    model: Model::Rnnoise,
+                    ..base
+                },
+            },
+        ]
+    })
 }
 
 impl Settings {

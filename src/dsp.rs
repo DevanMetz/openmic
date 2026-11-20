@@ -333,16 +333,22 @@ impl Mixer {
     }
 
     /// Each loaded clip's progress, paused state, and selected duration.
+    #[cfg(test)]
     pub fn progress(&self) -> Vec<ClipProgress> {
-        self.voices
-            .iter()
-            .map(|v| ClipProgress {
-                key: v.key,
-                fraction: v.pos as f32 / v.samples().len().max(1) as f32,
-                paused: v.paused,
-                duration: v.samples().len() as f32 / SR as f32,
-            })
-            .collect()
+        let mut out = Vec::with_capacity(self.voices.len());
+        self.progress_into(&mut out);
+        out
+    }
+
+    /// Append each loaded clip's progress into `out` without allocating when
+    /// `out` already has capacity (or no clips are active).
+    pub fn progress_into(&self, out: &mut Vec<ClipProgress>) {
+        out.extend(self.voices.iter().map(|v| ClipProgress {
+            key: v.key,
+            fraction: v.pos as f32 / v.samples().len().max(1) as f32,
+            paused: v.paused,
+            duration: v.samples().len() as f32 / SR as f32,
+        }));
     }
 
     /// Start `clip`. With `overlap` it layers over other pads (the same pad
